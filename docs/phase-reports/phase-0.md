@@ -2,6 +2,8 @@
 
 Calendar: planned Sun 15–Mon 16 Nov 2026; status on time; scope changes: none.
 
+Assumptions: the starting workspace was empty; interface responsibilities were frozen before their signatures were assigned; the Phase 0 `run` script prints a scaffold banner until the server and Swing client are implemented; TLS key generation is a local JDK `keytool` operation.
+
 ## Files present
 
 - `.gitignore`, `README.md`

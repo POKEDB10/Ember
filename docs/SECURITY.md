@@ -2,7 +2,7 @@
 
 ## Phase 0 status
 
-This document records the required controls to implement in later phases; the scaffold does not yet provide authentication, TLS sockets, authorization, persistent storage, or image upload. Do not describe unimplemented controls as active.
+Phase 1 implements the TLS 1.3 socket factory, the bounded length-prefixed frame codec, PBKDF2-HMAC-SHA256 password hashing, and input validation. The test suite verifies a 2 MiB TLS loopback frame and rejects the JVM default truststore. Authentication flows, authorization, persistent storage, and image upload remain unimplemented; do not describe them as active.
 
 ## Planned controls
 
