@@ -11,6 +11,7 @@ Ember is a student-built desktop messenger with a lighter campus social feed. Th
 - Demonstrate a real TLS transport, server-side authorization, and recoverable storage as implementation phases complete.
 - Use explicit frame limits, UTF-8 text encoding, and password hashing primitives supported by the JDK.
 - Demonstrate a real client-to-server TLS exchange and the message lifecycle with a live receipt.
+- Recover account and message records after restarting the server from its local WAL.
 
 ## Scope
 
