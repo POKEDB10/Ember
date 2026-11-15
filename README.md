@@ -2,7 +2,7 @@
 
 **Say it. Spark it. Let it fade.**
 
-Ember is a Java desktop messenger and campus social feed. The project is being built in gated phases; this Phase 0 scaffold currently demonstrates the build, runner, and test entry point. It does not yet provide chat or a server.
+Ember is a Java desktop messenger and campus social feed. Phase 1 established TLS 1.3 transport and a bounded wire protocol. Phase 2 adds in-memory account registration, login, a minimal Swing client, and live 1:1 messages with SENT and DELIVERED receipts. Durable storage, reconnect sync, groups, and Campus Pulse are still future phases.
 
 ## Requirements
 
@@ -15,9 +15,11 @@ Ember is a Java desktop messenger and campus social feed. The project is being b
 scripts/build.bat
 scripts/run.bat
 scripts/run-tests.bat
+scripts/run-server.bat --port 7443
+scripts/run-client.bat --host localhost --port 7443 --profile alice
 ```
 
-On Unix-like systems, use `scripts/build.sh`, `scripts/run.sh`, and `scripts/run-tests.sh`.
+On Unix-like systems, use the matching `scripts/build.sh`, `scripts/run.sh`, `scripts/run-tests.sh`, `scripts/run-server.sh`, and `scripts/run-client.sh` scripts.
 
 ## TLS development keys
 
@@ -25,4 +27,4 @@ The transport uses a local server keystore and client truststore. Run `scripts/g
 
 ## Security claims
 
-As features are completed, the project will use these claims: “Traffic between client and server is encrypted with TLS 1.3.” “Passwords are stored with salted PBKDF2-HMAC-SHA256 at 600,000 iterations, the OWASP work factor for that algorithm. OWASP's first choice is Argon2id, which the JDK does not include.” “The wire protocol is length-prefixed with size limits and does not use Java serialization.” “Every command that names an object is authorization-checked on the server, with a negative test per rule.” “Uploaded images are validated by signature and size, then re-encoded.” These are target claims and are not active scaffold features yet.
+Implemented claims: “Traffic between client and server is encrypted with TLS 1.3.” “Passwords are stored with salted PBKDF2-HMAC-SHA256 at 600,000 iterations, the OWASP work factor for that algorithm. OWASP's first choice is Argon2id, which the JDK does not include.” “The wire protocol is length-prefixed with size limits and does not use Java serialization.” The object-level authorization and image-validation claims remain targets until their phases and negative tests are complete.
