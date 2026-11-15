@@ -4,7 +4,9 @@
 
 Phase 1 implements the TLS 1.3 socket factory, the bounded length-prefixed frame codec, PBKDF2-HMAC-SHA256 password hashing, and input validation. The test suite verifies a 2 MiB TLS loopback frame and rejects the JVM default truststore. Authentication flows, authorization, persistent storage, and image upload remain unimplemented; do not describe them as active.
 
-## Planned controls
+## Claims and implementation status
+
+TLS 1.3 sockets, frame size checks, no Java serialization, PBKDF2-HMAC-SHA256 at 600,000 iterations, and username/message validation are implemented and covered by Phase 1/2 checks. Server-side object-level authorization for every command, durable audit logging, rate limits, and image validation are still planned and are not current product claims.
 
 - Traffic between client and server is encrypted with TLS 1.3. Clients trust only Ember's generated truststore and verify the server name.
 - Passwords are stored with salted PBKDF2-HMAC-SHA256 at 600,000 iterations, the OWASP work factor for that algorithm. OWASP's first choice is Argon2id, which the JDK does not include.

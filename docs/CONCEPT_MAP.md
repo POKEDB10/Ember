@@ -14,5 +14,9 @@ This map will be updated as concepts appear in implemented classes. Phase 0 demo
 | Regular-expression validation | `InputValidator` |
 | TLS and cryptographic key derivation | `TlsSocketFactory`, `Pbkdf2PasswordHasher` |
 | Checked exception hierarchy | `EmberException` and `common.exceptions` subclasses |
+| Producer-consumer queue and wait/notify | `OutboundSenderThread` |
+| Client model and observer notifications | `ClientStateModel`, `ClientModelListener` |
+| Connection-bound identity and in-memory DAO | `EmberServer`, `AuthService`, `InMemoryStorageEngine` |
+| Swing EDT and background work | `EmberClientApp` (`SwingWorker`), `ClientStateModel` |
 
 Later concept mappings are added with the phase that implements the corresponding code.

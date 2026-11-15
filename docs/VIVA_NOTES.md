@@ -31,3 +31,19 @@ The scaffold establishes the package root, shared product identity, plain `javac
 1. **Why check the payload length before creating its byte array?** The length comes from untrusted network input. Checking first prevents a peer from asking the client or server to allocate an oversized buffer.
 2. **Why does the client use its own truststore and endpoint identification?** The truststore limits trust to the demo server certificate, and endpoint identification checks that the certificate matches the requested host. The TLS loopback test also confirms the JVM default truststore rejects the self-signed Ember certificate.
 3. **Why use PBKDF2 and a dummy hash for unknown users?** PBKDF2-HMAC-SHA256 is the JDK-native choice under the no-library rule, with the specified 600,000 work factor. Verifying against a fixed dummy hash keeps the unknown-account path doing password-hash work instead of returning immediately.
+
+## Phase 2: walking skeleton
+
+`EmberServer` accepts TLS connections and gives each connection a named reader task. `AuthService` registers and authenticates accounts through the `StorageEngine` interface. `ClientController` sends commands through one outbound sender and receives events through one inbound receiver; model listeners are notified on the Swing EDT. The headless test registers Alice and Bob, sends “Hello”, observes it at Bob, and waits for Alice's DELIVERED receipt.
+
+**Key classes:** `EmberServer`, `ConnectionHandler`, `AuthService`, `SessionStore`, `InMemoryStorageEngine`, `ClientController`, `ClientStateModel`, `OutboundSenderThread`, `InboundReceiverThread`, `EmberClientApp`.
+
+**Trace:** Alice registers over TLS → the server hashes and stores the account → login success binds user identity to the connection → Alice sends a message → the server assigns sequence values and acknowledges it → Bob receives it and sends a delivery receipt → Alice sees DELIVERED.
+
+**Concepts:** interfaces and DAO, thread pools, platform threads, `wait/notify`, Observer/MVC, Swing EDT, `SwingWorker`, synchronized state.
+
+### Likely questions
+
+1. **Why is identity bound to the connection?** The server sets the authenticated user from the login result and uses that value for later commands. The client does not choose a sender identity in a message frame.
+2. **Why does the client use one sender thread and one receiver thread?** One writer prevents frames from interleaving on the socket, and one reader gives a clear place to process server events. The sender queue lets UI actions enqueue work without writing network bytes on the EDT.
+3. **Why use a SwingWorker for the connection and keep model callbacks on the EDT?** TLS handshakes and socket work can block, so they must not freeze the interface. Swing component updates belong on the event dispatch thread; the model schedules listener notifications there.

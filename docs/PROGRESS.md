@@ -1,11 +1,12 @@
 Phase 0: PASSED (completed before this run)
 
-Last passed phase: 1.
-Current phase: 2 (Walking skeleton).
-Done: Phase 0 scaffold and checkpoint; Phase 1 TLS key generation, protocol classes, KV codec, TLS factory, PBKDF2 hasher, input validation, exception hierarchy, and passing Phase 1 gates.
-Not done: Phase 2 server/client authentication and live chat.
-Open issues: The `.sh` scripts are still HUMAN-VERIFY on Linux/macOS. The Phase 0 runner was empty before Phase 1; it now has seven runnable tests.
+Last passed phase: 2.
+Current phase: 3 (Persistence and hardening).
+Done: Phase 0 scaffold/checkpoint; Phase 1 transport primitives and gates; Phase 2 server/client registration, login, direct message ACK/delivery, minimal Swing shell, and passing headless two-client TLS integration test.
+Not done: Phase 3 WAL persistence, audit logging, lockout, rate limiting, and concurrent hash cap.
+Open issues: Shell scripts need HUMAN-VERIFY on Linux/macOS. The Swing shell compiles but has not been manually exercised in a desktop session.
 SCOPE CHANGES: none.
-Exact next steps: add the Phase 2 model and server/client skeleton, implement registration/login and connection-bound sessions, create a minimal Swing login and chat window, then prove a live message and delivery acknowledgement over TLS.
+Exact next steps: add CRC-protected WAL replay and torn-tail recovery; implement autosave, audit JSON, username lockout, token buckets, and a four-operation password hash semaphore; run restart recovery and flood gates.
 
-Phase 1: PASSED. Report: `docs/phase-reports/phase-1.md`. Commit/tag are created after the gate and repository hygiene checks.
+Phase 1: PASSED. Report: `docs/phase-reports/phase-1.md`. Commit `1a37b6f`, tag `phase-1-pass`.
+Phase 2: PASSED. Report: `docs/phase-reports/phase-2.md`. Checkpoint follows after the phase gate and repository hygiene checks.
