@@ -2,6 +2,7 @@ package edu.ember.client;
 
 import edu.ember.common.model.Message;
 import edu.ember.common.model.MessageStatus;
+import edu.ember.common.exceptions.EmberException;
 import edu.ember.common.protocol.FrameFactory;
 import edu.ember.common.protocol.KvPayloadCodec;
 import edu.ember.common.protocol.WireFrame;
@@ -9,10 +10,16 @@ import edu.ember.common.protocol.WireOpcodes;
 import edu.ember.common.security.TlsSocketFactory;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLSocket;
 
 /** Facade for client authentication, messaging, and model observation. @concept Facade, MVC */
@@ -22,11 +29,30 @@ public final class ClientController implements AutoCloseable {
     private final OutboundSenderThread outbound;
     private final InboundReceiverThread inbound;
     private final AtomicLong correlationIds = new AtomicLong();
+    private final ExecutorService outboxWriter = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "ember-client-outbox-writer");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final ScheduledExecutorService heartbeat = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "ember-client-heartbeat");
+        thread.setDaemon(true);
+        return thread;
+    });
     private volatile String activeConversationId;
     private volatile String sessionToken;
+    private volatile LocalOutbox outbox;
+    private volatile boolean closing;
+    private final Path clientDataRoot;
 
     public ClientController(String host, int port, Path trustStore, char[] password)
             throws Exception {
+        this(host, port, trustStore, password, Path.of("client_data"));
+    }
+
+    public ClientController(String host, int port, Path trustStore, char[] password,
+            Path clientDataRoot) throws Exception {
+        this.clientDataRoot = clientDataRoot;
         socket = TlsSocketFactory.createClientSocket(trustStore, password, host, port);
         socket.setSoTimeout(45_000);
         socket.startHandshake();
@@ -34,6 +60,11 @@ public final class ClientController implements AutoCloseable {
         inbound = new InboundReceiverThread(socket.getInputStream(), this);
         outbound.start();
         inbound.start();
+        heartbeat.scheduleAtFixedRate(() -> {
+            if (model.userId() != null && !socket.isClosed()) {
+                ping();
+            }
+        }, 15, 15, TimeUnit.SECONDS);
     }
 
     public ClientStateModel model() { return model; }
@@ -49,18 +80,50 @@ public final class ClientController implements AutoCloseable {
     }
 
     public String sendMessage(String conversationId, String body) {
+        return sendMessageWithId(conversationId, body, UUID.randomUUID().toString());
+    }
+
+    public String sendMessageWithId(String conversationId, String body, String clientMsgId) {
         if (model.userId() == null) {
             throw new IllegalStateException("Authenticate before sending a message");
         }
-        String clientMsgId = UUID.randomUUID().toString();
-        Message message = new Message(clientMsgId, model.userId(), conversationId, body,
-                System.currentTimeMillis());
-        message.advanceStatus(MessageStatus.PENDING_LOCAL);
-        model.addMessage(message);
-        sendCommand(WireOpcodes.CMD_MSG_SEND, Map.of("clientMsgId", clientMsgId,
-                "convId", conversationId, "body", body));
+        if (model.messages(conversationId).stream()
+                .noneMatch(existing -> existing.clientMsgId().equals(clientMsgId))) {
+            Message message = new Message(clientMsgId, model.userId(), conversationId, body,
+                    System.currentTimeMillis());
+            message.advanceStatus(MessageStatus.PENDING_LOCAL);
+            model.addMessage(message);
+        }
+        WireFrame frame = commandFrame(WireOpcodes.CMD_MSG_SEND,
+                Map.of("clientMsgId", clientMsgId, "convId", conversationId, "body", body));
+        outboxWriter.execute(() -> persistAndSend(frame));
         return clientMsgId;
     }
+
+    public void resume(String token, long lastGlobalSeq) {
+        sendCommand(WireOpcodes.CMD_AUTH_RESUME,
+                Map.of("token", token, "lastGlobalSeq", Long.toString(lastGlobalSeq)));
+    }
+
+    public void resumeStoredSession(String userId) throws IOException {
+        Path tokenFile = clientDataRoot.resolve(userId).resolve("session.token");
+        if (!Files.exists(tokenFile)) {
+            throw new IOException("No saved session token");
+        }
+        String token = Files.readString(tokenFile, StandardCharsets.UTF_8);
+        resume(token, model.lastGlobalSequence());
+    }
+
+    public void ping() {
+        sendCommand(WireOpcodes.CMD_PING, Map.of());
+    }
+
+    public void requestHistory(String conversationId, long beforeSequence, int limit) {
+        sendCommand(WireOpcodes.CMD_HISTORY_PULL, Map.of("convId", conversationId,
+                "beforeSeq", Long.toString(beforeSequence), "limit", Integer.toString(limit)));
+    }
+
+    public String sessionToken() { return sessionToken; }
 
     public void openConversation(String conversationId) {
         activeConversationId = conversationId;
@@ -73,9 +136,18 @@ public final class ClientController implements AutoCloseable {
     }
 
     public void setTyping(String conversationId, boolean typing) {
-        if (typing) {
-            sendCommand(WireOpcodes.CMD_TYPING, Map.of("convId", conversationId));
-        }
+        sendCommand(WireOpcodes.CMD_TYPING, Map.of("convId", conversationId,
+                "typing", Boolean.toString(typing)));
+    }
+
+    public void createGroup(String name, String description) {
+        sendCommand(WireOpcodes.CMD_GROUP_CREATE,
+                Map.of("name", name, "desc", description, "member.n", "0"));
+    }
+
+    public void changeGroupMember(String groupId, String targetUser, String action) {
+        sendCommand(WireOpcodes.CMD_GROUP_MEMBER,
+                Map.of("groupId", groupId, "targetUser", targetUser, "action", action));
     }
 
     public void logout() {
@@ -88,56 +160,139 @@ public final class ClientController implements AutoCloseable {
 
     @Override
     public void close() {
+        closing = true;
+        heartbeat.shutdownNow();
         outbound.stopSending();
-        inbound.interrupt();
+        outboxWriter.shutdown();
         try {
             socket.close();
         } catch (IOException exception) {
-            model.setError("Connection close failed");
+            model.setError("500", "Connection close failed");
         }
+        inbound.interrupt();
     }
 
     void handleFrame(WireFrame frame) {
         Map<String, String> fields = KvPayloadCodec.decode(frame.payload());
         if (frame.opcode() == WireOpcodes.EVT_AUTH_OK) {
             sessionToken = fields.get("token");
-            model.authenticated(fields.get("userId"));
+            String userId = fields.get("userId");
+            initializeOutbox(userId);
+            model.authenticated(userId);
         } else if (frame.opcode() == WireOpcodes.EVT_MSG_ACK) {
+            model.updateAcknowledgement(fields.get("clientMsgId"),
+                    Long.parseLong(fields.get("convSeq")), Long.parseLong(fields.get("globalSeq")));
             model.updateStatus(fields.get("clientMsgId"), MessageStatus.SENT);
+            acknowledgeOutbox();
         } else if (frame.opcode() == WireOpcodes.EVT_MSG_DELIVER) {
             handleDelivery(fields);
         } else if (frame.opcode() == WireOpcodes.EVT_RECEIPT_UPDATE) {
-            model.updateStatus(fields.get("clientMsgId"), parseStatus(fields.get("status")));
+            String names = fields.getOrDefault("readBy", "");
+            model.updateReceipt(fields.get("clientMsgId"),
+                    Integer.parseInt(fields.getOrDefault("delivered", "0")),
+                    Integer.parseInt(fields.getOrDefault("read", "0")),
+                    Integer.parseInt(fields.getOrDefault("total", "1")), names);
+        } else if (frame.opcode() == WireOpcodes.EVT_SYNC_ITEM) {
+            handleDelivery(fields);
+        } else if (frame.opcode() == WireOpcodes.EVT_SYNC_DONE) {
+            drainOutbox();
+        } else if (frame.opcode() == WireOpcodes.EVT_GROUP_UPDATE) {
+            model.updateGroup(fields.get("groupId"), Integer.parseInt(fields.get("member.n")));
+        } else if (frame.opcode() == WireOpcodes.EVT_HISTORY_PAGE) {
+            model.addHistoryMessage(readMessage(fields));
+        } else if (frame.opcode() == WireOpcodes.EVT_PONG) {
+            model.heartbeatReceived();
+        } else if (frame.opcode() == WireOpcodes.EVT_PRESENCE_UPDATE) {
+            model.updatePresence(fields.get("userId"), Boolean.parseBoolean(fields.get("online")));
+        } else if (frame.opcode() == WireOpcodes.EVT_TYPING) {
+            model.updateTyping(fields.get("convId"), fields.get("userId"),
+                    Boolean.parseBoolean(fields.get("typing")));
         } else if (frame.opcode() == WireOpcodes.EVT_ERROR) {
-            model.setError(fields.getOrDefault("message", "Request failed"));
+            model.setError(fields.getOrDefault("code", "500"),
+                    fields.getOrDefault("message", "Request failed"));
         }
     }
 
     void connectionEnded(Exception exception) {
-        if (!socket.isClosed()) {
-            model.setError("Connection ended: " + exception.getMessage());
+        if (!closing && !socket.isClosed()) {
+            model.setError("503", "Connection ended: " + exception.getMessage());
         }
     }
 
     private void handleDelivery(Map<String, String> fields) {
+        Message message = readMessage(fields);
+        message.advanceStatus(MessageStatus.DELIVERED);
+        model.addMessage(message);
+        if (!message.senderUserId().equals(model.userId())) {
+            sendCommand(WireOpcodes.CMD_MSG_RECEIPT, Map.of("convId", message.conversationId(),
+                    "clientMsgId", message.clientMsgId(), "status", "DELIVERED"));
+        }
+    }
+
+    private Message readMessage(Map<String, String> fields) {
         Message message = new Message(fields.get("clientMsgId"), fields.get("senderUserId"),
                 fields.get("convId"), fields.get("body"),
                 Long.parseLong(fields.get("serverTs")));
         message.assignSequences(Long.parseLong(fields.get("convSeq")),
                 Long.parseLong(fields.get("globalSeq")));
         message.advanceStatus(MessageStatus.DELIVERED);
-        model.addMessage(message);
-        sendCommand(WireOpcodes.CMD_MSG_RECEIPT, Map.of("convId", message.conversationId(),
-                "clientMsgId", message.clientMsgId(), "status", "DELIVERED"));
-    }
-
-    private MessageStatus parseStatus(String value) {
-        return "READ".equals(value) ? MessageStatus.READ : MessageStatus.DELIVERED;
+        return message;
     }
 
     private void sendCommand(int opcode, Map<String, String> fields) {
+        outbound.enqueue(commandFrame(opcode, fields));
+    }
+
+    private WireFrame commandFrame(int opcode, Map<String, String> fields) {
         byte[] payload = edu.ember.common.protocol.KvPayloadCodec.encode(new HashMap<>(fields));
-        outbound.enqueue(new WireFrame.Builder(opcode).correlationId(correlationIds.incrementAndGet())
-                .payload(payload).build());
+        return new WireFrame.Builder(opcode).correlationId(correlationIds.incrementAndGet())
+                .payload(payload).build();
+    }
+
+    private void initializeOutbox(String userId) {
+        try {
+            Path userDirectory = clientDataRoot.resolve(userId);
+            Files.createDirectories(userDirectory);
+            outbox = new LocalOutbox(userDirectory.resolve("outbox.dat"));
+            Files.writeString(userDirectory.resolve("session.token"), sessionToken,
+                    StandardCharsets.UTF_8);
+        } catch (IOException | EmberException exception) {
+            model.setError("500", "Could not open local message outbox");
+        }
+    }
+
+    private void persistAndSend(WireFrame frame) {
+        try {
+            LocalOutbox current = outbox;
+            if (current == null) {
+                throw new IOException("Outbox is not initialized");
+            }
+            current.enqueue(frame);
+            outbound.enqueue(frame);
+        } catch (IOException exception) {
+            model.setError("507", "Could not save pending message");
+        }
+    }
+
+    private void acknowledgeOutbox() {
+        outboxWriter.execute(() -> {
+            try {
+                if (outbox != null && outbox.size() > 0) {
+                    outbox.removeFirst();
+                }
+            } catch (IOException exception) {
+                model.setError("507", "Could not update local message outbox");
+            }
+        });
+    }
+
+    private void drainOutbox() {
+        LocalOutbox current = outbox;
+        if (current == null) {
+            return;
+        }
+        for (WireFrame frame : current.snapshot()) {
+            outbound.enqueue(frame);
+        }
     }
 }

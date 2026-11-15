@@ -40,6 +40,7 @@ public final class EmberClientApp {
     private final Path trustStore;
     private final char[] storePassword;
     private ClientController controller;
+    private ReconnectManager reconnectManager;
 
     private EmberClientApp(String host, int port, String profile, Path trustStore,
             char[] storePassword) {
@@ -210,6 +211,44 @@ public final class EmberClientApp {
             }
         } else if (eventType.equals("ERROR")) {
             status.setText(model.errorMessage());
+            if ("503".equals(model.errorCode()) && reconnectManager == null) {
+                startReconnect(model.userId());
+            }
         }
+    }
+
+    private void startReconnect(String userId) {
+        status.setText("Connection lost. Reconnecting…");
+        reconnectManager = new ReconnectManager(
+                () -> new ClientController(host, port, trustStore, storePassword),
+                new ReconnectManager.ReconnectListener() {
+                    @Override
+                    public void onReconnected(ClientController replacement) {
+                        SwingUtilities.invokeLater(() -> {
+                            ClientController previous = controller;
+                            controller = replacement;
+                            replacement.addListener(EmberClientApp.this::modelChanged);
+                            if (userId != null) {
+                                try {
+                                    replacement.resumeStoredSession(userId);
+                                } catch (java.io.IOException exception) {
+                                    status.setText("Reconnect failed: " + exception.getMessage());
+                                }
+                            }
+                            if (previous != null) {
+                                previous.close();
+                            }
+                            reconnectManager = null;
+                            status.setText("Reconnected; syncing messages…");
+                        });
+                    }
+
+                    @Override
+                    public void onAttemptFailed(Exception exception) {
+                        SwingUtilities.invokeLater(() ->
+                                status.setText("Reconnecting: " + exception.getMessage()));
+                    }
+                });
+        reconnectManager.start();
     }
 }
