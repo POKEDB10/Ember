@@ -2,7 +2,7 @@
 
 **Say it. Spark it. Let it fade.**
 
-Ember is a Java desktop messenger and campus social feed. Phase 1 established TLS 1.3 transport and a bounded wire protocol. Phase 2 adds in-memory account registration, login, a minimal Swing client, and live 1:1 messages with SENT and DELIVERED receipts. Durable storage, reconnect sync, groups, and Campus Pulse are still future phases.
+Ember is a Java desktop messenger and campus social feed. Phases 1–3 provide TLS 1.3 transport, a bounded wire protocol, registration/login, a minimal Swing client, live 1:1 messaging, CRC-protected WAL storage, username lockout, message rate limits, and authentication audit events. Reconnect sync, groups, and Campus Pulse are still future phases.
 
 ## Requirements
 
@@ -15,8 +15,8 @@ Ember is a Java desktop messenger and campus social feed. Phase 1 established TL
 scripts/build.bat
 scripts/run.bat
 scripts/run-tests.bat
-scripts/run-server.bat --port 7443
-scripts/run-client.bat --host localhost --port 7443 --profile alice
+scripts/run-server.bat --port 7443 --storage server_data --durability strict
+scripts/run-client.bat --host 127.0.0.1 --port 7443 --profile alice
 ```
 
 On Unix-like systems, use the matching `scripts/build.sh`, `scripts/run.sh`, `scripts/run-tests.sh`, `scripts/run-server.sh`, and `scripts/run-client.sh` scripts.
