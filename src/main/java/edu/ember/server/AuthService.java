@@ -1,6 +1,8 @@
 package edu.ember.server;
 
 import edu.ember.common.exceptions.AuthenticationException;
+import edu.ember.common.exceptions.AuthenticationLockedException;
+import edu.ember.common.exceptions.RateLimitedException;
 import edu.ember.common.exceptions.ValidationException;
 import edu.ember.common.model.UserRecord;
 import edu.ember.common.security.InputValidator;
@@ -9,21 +11,31 @@ import edu.ember.server.storage.StorageEngine;
 import java.io.IOException;
 import java.util.Locale;
 import java.util.Optional;
-import java.util.UUID;
+import java.util.concurrent.Semaphore;
 
 /** Registers accounts and verifies passwords using the configured hasher. @concept service layer, Strategy pattern */
 public final class AuthService {
     private static final String LOGIN_ERROR = "Invalid username or password";
     private final StorageEngine storage;
     private final PasswordHasher passwordHasher;
+    private final UserLockManager locks;
+    private final SecurityAuditLogger auditLogger;
+    private final Semaphore hashSlots = new Semaphore(4);
 
     public AuthService(StorageEngine storage, PasswordHasher passwordHasher) {
+        this(storage, passwordHasher, new UserLockManager(), null);
+    }
+
+    public AuthService(StorageEngine storage, PasswordHasher passwordHasher,
+            UserLockManager locks, SecurityAuditLogger auditLogger) {
         this.storage = storage;
         this.passwordHasher = passwordHasher;
+        this.locks = locks;
+        this.auditLogger = auditLogger;
     }
 
     public UserRecord register(String username, char[] password, String displayName)
-            throws IOException, ValidationException, AuthenticationException {
+            throws IOException, ValidationException, AuthenticationException, RateLimitedException {
         InputValidator.validateUsername(username);
         char[] checkedPassword = InputValidator.validatePassword(password);
         if (displayName == null || displayName.isBlank() || displayName.length() > 40) {
@@ -33,22 +45,60 @@ public final class AuthService {
             throw new AuthenticationException(LOGIN_ERROR);
         }
         String normalized = username.toLowerCase(Locale.ROOT);
-        UserRecord user = new UserRecord(normalized, normalized, displayName,
-                passwordHasher.hash(checkedPassword));
+        String passwordHash;
+        acquireHashSlot();
+        try {
+            passwordHash = passwordHasher.hash(checkedPassword);
+        } finally {
+            hashSlots.release();
+        }
+        UserRecord user = new UserRecord(normalized, normalized, displayName, passwordHash);
         storage.saveUser(user);
         return user;
     }
 
     public UserRecord login(String username, char[] password)
-            throws IOException, ValidationException, AuthenticationException {
+            throws IOException, ValidationException, AuthenticationException, RateLimitedException {
         InputValidator.validateUsername(username);
         char[] checkedPassword = InputValidator.validatePassword(password);
+        if (locks.isLocked(username)) {
+            log("authn_login_lock", username, "username");
+            throw new AuthenticationLockedException(LOGIN_ERROR);
+        }
         Optional<UserRecord> user = storage.findUser(username);
         String hash = user.map(UserRecord::passwordHash).orElseGet(passwordHasher::dummyHash);
-        boolean validPassword = passwordHasher.verify(checkedPassword, hash);
+        boolean validPassword;
+        acquireHashSlot();
+        try {
+            validPassword = passwordHasher.verify(checkedPassword, hash);
+        } finally {
+            hashSlots.release();
+        }
         if (user.isEmpty() || !validPassword) {
+            boolean newlyLocked = locks.recordFailure(username);
+            log("authn_login_fail", username, "password");
+            if (newlyLocked) {
+                log("authn_login_lock", username, "username");
+            }
             throw new AuthenticationException(LOGIN_ERROR);
         }
+        locks.recordSuccess(username);
+        log("authn_login_success", username, "password");
         return user.get();
+    }
+
+    private void acquireHashSlot() throws RateLimitedException {
+        try {
+            hashSlots.acquire();
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new RateLimitedException("Password verification is busy");
+        }
+    }
+
+    private void log(String event, String username, String source) throws IOException {
+        if (auditLogger != null) {
+            auditLogger.log(event, username, source);
+        }
     }
 }

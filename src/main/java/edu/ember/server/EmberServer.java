@@ -4,6 +4,7 @@ import edu.ember.common.security.PasswordHasher;
 import edu.ember.common.security.Pbkdf2PasswordHasher;
 import edu.ember.common.security.TlsSocketFactory;
 import edu.ember.server.storage.InMemoryStorageEngine;
+import edu.ember.server.storage.WalStorageEngine;
 import edu.ember.server.storage.StorageEngine;
 import java.io.IOException;
 import java.net.SocketException;
@@ -19,6 +20,11 @@ public final class EmberServer implements AutoCloseable {
     private final SSLServerSocket serverSocket;
     private final StorageEngine storage;
     private final AuthService authService;
+    private final SecurityAuditLogger auditLogger;
+    private final AuthRateLimiter authRateLimiter = new AuthRateLimiter();
+    private final java.util.concurrent.ConcurrentMap<String, TokenBucket> messageBuckets =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final AutoSaveThread autoSaveThread;
     private final SessionStore sessions = new SessionStore();
     private final java.util.concurrent.ConcurrentMap<String, ConnectionHandler> online =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -30,23 +36,39 @@ public final class EmberServer implements AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean(true);
 
     public EmberServer(Path keyStore, char[] password, int port) throws Exception {
+        this(keyStore, password, port, new InMemoryStorageEngine(),
+                new SecurityAuditLogger(Path.of("logs", "security-audit.json")));
+    }
+
+    public EmberServer(Path keyStore, char[] password, int port, StorageEngine storage,
+            SecurityAuditLogger auditLogger) throws Exception {
         serverSocket = TlsSocketFactory.createServerSocket(keyStore, password, port);
-        storage = new InMemoryStorageEngine();
+        this.storage = storage;
+        this.auditLogger = auditLogger;
         storage.init();
         PasswordHasher hasher = new Pbkdf2PasswordHasher();
-        authService = new AuthService(storage, hasher);
+        authService = new AuthService(storage, hasher, new UserLockManager(), auditLogger);
+        autoSaveThread = new AutoSaveThread(storage, 30_000);
     }
 
     public static void main(String[] args) throws Exception {
         int port = 7443;
+        Path dataDirectory = Path.of("server_data");
+        boolean strictDurability = true;
         for (int index = 0; index + 1 < args.length; index++) {
             if (args[index].equals("--port")) {
                 port = Integer.parseInt(args[++index]);
+            } else if (args[index].equals("--storage")) {
+                dataDirectory = Path.of(args[++index]);
+            } else if (args[index].equals("--durability")) {
+                strictDurability = args[++index].equals("strict");
             }
         }
         Path config = Path.of("config");
         char[] password = readStorePassword(config.resolve("secrets.properties"));
-        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, port);
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, port,
+                new WalStorageEngine(dataDirectory, strictDurability),
+                new SecurityAuditLogger(Path.of("logs", "security-audit.json")));
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 server.close();
@@ -75,6 +97,7 @@ public final class EmberServer implements AutoCloseable {
     }
 
     public void start() {
+        autoSaveThread.start();
         Thread acceptThread = new Thread(this::acceptLoop, "ember-tls-accept");
         acceptThread.setDaemon(true);
         acceptThread.start();
@@ -83,6 +106,7 @@ public final class EmberServer implements AutoCloseable {
     @Override
     public void close() throws IOException {
         running.set(false);
+        autoSaveThread.interrupt();
         serverSocket.close();
         clients.shutdownNow();
         storage.close();
@@ -161,6 +185,13 @@ public final class EmberServer implements AutoCloseable {
 
         private void route(edu.ember.common.protocol.WireFrame frame) throws IOException {
             try {
+                if ((frame.opcode() == edu.ember.common.protocol.WireOpcodes.CMD_AUTH_LOGIN
+                        || frame.opcode() == edu.ember.common.protocol.WireOpcodes.CMD_AUTH_REGISTER)
+                        && !authRateLimiter.allow(socket.getInetAddress())) {
+                    auditLogger.log("rate_limited", "unknown", socket.getInetAddress().getHostAddress());
+                    sendError(frame.correlationId(), "429", "Too many requests");
+                    return;
+                }
                 switch (frame.opcode()) {
                     case edu.ember.common.protocol.WireOpcodes.CMD_AUTH_REGISTER -> authenticate(frame, true);
                     case edu.ember.common.protocol.WireOpcodes.CMD_AUTH_LOGIN -> authenticate(frame, false);
@@ -170,7 +201,12 @@ public final class EmberServer implements AutoCloseable {
                     default -> sendError(frame.correlationId(), "400", "Unsupported command");
                 }
             } catch (edu.ember.common.exceptions.EmberException exception) {
-                sendError(frame.correlationId(), "400", exception.getMessage());
+                String code = exception instanceof edu.ember.common.exceptions.AuthenticationLockedException
+                        ? "423" : exception instanceof edu.ember.common.exceptions.AuthorizationException
+                        ? "403" : exception instanceof edu.ember.common.exceptions.RateLimitedException
+                        ? "429" : exception instanceof edu.ember.common.exceptions.AuthenticationException
+                        ? "401" : "400";
+                sendError(frame.correlationId(), code, exception.getMessage());
             }
         }
 
@@ -203,6 +239,13 @@ public final class EmberServer implements AutoCloseable {
             String clientMsgId = fields.required("clientMsgId");
             String body = edu.ember.common.security.InputValidator.validateMessageBody(
                     fields.required("body"));
+            TokenBucket bucket = messageBuckets.computeIfAbsent(userId,
+                    ignored -> new TokenBucket(20, 5.0));
+            if (!bucket.tryConsume()) {
+                auditLogger.log("rate_limited", userId, "messages");
+                sendError(frame.correlationId(), "429", "Too many requests");
+                return;
+            }
             String recipient = directRecipient(conversationId, userId);
             var message = new edu.ember.common.model.Message(clientMsgId, userId, conversationId,
                     body, System.currentTimeMillis());
