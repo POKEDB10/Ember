@@ -92,6 +92,7 @@ public final class Pbkdf2PasswordHasher implements PasswordHasher {
         }
     }
 
+    /** Holds parsed algorithm parameters for one stored PBKDF2 hash. @concept records */
     private record ParsedHash(int iterations, byte[] salt, byte[] hash) {
     }
 }
