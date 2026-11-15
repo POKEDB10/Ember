@@ -2,7 +2,15 @@
 
 ## Modules
 
-Module descriptions and concept coverage will be updated as each phase is implemented.
+Phase 0 provides the product constants, named logging helper, build scripts, and zero-dependency test runner. Phase 1 adds the binary protocol (`WireFrame`, `FrameCodec`, `FrameFactory`, `KvPayloadCodec`), TLS socket creation (`TlsSocketFactory`), PBKDF2 password hashing, input validation, and checked application exceptions.
+
+| Concept | Class | File |
+|---|---|---|
+| Builder and immutable frame | `WireFrame.Builder`, `WireFrame` | `common/protocol/WireFrame.java` |
+| Length-prefixed binary I/O | `FrameCodec` | `common/protocol/FrameCodec.java` |
+| UTF-8 text and escaping | `KvPayloadCodec` | `common/protocol/KvPayloadCodec.java` |
+| Strategy interface and password hashing | `PasswordHasher`, `Pbkdf2PasswordHasher` | `common/security/PasswordHasher.java`, `Pbkdf2PasswordHasher.java` |
+| TLS and endpoint identity | `TlsSocketFactory` | `common/security/TlsSocketFactory.java` |
 
 ## Security
 
