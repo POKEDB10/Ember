@@ -21,7 +21,7 @@ On Unix-like systems, use `scripts/build.sh`, `scripts/run.sh`, and `scripts/run
 
 ## TLS development keys
 
-The Phase 1 transport uses a local server keystore and client truststore. Set `EMBER_KEYSTORE_PASS` and run `scripts/gen-keys.bat` (or `scripts/gen-keys.sh`) once. The server keystore is local-only and git-ignored. Do not use these demo credentials for other services.
+The transport uses a local server keystore and client truststore. Run `scripts/gen-keys.bat` (or `scripts/gen-keys.sh`) once. The script reads `EMBER_KEYSTORE_PASS` from the environment, then from the git-ignored `config/secrets.properties`; if neither is present, it creates a random password there. On Windows, `setx EMBER_KEYSTORE_PASS value` only affects new terminals, so open a new terminal before running the script. The server keystore and secrets file are local-only and git-ignored; the generated certificate and client truststore are safe to commit for the offline demo. Do not reuse the generated password elsewhere.
 
 ## Security claims
 
