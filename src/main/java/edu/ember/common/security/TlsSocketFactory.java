@@ -28,7 +28,7 @@ public final class TlsSocketFactory {
         SSLContext context = SSLContext.getInstance(TLS_PROTOCOL);
         context.init(keyManagers.getKeyManagers(), null, null);
         SSLServerSocket socket = (SSLServerSocket) context.getServerSocketFactory()
-                .createServerSocket(port);
+                .createServerSocket(port, 50, java.net.InetAddress.getByName("127.0.0.1"));
         socket.setEnabledProtocols(new String[] {TLS_PROTOCOL});
         return socket;
     }
