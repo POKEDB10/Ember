@@ -10,6 +10,7 @@ Ember is a student-built desktop messenger with a lighter campus social feed. Th
 - Keep the implementation readable and explainable for students who know core Java and Swing.
 - Demonstrate a real TLS transport, server-side authorization, and recoverable storage as implementation phases complete.
 - Use explicit frame limits, UTF-8 text encoding, and password hashing primitives supported by the JDK.
+- Demonstrate a real client-to-server TLS exchange and the message lifecycle with a live receipt.
 
 ## Scope
 
