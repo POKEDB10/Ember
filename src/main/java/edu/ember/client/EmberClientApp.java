@@ -53,7 +53,7 @@ public final class EmberClientApp {
     }
 
     public static void main(String[] args) throws Exception {
-        String host = "localhost";
+        String host = "127.0.0.1";
         String profile = "";
         int port = 7443;
         for (int index = 0; index + 1 < args.length; index++) {
