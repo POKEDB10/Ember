@@ -13,3 +13,5 @@ The seven-minute script and failure fallbacks are completed in Phase 8. Until th
 2. Launch two clients with `scripts/run-client.bat --host localhost --port 7443 --profile alice` and `--profile bob`.
 3. Register both users, send `Hello` from Alice to Bob, and confirm Bob receives it while Alice's status advances to SENT and DELIVERED.
 4. If the UI cannot connect, run `scripts/run-tests.bat`; its headless TLS integration test covers the same message path.
+
+The server stores users and messages in `server_data/wal/events.wal` with CRC checks and strict fsync behavior. Do not delete this directory during the demo unless resetting to a clean scenario.

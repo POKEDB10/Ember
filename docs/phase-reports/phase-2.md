@@ -11,7 +11,7 @@ Windows:
 ```text
 scripts\gen-keys.bat
 scripts\run-server.bat --port 7443
-scripts\run-client.bat --host localhost --port 7443 --profile alice
+scripts\run-client.bat --host 127.0.0.1 --port 7443 --profile alice
 scripts\run-tests.bat
 ```
 

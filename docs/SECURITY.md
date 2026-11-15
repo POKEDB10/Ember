@@ -2,7 +2,7 @@
 
 ## Phase 0 status
 
-Phase 1 implements the TLS 1.3 socket factory, the bounded length-prefixed frame codec, PBKDF2-HMAC-SHA256 password hashing, and input validation. The test suite verifies a 2 MiB TLS loopback frame and rejects the JVM default truststore. Authentication flows, authorization, persistent storage, and image upload remain unimplemented; do not describe them as active.
+Phases 1–3 implement TLS 1.3 loopback sockets, the bounded length-prefixed frame codec, PBKDF2-HMAC-SHA256 password hashing, input validation, account registration/login, WAL persistence with CRC and torn-tail recovery, username lockout, per-user message throttling, and structured authentication audit events. Tests verify TLS and a server restart. Object-level authorization for all command types, private-account filtering, and image validation remain unimplemented; do not describe them as active.
 
 ## Claims and implementation status
 

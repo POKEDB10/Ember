@@ -47,3 +47,19 @@ The scaffold establishes the package root, shared product identity, plain `javac
 1. **Why is identity bound to the connection?** The server sets the authenticated user from the login result and uses that value for later commands. The client does not choose a sender identity in a message frame.
 2. **Why does the client use one sender thread and one receiver thread?** One writer prevents frames from interleaving on the socket, and one reader gives a clear place to process server events. The sender queue lets UI actions enqueue work without writing network bytes on the EDT.
 3. **Why use a SwingWorker for the connection and keep model callbacks on the EDT?** TLS handshakes and socket work can block, so they must not freeze the interface. Swing component updates belong on the event dispatch thread; the model schedules listener notifications there.
+
+## Phase 3: persistence and hardening
+
+`WalStorageEngine` appends records containing a length, CRC32, record type, and UTF-8 KV payload. Replay applies valid records in order and truncates the file at the first incomplete or checksum-invalid record. Authentication uses a four-permit semaphore around expensive hashes; failed logins feed `UserLockManager`, while `TokenBucket` limits messages and `SecurityAuditLogger` appends escaped JSON events without credentials.
+
+**Key classes:** `WalStorageEngine`, `WalRecord`, `AutoSaveThread`, `SecurityAuditLogger`, `UserLockManager`, `AuthRateLimiter`, `TokenBucket`, `AuthService`.
+
+**Trace:** a registered user and message are appended to the WAL → the server closes → a fresh server replays the WAL → the user can log in and the message is present → a torn tail is detected and truncated without discarding earlier records.
+
+**Concepts:** CRC32, file channels, WAL replay, synchronization, `Semaphore`, token bucket, daemon threads, JSON escaping.
+
+### Likely questions
+
+1. **How does WAL recovery handle a process stopping during a write?** Each record carries its byte length and CRC32. If the last record is short or its checksum does not match, replay stops at that record's starting offset and truncates the tail, preserving earlier complete records.
+2. **Why use a per-username lockout but disable per-IP throttling on loopback?** Lockout limits repeated password guesses for one account. Demo clients all share the loopback address, so per-IP throttling there would throttle legitimate participants together; the code leaves it off for loopback and still rate-limits messages per user.
+3. **What does the audit logger deliberately omit?** It records event names, usernames, timestamps, and source labels, with control characters escaped to keep one event per JSON line. Passwords and session tokens are never fields in its API.

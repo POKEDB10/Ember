@@ -18,5 +18,9 @@ This map will be updated as concepts appear in implemented classes. Phase 0 demo
 | Client model and observer notifications | `ClientStateModel`, `ClientModelListener` |
 | Connection-bound identity and in-memory DAO | `EmberServer`, `AuthService`, `InMemoryStorageEngine` |
 | Swing EDT and background work | `EmberClientApp` (`SwingWorker`), `ClientStateModel` |
+| CRC, WAL replay, and torn-tail recovery | `WalStorageEngine`, package-private `WalRecord` |
+| Rate limiting and lockout | `TokenBucket`, `AuthRateLimiter`, `UserLockManager` |
+| Audit logging and JSON escaping | `SecurityAuditLogger` |
+| Daemon autosave thread and interruption | `AutoSaveThread` |
 
 Later concept mappings are added with the phase that implements the corresponding code.
