@@ -103,6 +103,7 @@ public final class InMemoryStorageEngine implements StorageEngine {
     }
 
     @Override public int purgeExpiredRecords(long nowMs) { return 0; }
+    @Override public void flush() { }
     @Override public void close() { }
 
     private static Map<String, String> messageFields(Message message) {

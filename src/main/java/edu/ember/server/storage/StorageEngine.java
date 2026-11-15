@@ -22,6 +22,7 @@ public interface StorageEngine extends AutoCloseable {
     List<Message> getHistory(String conversationId, long beforeSequence, int limit)
             throws IOException;
     int purgeExpiredRecords(long nowMs) throws IOException;
+    void flush() throws IOException;
     @Override
     void close() throws IOException;
 }
