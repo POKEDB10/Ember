@@ -29,6 +29,7 @@ public final class WireFrame {
         return Arrays.copyOf(payload, payload.length);
     }
 
+    /** Collects frame fields before producing an immutable frame. @concept Builder pattern */
     public static final class Builder {
         private final int opcode;
         private long correlationId;
