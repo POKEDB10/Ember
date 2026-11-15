@@ -20,9 +20,14 @@ public final class EmberServer implements AutoCloseable {
     private final SSLServerSocket serverSocket;
     private final StorageEngine storage;
     private final AuthService authService;
+    private final GroupService groupService;
     private final SecurityAuditLogger auditLogger;
     private final AuthRateLimiter authRateLimiter = new AuthRateLimiter();
     private final java.util.concurrent.ConcurrentMap<String, TokenBucket> messageBuckets =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentMap<String, GroupReceiptTracker> receiptTrackers =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentMap<String, Long> typingLastSent =
             new java.util.concurrent.ConcurrentHashMap<>();
     private final AutoSaveThread autoSaveThread;
     private final SessionStore sessions = new SessionStore();
@@ -48,6 +53,7 @@ public final class EmberServer implements AutoCloseable {
         storage.init();
         PasswordHasher hasher = new Pbkdf2PasswordHasher();
         authService = new AuthService(storage, hasher, new UserLockManager(), auditLogger);
+        groupService = new GroupService(storage);
         autoSaveThread = new AutoSaveThread(storage, 30_000);
     }
 
@@ -133,10 +139,10 @@ public final class EmberServer implements AutoCloseable {
 
     private void disconnect(ConnectionHandler handler) {
         if (handler.userId != null) {
-            online.remove(handler.userId, handler);
-        }
-        if (handler.token != null) {
-            sessions.remove(handler.token);
+            boolean wasOnline = online.remove(handler.userId, handler);
+            if (wasOnline) {
+                broadcastPresence(handler.userId, false);
+            }
         }
         try {
             handler.socket.close();
@@ -195,12 +201,22 @@ public final class EmberServer implements AutoCloseable {
                 switch (frame.opcode()) {
                     case edu.ember.common.protocol.WireOpcodes.CMD_AUTH_REGISTER -> authenticate(frame, true);
                     case edu.ember.common.protocol.WireOpcodes.CMD_AUTH_LOGIN -> authenticate(frame, false);
-                    case edu.ember.common.protocol.WireOpcodes.CMD_AUTH_LOGOUT -> socket.close();
+                    case edu.ember.common.protocol.WireOpcodes.CMD_AUTH_RESUME -> resume(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_AUTH_LOGOUT -> logout();
                     case edu.ember.common.protocol.WireOpcodes.CMD_MSG_SEND -> sendMessage(frame);
                     case edu.ember.common.protocol.WireOpcodes.CMD_MSG_RECEIPT -> receiveReceipt(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_PING -> ping(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_TYPING -> typing(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_HISTORY_PULL -> history(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_GROUP_CREATE -> createGroup(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_GROUP_MEMBER -> changeGroupMember(frame);
                     default -> sendError(frame.correlationId(), "400", "Unsupported command");
                 }
             } catch (edu.ember.common.exceptions.EmberException exception) {
+                if (exception instanceof edu.ember.common.exceptions.AuthorizationException) {
+                    auditLogger.log("authz_fail", userId == null ? "unknown" : userId,
+                            "opcode:" + frame.opcode());
+                }
                 String code = exception instanceof edu.ember.common.exceptions.AuthenticationLockedException
                         ? "423" : exception instanceof edu.ember.common.exceptions.AuthorizationException
                         ? "403" : exception instanceof edu.ember.common.exceptions.RateLimitedException
@@ -229,6 +245,159 @@ public final class EmberServer implements AutoCloseable {
             send(edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_AUTH_OK,
                     frame.correlationId(), response));
+            sendSync(0);
+            sendPresenceSnapshot(this);
+            broadcastPresence(userId, true);
+        }
+
+        private void resume(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.AuthenticationException {
+            MapFields fields = new MapFields(frame.payload());
+            String suppliedToken = fields.required("token");
+            String resumedUser = sessions.findUserId(suppliedToken);
+            if (resumedUser == null) {
+                sendError(frame.correlationId(), "401", "Authentication required");
+                return;
+            }
+            userId = resumedUser;
+            token = suppliedToken;
+            online.put(userId, this);
+            java.util.Map<String, String> response = new java.util.HashMap<>();
+            response.put("token", token);
+            response.put("userId", userId);
+            response.put("role", "STUDENT");
+            response.put("globalSeq", "0");
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_AUTH_OK,
+                    frame.correlationId(), response));
+            sendSync(Long.parseLong(fields.required("lastGlobalSeq")));
+            sendPresenceSnapshot(this);
+            broadcastPresence(userId, true);
+        }
+
+        private void sendSync(long sinceGlobalSeq) throws IOException {
+            long upToGlobalSequence = sinceGlobalSeq;
+            for (var item : storage.getDeltaFramesSince(userId, sinceGlobalSeq)) {
+                send(item);
+                upToGlobalSequence = Math.max(upToGlobalSequence, item.correlationId());
+            }
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_SYNC_DONE, 0,
+                    java.util.Map.of("upToGlobalSeq", Long.toString(upToGlobalSequence))));
+        }
+
+        private void logout() throws IOException {
+            if (token != null) {
+                sessions.remove(token);
+            }
+            socket.close();
+        }
+
+        private void ping(edu.ember.common.protocol.WireFrame frame) throws IOException {
+            requireAuthenticated(frame.correlationId());
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_PONG, frame.correlationId(),
+                    java.util.Map.of("serverTs", Long.toString(System.currentTimeMillis()))));
+        }
+
+        private void history(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            String conversationId = fields.required("convId");
+            if (conversationId.startsWith("dm:")) {
+                directRecipient(conversationId, userId);
+            } else if (conversationId.startsWith("grp:")) {
+                groupService.requireMember(userId, conversationId.substring(4));
+            } else {
+                throw new edu.ember.common.exceptions.AuthorizationException("Invalid conversation");
+            }
+            long before = Long.parseLong(fields.required("beforeSeq"));
+            int limit = Integer.parseInt(fields.required("limit"));
+            if (before < 1 || limit < 1 || limit > 100) {
+                throw new edu.ember.common.exceptions.ValidationException("Invalid history range");
+            }
+            for (var message : storage.getHistory(conversationId, before, limit)) {
+                send(edu.ember.common.protocol.FrameFactory.event(
+                        edu.ember.common.protocol.WireOpcodes.EVT_HISTORY_PAGE,
+                        frame.correlationId(), messageFields(message)));
+            }
+        }
+
+        private void typing(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            String conversationId = fields.required("convId");
+            boolean isTyping = Boolean.parseBoolean(fields.required("typing"));
+            java.util.List<String> recipients;
+            if (conversationId.startsWith("dm:")) {
+                recipients = java.util.List.of(directRecipient(conversationId, userId));
+            } else if (conversationId.startsWith("grp:")) {
+                String groupId = conversationId.substring(4);
+                groupService.requireMember(userId, groupId);
+                recipients = groupService.memberIds(groupId).stream()
+                        .filter(member -> !member.equals(userId)).toList();
+            } else {
+                throw new edu.ember.common.exceptions.AuthorizationException("Invalid conversation");
+            }
+            String key = conversationId + "\n" + userId;
+            long now = System.currentTimeMillis();
+            if (isTyping) {
+                Long previous = typingLastSent.putIfAbsent(key, now);
+                if (previous != null && now - previous < 3_000) {
+                    return;
+                }
+                typingLastSent.put(key, now);
+            } else {
+                typingLastSent.remove(key);
+            }
+            var event = edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_TYPING, frame.correlationId(),
+                    java.util.Map.of("convId", conversationId, "userId", userId,
+                            "typing", Boolean.toString(isTyping)));
+            for (String recipient : recipients) {
+                ConnectionHandler target = online.get(recipient);
+                if (target != null) {
+                    target.send(event);
+                }
+            }
+        }
+
+        private void createGroup(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            var group = groupService.create(userId, fields.required("name"), fields.required("desc"));
+            int count = Integer.parseInt(fields.required("member.n"));
+            for (int index = 0; index < count; index++) {
+                groupService.changeMember(userId, group.groupId(), fields.required("member." + index), "ADD");
+            }
+            sendGroupUpdate(frame.correlationId(), group.groupId());
+        }
+
+        private void changeGroupMember(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            groupService.changeMember(userId, fields.required("groupId"),
+                    fields.required("targetUser"), fields.required("action"));
+            sendGroupUpdate(frame.correlationId(), fields.required("groupId"));
+        }
+
+        private void sendGroupUpdate(long correlationId, String groupId) throws IOException,
+                edu.ember.common.exceptions.AuthorizationException {
+            java.util.Map<String, String> fields = new java.util.HashMap<>();
+            fields.put("groupId", groupId);
+            fields.put("member.n", Integer.toString(groupService.memberIds(groupId).size()));
+            var event = edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_GROUP_UPDATE, correlationId, fields);
+            for (String memberId : groupService.memberIds(groupId)) {
+                ConnectionHandler member = online.get(memberId);
+                if (member != null) {
+                    member.send(event);
+                }
+            }
         }
 
         private void sendMessage(edu.ember.common.protocol.WireFrame frame) throws IOException,
@@ -246,23 +415,50 @@ public final class EmberServer implements AutoCloseable {
                 sendError(frame.correlationId(), "429", "Too many requests");
                 return;
             }
-            String recipient = directRecipient(conversationId, userId);
+            java.util.List<String> recipients;
+            if (conversationId.startsWith("dm:")) {
+                recipients = java.util.List.of(directRecipient(conversationId, userId));
+            } else if (conversationId.startsWith("grp:")) {
+                String groupId = conversationId.substring(4);
+                groupService.requireMember(userId, groupId);
+                recipients = groupService.memberIds(groupId).stream()
+                        .filter(member -> !member.equals(userId)).toList();
+            } else {
+                throw new edu.ember.common.exceptions.AuthorizationException("Invalid conversation");
+            }
+            var original = storage.findBySenderAndClientMsgId(userId, clientMsgId);
+            if (original.isPresent()) {
+                var saved = original.get();
+                if (!saved.conversationId().equals(conversationId) || !saved.body().equals(body)) {
+                    throw new edu.ember.common.exceptions.AuthorizationException("Message ID is already used");
+                }
+                sendMessageAck(frame.correlationId(), saved);
+                return;
+            }
             var message = new edu.ember.common.model.Message(clientMsgId, userId, conversationId,
                     body, System.currentTimeMillis());
-            long conversationSequence = storage.appendMessage(message);
+            storage.appendMessage(message);
+            receiptTrackers.put(receiptKey(message), new GroupReceiptTracker(recipients.size()));
+            sendMessageAck(frame.correlationId(), message);
+            for (String recipient : recipients) {
+                ConnectionHandler target = online.get(recipient);
+                if (target != null) {
+                    target.send(edu.ember.common.protocol.FrameFactory.event(
+                            edu.ember.common.protocol.WireOpcodes.EVT_MSG_DELIVER, 0,
+                            messageFields(message)));
+                }
+            }
+        }
+
+        private void sendMessageAck(long correlationId, edu.ember.common.model.Message message)
+                throws IOException {
             java.util.Map<String, String> ack = new java.util.HashMap<>();
-            ack.put("clientMsgId", clientMsgId);
-            ack.put("convSeq", Long.toString(conversationSequence));
+            ack.put("clientMsgId", message.clientMsgId());
+            ack.put("convSeq", Long.toString(message.conversationSequence()));
             ack.put("globalSeq", Long.toString(message.globalSequence()));
             ack.put("serverTs", Long.toString(message.createdAtMs()));
             send(edu.ember.common.protocol.FrameFactory.event(
-                    edu.ember.common.protocol.WireOpcodes.EVT_MSG_ACK, frame.correlationId(), ack));
-            ConnectionHandler target = online.get(recipient);
-            if (target != null) {
-                target.send(edu.ember.common.protocol.FrameFactory.event(
-                        edu.ember.common.protocol.WireOpcodes.EVT_MSG_DELIVER, 0,
-                        messageFields(message)));
-            }
+                    edu.ember.common.protocol.WireOpcodes.EVT_MSG_ACK, correlationId, ack));
         }
 
         private String directRecipient(String conversationId, String sender)
@@ -289,29 +485,59 @@ public final class EmberServer implements AutoCloseable {
             MapFields fields = new MapFields(frame.payload());
             String messageId = fields.required("clientMsgId");
             var message = storage.findByClientMsgId(messageId);
+            String conversationId = fields.required("convId");
             if (message.isEmpty() || message.get().senderUserId().equals(userId)
-                    || !directRecipient(message.get().conversationId(),
-                            message.get().senderUserId()).equals(userId)) {
-                return;
+                    || !message.get().conversationId().equals(conversationId)) {
+                throw new edu.ember.common.exceptions.AuthorizationException("Receipt is not allowed");
             }
-            String status = fields.required("status");
-            if (!status.equals("READ")) {
-                status = "DELIVERED";
-                message.get().advanceStatus(edu.ember.common.model.MessageStatus.DELIVERED);
+            if (conversationId.startsWith("dm:")) {
+                if (!directRecipient(conversationId, message.get().senderUserId()).equals(userId)) {
+                    throw new edu.ember.common.exceptions.AuthorizationException("Receipt is not allowed");
+                }
+            } else if (conversationId.startsWith("grp:")) {
+                groupService.requireMember(userId, conversationId.substring(4));
             } else {
-                message.get().advanceStatus(edu.ember.common.model.MessageStatus.READ);
+                throw new edu.ember.common.exceptions.AuthorizationException("Receipt is not allowed");
+            }
+            String requestedStatus = fields.required("status");
+            edu.ember.common.model.MessageStatus status = requestedStatus.equals("READ")
+                    ? edu.ember.common.model.MessageStatus.READ
+                    : edu.ember.common.model.MessageStatus.DELIVERED;
+            if (!requestedStatus.equals("READ") && !requestedStatus.equals("DELIVERED")) {
+                throw new edu.ember.common.exceptions.ValidationException("Invalid receipt status");
+            }
+            String key = receiptKey(message.get());
+            GroupReceiptTracker tracker = receiptTrackers.get(key);
+            if (tracker == null) {
+                int totalRecipients = conversationId.startsWith("grp:")
+                        ? Math.max(1, groupService.memberIds(conversationId.substring(4)).size() - 1)
+                        : 1;
+                GroupReceiptTracker fresh = new GroupReceiptTracker(totalRecipients);
+                GroupReceiptTracker previous = receiptTrackers.putIfAbsent(key, fresh);
+                tracker = previous == null ? fresh : previous;
+            }
+            GroupReceiptTracker.ReceiptSummary summary = tracker.record(userId, status);
+            if (summary.read() == summary.total()) {
+                storage.updateMessageStatus(messageId, edu.ember.common.model.MessageStatus.READ);
+            } else if (summary.delivered() == summary.total()) {
+                storage.updateMessageStatus(messageId, edu.ember.common.model.MessageStatus.DELIVERED);
             }
             ConnectionHandler sender = online.get(message.get().senderUserId());
             if (sender != null) {
                 java.util.Map<String, String> receipt = new java.util.HashMap<>();
                 receipt.put("clientMsgId", messageId);
-                receipt.put("status", status);
-                receipt.put("delivered", "1");
-                receipt.put("read", "0");
-                receipt.put("total", "1");
+                receipt.put("status", requestedStatus);
+                receipt.put("delivered", Integer.toString(summary.delivered()));
+                receipt.put("read", Integer.toString(summary.read()));
+                receipt.put("total", Integer.toString(summary.total()));
+                receipt.put("readBy", String.join(", ", summary.readBy()));
                 sender.send(edu.ember.common.protocol.FrameFactory.event(
                         edu.ember.common.protocol.WireOpcodes.EVT_RECEIPT_UPDATE, 0, receipt));
             }
+        }
+
+        private String receiptKey(edu.ember.common.model.Message message) {
+            return message.senderUserId() + "\n" + message.clientMsgId();
         }
 
         private void requireAuthenticated(long correlationId) throws IOException {
@@ -337,6 +563,28 @@ public final class EmberServer implements AutoCloseable {
             }
         }
 
+    }
+
+    private void broadcastPresence(String userId, boolean isOnline) {
+        var event = edu.ember.common.protocol.FrameFactory.event(
+                edu.ember.common.protocol.WireOpcodes.EVT_PRESENCE_UPDATE, 0,
+                java.util.Map.of("userId", userId, "online", Boolean.toString(isOnline)));
+        for (ConnectionHandler handler : online.values()) {
+            try {
+                handler.send(event);
+            } catch (IOException exception) {
+                java.util.logging.Logger.getLogger(EmberServer.class.getName())
+                        .log(Level.FINE, "Presence notification failed", exception);
+            }
+        }
+    }
+
+    private void sendPresenceSnapshot(ConnectionHandler handler) throws IOException {
+        for (String onlineUser : online.keySet()) {
+            handler.send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_PRESENCE_UPDATE, 0,
+                    java.util.Map.of("userId", onlineUser, "online", "true")));
+        }
     }
 
     private static java.util.Map<String, String> messageFields(edu.ember.common.model.Message message) {
