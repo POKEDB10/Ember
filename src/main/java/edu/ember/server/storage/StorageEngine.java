@@ -2,6 +2,7 @@ package edu.ember.server.storage;
 
 import edu.ember.common.model.Message;
 import edu.ember.common.model.MessageStatus;
+import edu.ember.common.model.GroupChat;
 import edu.ember.common.model.UserRecord;
 import edu.ember.common.protocol.WireFrame;
 import java.io.IOException;
@@ -18,6 +19,8 @@ public interface StorageEngine extends AutoCloseable {
     Optional<Message> findBySenderAndClientMsgId(String senderUserId, String clientMsgId)
             throws IOException;
     Optional<Message> findByClientMsgId(String clientMsgId) throws IOException;
+    void saveGroup(GroupChat group) throws IOException;
+    Optional<GroupChat> findGroup(String groupId) throws IOException;
     List<WireFrame> getDeltaFramesSince(String userId, long sinceGlobalSeq) throws IOException;
     List<Message> getHistory(String conversationId, long beforeSequence, int limit)
             throws IOException;

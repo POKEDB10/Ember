@@ -2,6 +2,7 @@ package edu.ember.server.storage;
 
 import edu.ember.common.model.Message;
 import edu.ember.common.model.MessageStatus;
+import edu.ember.common.model.GroupChat;
 import edu.ember.common.model.UserRecord;
 import edu.ember.common.protocol.KvPayloadCodec;
 import edu.ember.common.protocol.WireFrame;
@@ -25,6 +26,7 @@ public final class WalStorageEngine implements StorageEngine {
     private static final byte USER_SAVE = 1;
     private static final byte MESSAGE_APPEND = 2;
     private static final byte MESSAGE_STATUS = 3;
+    private static final byte GROUP_SAVE = 4;
     private final Path walPath;
     private final boolean strictDurability;
     private final InMemoryStorageEngine state = new InMemoryStorageEngine();
@@ -103,6 +105,17 @@ public final class WalStorageEngine implements StorageEngine {
     @Override
     public synchronized Optional<Message> findByClientMsgId(String clientMsgId) throws IOException {
         return state.findByClientMsgId(clientMsgId);
+    }
+
+    @Override
+    public synchronized void saveGroup(GroupChat group) throws IOException {
+        appendRecord(GROUP_SAVE, groupFields(group));
+        state.saveGroup(group);
+    }
+
+    @Override
+    public synchronized Optional<GroupChat> findGroup(String groupId) throws IOException {
+        return state.findGroup(groupId);
     }
 
     @Override
@@ -197,6 +210,8 @@ public final class WalStorageEngine implements StorageEngine {
         } else if (record.type() == MESSAGE_STATUS) {
             state.updateMessageStatus(fields.get("clientMsgId"),
                     MessageStatus.valueOf(fields.get("status")));
+        } else if (record.type() == GROUP_SAVE) {
+            state.saveGroup(groupFrom(fields));
         } else {
             throw new IOException("Unknown WAL record type");
         }
@@ -258,5 +273,32 @@ public final class WalStorageEngine implements StorageEngine {
         message.assignSequences(Long.parseLong(fields.get("convSeq")),
                 Long.parseLong(fields.get("globalSeq")));
         return message;
+    }
+
+    private static Map<String, String> groupFields(GroupChat group) {
+        Map<String, String> fields = new HashMap<>();
+        fields.put("groupId", group.groupId());
+        fields.put("name", group.name());
+        fields.put("description", group.description());
+        Map<String, edu.ember.common.model.UserRole> members = group.members();
+        fields.put("member.n", Integer.toString(members.size()));
+        int index = 0;
+        for (Map.Entry<String, edu.ember.common.model.UserRole> member : members.entrySet()) {
+            fields.put("member." + index, member.getKey());
+            fields.put("role." + index, member.getValue().name());
+            index++;
+        }
+        return fields;
+    }
+
+    private static GroupChat groupFrom(Map<String, String> fields) {
+        int count = Integer.parseInt(fields.get("member.n"));
+        Map<String, edu.ember.common.model.UserRole> members = new HashMap<>();
+        for (int index = 0; index < count; index++) {
+            members.put(fields.get("member." + index),
+                    edu.ember.common.model.UserRole.valueOf(fields.get("role." + index)));
+        }
+        return new GroupChat(fields.get("groupId"), fields.get("name"),
+                fields.get("description"), members);
     }
 }

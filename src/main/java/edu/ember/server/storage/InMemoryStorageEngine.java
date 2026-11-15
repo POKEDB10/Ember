@@ -2,6 +2,7 @@ package edu.ember.server.storage;
 
 import edu.ember.common.model.Message;
 import edu.ember.common.model.MessageStatus;
+import edu.ember.common.model.GroupChat;
 import edu.ember.common.model.UserRecord;
 import edu.ember.common.protocol.FrameFactory;
 import edu.ember.common.protocol.WireOpcodes;
@@ -16,6 +17,7 @@ import java.util.Optional;
 /** Stores account and message state in process memory for the walking skeleton. @concept DAO, synchronized collections */
 public final class InMemoryStorageEngine implements StorageEngine {
     private final Map<String, UserRecord> users = new HashMap<>();
+    private final Map<String, GroupChat> groups = new HashMap<>();
     private final Map<String, Message> messagesById = new HashMap<>();
     private final Map<String, Long> conversationSequences = new HashMap<>();
     private final List<Message> messages = new ArrayList<>();
@@ -76,6 +78,19 @@ public final class InMemoryStorageEngine implements StorageEngine {
     }
 
     @Override
+    public synchronized void saveGroup(GroupChat group) {
+        groups.put(group.groupId(), new GroupChat(group.groupId(), group.name(),
+                group.description(), group.members()));
+    }
+
+    @Override
+    public synchronized Optional<GroupChat> findGroup(String groupId) {
+        GroupChat group = groups.get(groupId);
+        return group == null ? Optional.empty() : Optional.of(new GroupChat(group.groupId(),
+                group.name(), group.description(), group.members()));
+    }
+
+    @Override
     public synchronized List<WireFrame> getDeltaFramesSince(String userId, long sinceGlobalSeq) {
         List<WireFrame> result = new ArrayList<>();
         for (Message message : messages) {
@@ -94,12 +109,12 @@ public final class InMemoryStorageEngine implements StorageEngine {
         List<Message> result = new ArrayList<>();
         for (Message message : messages) {
             if (message.conversationId().equals(conversationId)
-                    && message.conversationSequence() < beforeSequence
-                    && result.size() < limit) {
+                    && message.conversationSequence() < beforeSequence) {
                 result.add(message);
             }
         }
-        return List.copyOf(result);
+        int start = Math.max(0, result.size() - limit);
+        return List.copyOf(result.subList(start, result.size()));
     }
 
     @Override public int purgeExpiredRecords(long nowMs) { return 0; }
@@ -118,11 +133,15 @@ public final class InMemoryStorageEngine implements StorageEngine {
         return fields;
     }
 
-    private static boolean isParticipant(Message message, String userId) {
+    private boolean isParticipant(Message message, String userId) {
         if (message.senderUserId().equals(userId)) {
             return true;
         }
         String conversation = message.conversationId();
+        if (conversation.startsWith("grp:")) {
+            GroupChat group = groups.get(conversation.substring(4));
+            return group != null && group.contains(userId);
+        }
         if (!conversation.startsWith("dm:")) {
             return false;
         }
