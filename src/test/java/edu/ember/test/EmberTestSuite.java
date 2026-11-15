@@ -8,6 +8,10 @@ import edu.ember.common.protocol.WireFrame;
 import edu.ember.common.security.InputValidator;
 import edu.ember.common.security.Pbkdf2PasswordHasher;
 import edu.ember.common.security.TlsSocketFactory;
+import edu.ember.client.ClientController;
+import edu.ember.client.ClientStateModel;
+import edu.ember.common.model.MessageStatus;
+import edu.ember.server.EmberServer;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
@@ -16,6 +20,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLParameters;
@@ -43,6 +49,7 @@ public final class EmberTestSuite {
         runTest("password hashing and dummy verification", this::testPasswordHasher);
         runTest("input validation", this::testInputValidation);
         runTest("TLS 1.3 loopback frame round trip", this::testTlsRoundTrip);
+        runTest("headless registration, message, and delivery", this::testWalkingSkeleton);
         System.out.println("Ember tests: " + passed + " passed, " + failed + " failed.");
         if (failed != 0) {
             throw new AssertionError("Test suite failed");
@@ -123,6 +130,74 @@ public final class EmberTestSuite {
         }
     }
 
+    private void testWalkingSkeleton() throws Exception {
+        Path config = Path.of("config");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0);
+        ClientController alice = null;
+        ClientController bob = null;
+        try {
+            server.start();
+            alice = new ClientController("localhost", server.port(),
+                    config.resolve("ember-client-trust.p12"), password);
+            bob = new ClientController("localhost", server.port(),
+                    config.resolve("ember-client-trust.p12"), password);
+            CountDownLatch authLatch = new CountDownLatch(2);
+            CountDownLatch deliveryLatch = new CountDownLatch(1);
+            CountDownLatch sentLatch = new CountDownLatch(1);
+            CountDownLatch deliveredReceiptLatch = new CountDownLatch(1);
+            ClientStateModel aliceModel = alice.model();
+            ClientStateModel bobModel = bob.model();
+            alice.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) {
+                    authLatch.countDown();
+                }
+                if (event.equals("MESSAGE_STATUS") && message != null
+                        && message.status() == MessageStatus.SENT) {
+                    sentLatch.countDown();
+                }
+                if (event.equals("MESSAGE_STATUS") && message != null
+                        && message.status() == MessageStatus.DELIVERED) {
+                    deliveredReceiptLatch.countDown();
+                }
+            });
+            bob.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) {
+                    authLatch.countDown();
+                }
+                if (event.equals("MESSAGE") && message != null && message.body().equals("Hello")) {
+                    deliveryLatch.countDown();
+                }
+            });
+            alice.register("alice", "alice-pass-42".toCharArray(), "Alice");
+            bob.register("bob", "bob-pass-42".toCharArray(), "Bob");
+            assertTrue(authLatch.await(30, TimeUnit.SECONDS), "Both users did not authenticate");
+            alice.openConversation("dm:alice:bob");
+            bob.openConversation("dm:alice:bob");
+            String clientMsgId = alice.sendMessage("dm:alice:bob", "Hello");
+            assertTrue(sentLatch.await(20, TimeUnit.SECONDS),
+                    "Alice did not observe SENT acknowledgement");
+            assertTrue(deliveryLatch.await(30, TimeUnit.SECONDS), "Bob did not receive the message");
+            assertTrue(deliveredReceiptLatch.await(30, TimeUnit.SECONDS),
+                    "Alice did not receive the DELIVERED receipt");
+            assertEquals("Hello", bobModel.messages("dm:alice:bob").get(0).body(),
+                    "Bob's message body changed");
+            MessageStatus aliceStatus = aliceModel.messages("dm:alice:bob").stream()
+                    .filter(message -> message.clientMsgId().equals(clientMsgId))
+                    .findFirst().orElseThrow().status();
+            assertEquals(MessageStatus.DELIVERED, aliceStatus,
+                    "Sender message status did not reach DELIVERED");
+        } finally {
+            if (alice != null) {
+                alice.close();
+            }
+            if (bob != null) {
+                bob.close();
+            }
+            server.close();
+        }
+    }
+
     private Thread tlsEchoThread(SSLServerSocket server, AtomicReference<Throwable> failure,
             AtomicReference<String> protocol) {
         return new Thread(() -> {
@@ -141,8 +216,7 @@ public final class EmberTestSuite {
             untrusted.startHandshake();
             throw new AssertionError("Default JVM trust store accepted Ember's certificate");
         } catch (IOException expected) {
-            passed++;
-            System.out.println("PASS: default JVM trust store rejected Ember certificate");
+            System.out.println("Verified: default JVM trust store rejected Ember certificate");
         }
     }
 
@@ -253,6 +327,7 @@ public final class EmberTestSuite {
     }
 
     @FunctionalInterface
+    /** Allows test cases to report checked failures to the runner. @concept interfaces, exceptions */
     private interface CheckedTest {
         void run() throws Exception;
     }
