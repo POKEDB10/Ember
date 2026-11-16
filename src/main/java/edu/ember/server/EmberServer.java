@@ -90,9 +90,10 @@ public final class EmberServer implements AutoCloseable {
         int port = 7443;
         Path dataDirectory = Path.of("server_data");
         boolean strictDurability = true;
+        boolean demoSeed = false;
         int storyTtlSec = 86_400;
         java.util.Set<String> adminUsernames = new java.util.HashSet<>();
-        for (int index = 0; index + 1 < args.length; index++) {
+        for (int index = 0; index < args.length; index++) {
             if (args[index].equals("--port")) {
                 port = Integer.parseInt(args[++index]);
             } else if (args[index].equals("--storage")) {
@@ -103,9 +104,19 @@ public final class EmberServer implements AutoCloseable {
                 storyTtlSec = Integer.parseInt(args[++index]);
             } else if (args[index].equals("--admin-user")) {
                 adminUsernames.add(args[++index]);
+            } else if (args[index].equals("--demo-seed")) {
+                demoSeed = true;
             }
         }
         Path config = Path.of("config");
+        if (demoSeed) {
+            if (edu.ember.tools.DemoSeeder.seed(dataDirectory)) {
+                System.out.println("Demo accounts and sample content seeded.");
+            } else {
+                System.out.println("Demo seed skipped: Alice already exists.");
+            }
+            adminUsernames.add("alice");
+        }
         char[] password = readStorePassword(config.resolve("secrets.properties"));
         EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, port,
                 new WalStorageEngine(dataDirectory, strictDurability),
