@@ -2,7 +2,9 @@
 
 **Say it. Spark it. Let it fade.**
 
-Ember is a Java desktop messenger and campus social feed. Phases 1–3 provide TLS 1.3 transport, a bounded wire protocol, registration/login, a minimal Swing client, live 1:1 messaging, CRC-protected WAL storage, username lockout, message rate limits, and authentication audit events. Reconnect sync, groups, and Campus Pulse are still future phases.
+Ember is a Java desktop messenger and campus social feed.
+
+The current build provides TLS 1.3 transport, a bounded wire protocol, registration/login, a minimal Swing client, live 1:1 and group messaging, server-assigned order, sent/delivered/read receipts, duplicate resend handling, a durable local outbox, session resume and sync, history pulls, presence, typing, and heartbeat. The server uses CRC-protected WAL storage, username lockout, message rate limits, and authentication audit events. The custom chat UI and Campus Pulse are upcoming phases.
 
 ## Requirements
 
