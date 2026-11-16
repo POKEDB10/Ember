@@ -63,3 +63,19 @@ The scaffold establishes the package root, shared product identity, plain `javac
 1. **How does WAL recovery handle a process stopping during a write?** Each record carries its byte length and CRC32. If the last record is short or its checksum does not match, replay stops at that record's starting offset and truncates the tail, preserving earlier complete records.
 2. **Why use a per-username lockout but disable per-IP throttling on loopback?** Lockout limits repeated password guesses for one account. Demo clients all share the loopback address, so per-IP throttling there would throttle legitimate participants together; the code leaves it off for loopback and still rate-limits messages per user.
 3. **What does the audit logger deliberately omit?** It records event names, usernames, timestamps, and source labels, with control characters escaped to keep one event per JSON line. Passwords and session tokens are never fields in its API.
+
+## Phase 4: core messaging
+
+`ClientController` writes outgoing message commands to `LocalOutbox` before placing them on the socket writer queue. `ReconnectManager` retries with exponential backoff and jitter; after a session-token resume, the server sends messages after the client's global sequence and then the client drains its saved outbox. `EmberServer.ConnectionHandler` enforces direct conversation membership and group membership, handles duplicate resends, serves bounded history, and aggregates per-recipient group receipts. Presence snapshots let newly authenticated clients see who is already online; typing and heartbeat use dedicated events.
+
+**Key classes:** `LocalOutbox`, `ReconnectManager`, `ClientController`, `ClientStateModel`, `GroupChat`, `GroupService`, `GroupReceiptTracker`, `EmberServer`, and `StorageEngine`.
+
+**Trace:** a message is framed and stored locally → the server validates the connection identity and conversation/group membership → WAL storage assigns order and saves the message → the sender receives an ACK and recipients receive it or get it in a later sync → recipient receipts update the sender's SENT/DELIVERED/READ state.
+
+**Concepts:** idempotency, producer queue, exponential backoff, TLS session resume, bounded paging, RBAC, fan-out, synchronized aggregation, observer events.
+
+### Likely questions
+
+1. **How does duplicate resend avoid creating a second message?** The server looks up the authenticated sender and client message ID before appending. A matching conversation and body receive the original acknowledgement; reusing the ID for different content is rejected.
+2. **How does a client recover after a disconnect?** It reconnects with bounded exponential backoff, resumes with its saved session token and last global sequence, processes missing events, then sends frames still present in its durable local outbox. The integration tests verify an offline message appears once after resume.
+3. **Why are group receipts counted on the server?** The server knows the current recipient set and authenticates each receipt against group membership. It reports delivered/read counts and advances status only when every recipient has reached that state, avoiding a client claiming completion based on its own view.

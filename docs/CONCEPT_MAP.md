@@ -22,5 +22,13 @@ This map will be updated as concepts appear in implemented classes. Phase 0 demo
 | Rate limiting and lockout | `TokenBucket`, `AuthRateLimiter`, `UserLockManager` |
 | Audit logging and JSON escaping | `SecurityAuditLogger` |
 | Daemon autosave thread and interruption | `AutoSaveThread` |
+| Roles, group membership, and fan-out | `GroupChat`, `GroupService` |
+| Exponential backoff and jitter | `ReconnectManager` |
+| File-backed local frame queue | `LocalOutbox` |
+| Group roles and aggregated receipts | `GroupChat`, `GroupService`, `GroupReceiptTracker` |
+| Idempotency and durable producer queue | `EmberServer.ConnectionHandler`, `LocalOutbox` |
+| Exponential backoff and session recovery | `ReconnectManager`, `ClientController.resume` |
+| Presence, typing, and heartbeat events | `EmberServer.ConnectionHandler`, `ClientStateModel` |
+| Authorized history and sequence paging | `StorageEngine.getHistory`, `CMD_HISTORY_PULL` |
 
 Later concept mappings are added with the phase that implements the corresponding code.
