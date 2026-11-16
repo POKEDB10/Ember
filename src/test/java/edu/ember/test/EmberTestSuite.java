@@ -11,6 +11,12 @@ import edu.ember.common.security.InputValidator;
 import edu.ember.common.security.Pbkdf2PasswordHasher;
 import edu.ember.common.security.PasswordHasher;
 import edu.ember.common.security.TlsSocketFactory;
+import edu.ember.common.security.ImageValidator;
+import edu.ember.common.exceptions.MediaValidationException;
+import edu.ember.common.model.UserProfile;
+import edu.ember.common.model.MediaAsset;
+import edu.ember.common.model.SocialPost;
+import edu.ember.common.model.PostComment;
 import edu.ember.client.ClientController;
 import edu.ember.client.ClientStateModel;
 import edu.ember.client.LocalOutbox;
@@ -97,6 +103,12 @@ public final class EmberTestSuite {
                 this::testReconnectHistoryAndPresence);
         runTest("group fan-out aggregates receipts and denies unauthorized object access",
                 this::testGroupMessagingAndAuthorization);
+        runTest("image signatures and oversized dimensions are rejected before decode",
+                this::testImageAttacks);
+        runTest("Campus Pulse WAL persists profiles, follows, posts, likes, and comments",
+                this::testSocialWalRecovery);
+        runTest("Campus Pulse TLS upload, feed, and object authorization",
+                this::testCampusPulseNetwork);
         System.out.println("Ember tests: " + passed + " passed, " + failed + " failed.");
         if (failed != 0) {
             throw new AssertionError("Test suite failed");
@@ -867,6 +879,194 @@ public final class EmberTestSuite {
             assertEquals(ThemeManager.Theme.LIGHT, ThemeManager.current(),
                     "Theme switch did not apply");
         });
+    }
+
+    private void testImageAttacks() throws Exception {
+        ImageValidator validator = new ImageValidator();
+        boolean scriptRejected = false;
+        try {
+            validator.validate("#!/bin/sh\necho unsafe".getBytes(
+                    java.nio.charset.StandardCharsets.UTF_8), "avatar.jpg");
+        } catch (MediaValidationException expected) { scriptRejected = true; }
+        assertTrue(scriptRejected, "Renamed script was accepted as an image");
+        boolean dimensionsRejected = false;
+        try {
+            validator.validate(pngHeader(12_000, 12_000), "large.png");
+        } catch (MediaValidationException expected) { dimensionsRejected = true; }
+        assertTrue(dimensionsRejected, "12,000 × 12,000 PNG was not rejected by its header");
+        System.out.println("Verified: image signature and 12,000 x 12,000 PNG header rejected before decode");
+    }
+
+    private void testSocialWalRecovery() throws Exception {
+        Path directory = Files.createTempDirectory("ember-social-wal");
+        UserRecord user = new UserRecord("alice", "alice", "Alice", "hash");
+        MediaAsset media = new MediaAsset("media-1", "alice", "media-1.jpg",
+                "media-1_thumb.jpg", 64, 48, 100);
+        SocialPost post = new SocialPost("post-1", "alice", media.mediaId(), "مرحبا 🌋",
+                101, 0, 0, false);
+        WalStorageEngine first = new WalStorageEngine(directory, true);
+        first.init();
+        first.saveUser(user);
+        first.saveProfile(new UserProfile("alice", "Alice", "Campus life", ""));
+        first.setFollow("bob", "alice", true);
+        first.saveMedia(media);
+        first.savePost(post);
+        first.setPostLike(post.postId(), "bob", true);
+        first.addComment(new PostComment("comment-1", post.postId(), "bob", "مرحبا 🌋", 102));
+        first.close();
+        WalStorageEngine recovered = new WalStorageEngine(directory, true);
+        recovered.init();
+        assertEquals("Campus life", recovered.findProfile("alice").orElseThrow().bio(),
+                "Profile was not restored from WAL");
+        assertEquals(List.of("bob"), recovered.followersOf("alice"),
+                "Follow relationship was not restored from WAL");
+        SocialPost restored = recovered.findPost(post.postId(), "bob").orElseThrow();
+        assertTrue(restored.likedByViewer() && restored.likeCount() == 1,
+                "Post like was not restored from WAL");
+        assertEquals("مرحبا 🌋", recovered.commentsForPost(post.postId(), 10).get(0).text(),
+                "Comment text did not survive WAL UTF-8 replay");
+        recovered.close();
+    }
+
+    private void testCampusPulseNetwork() throws Exception {
+        Path config = Path.of("config");
+        Path temporary = Files.createTempDirectory("ember-social-network");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0,
+                new InMemoryStorageEngine(), new SecurityAuditLogger(
+                        temporary.resolve("audit.json")), temporary.resolve("media"));
+        ClientController alice = null;
+        ClientController bob = null;
+        SSLSocket attacker = null;
+        try {
+            server.start();
+            alice = new ClientController("127.0.0.1", server.port(),
+                    config.resolve("ember-client-trust.p12"), password,
+                    temporary.resolve("client-a"));
+            bob = new ClientController("127.0.0.1", server.port(),
+                    config.resolve("ember-client-trust.p12"), password,
+                    temporary.resolve("client-b"));
+            CountDownLatch authenticated = new CountDownLatch(2);
+            CountDownLatch uploaded = new CountDownLatch(1);
+            CountDownLatch aliceFeed = new CountDownLatch(1);
+            CountDownLatch bobFeed = new CountDownLatch(1);
+            CountDownLatch commentsReady = new CountDownLatch(1);
+            CountDownLatch rejectedRequests = new CountDownLatch(9);
+            CountDownLatch prePostRejections = new CountDownLatch(2);
+            alice.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("MEDIA_UPLOADED")) uploaded.countDown();
+                if (event.equals("SOCIAL_FEED") && !model.socialPosts().isEmpty()) aliceFeed.countDown();
+            });
+            bob.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("SOCIAL_FEED") && !model.socialPosts().isEmpty()) bobFeed.countDown();
+                if (event.equals("COMMENTS") && !model.comments(
+                        model.socialPosts().isEmpty() ? "" : model.socialPosts().get(0).postId()).isEmpty()) {
+                    commentsReady.countDown();
+                }
+                if (event.equals("ERROR") && ("400".equals(model.errorCode())
+                        || "403".equals(model.errorCode()) || "404".equals(model.errorCode()))) {
+                    rejectedRequests.countDown();
+                    prePostRejections.countDown();
+                }
+            });
+            alice.register("pulsealice", "alice-pass-42".toCharArray(), "Pulse Alice");
+            bob.register("pulsebob", "bob-pass-42".toCharArray(), "Pulse Bob");
+            assertTrue(authenticated.await(30, TimeUnit.SECONDS), "Campus Pulse accounts did not authenticate");
+
+            bob.uploadMedia("#!/bin/sh".getBytes(java.nio.charset.StandardCharsets.UTF_8), "avatar.jpg");
+
+            byte[] photo = paddedJpeg(3 * 1024 * 1024);
+            alice.uploadMedia(photo, "campus-photo.jpg");
+            CountDownLatch edtResponsive = new CountDownLatch(1);
+            javax.swing.SwingUtilities.invokeLater(edtResponsive::countDown);
+            assertTrue(edtResponsive.await(1, TimeUnit.SECONDS),
+                    "3 MB upload preparation blocked the Swing EDT");
+            assertTrue(uploaded.await(30, TimeUnit.SECONDS), "3 MB photo upload did not complete");
+            String mediaId = alice.model().lastUploadedMediaId();
+            bob.requestMedia(mediaId, true);
+            assertTrue(prePostRejections.await(20, TimeUnit.SECONDS),
+                    "Invalid upload or media without a published post was not rejected");
+            bob.createPost(mediaId, "unauthorized reuse");
+            bob.follow("missing-user", true);
+            bob.requestProfile("missing-user");
+            bob.requestFeed("missing-user");
+            alice.createPost(mediaId, "مرحبا 🌋 on campus");
+            assertTrue(aliceFeed.await(20, TimeUnit.SECONDS), "Post was not returned to its author");
+            bob.requestFeed(null);
+            assertTrue(bobFeed.await(20, TimeUnit.SECONDS), "Public feed did not return the post to Bob");
+            String postId = bob.model().socialPosts().get(0).postId();
+            bob.interactPost(postId, "comment", "Campus Pulse comment 🌋");
+            bob.interactPost(postId, "comments", "");
+            assertTrue(commentsReady.await(20, TimeUnit.SECONDS), "Post comment was not returned");
+            assertEquals("Campus Pulse comment 🌋", bob.model().comments(postId).get(0).text(),
+                    "Comment text changed over the TLS social protocol");
+            bob.requestMedia(mediaId, true);
+            CountDownLatch mediaReady = new CountDownLatch(1);
+            bob.addListener((model, event, message) -> {
+                if (event.equals("MEDIA") && model.mediaBytes(mediaId) != null) mediaReady.countDown();
+            });
+            bob.requestMedia(mediaId, true);
+            assertTrue(mediaReady.await(20, TimeUnit.SECONDS), "Public post media was not returned");
+            assertTrue(bob.model().mediaBytes(mediaId).length > 0, "Downloaded media was empty");
+
+            bob.requestMedia("missing-media", true);
+            bob.interactPost("missing-post", "like", "");
+            bob.interactPost("missing-post", "comment", "unauthorized");
+
+            attacker = TlsSocketFactory.createClientSocket(
+                    config.resolve("ember-client-trust.p12"), password, "127.0.0.1", server.port());
+            attacker.setSoTimeout(10_000);
+            attacker.startHandshake();
+            FrameCodec.writeFrame(attacker.getOutputStream(), FrameFactory.command(
+                    WireOpcodes.CMD_AUTH_REGISTER, 1, Map.of("user", "pulseattacker",
+                            "pass", "attacker-pass-42", "displayName", "Attacker")));
+            WireFrame auth = FrameCodec.readFrame(attacker.getInputStream(), 4096);
+            assertEquals(WireOpcodes.EVT_AUTH_OK, auth.opcode(), "Raw attacker did not authenticate");
+            FrameCodec.writeFrame(attacker.getOutputStream(), FrameFactory.command(
+                    WireOpcodes.CMD_PROFILE_UPDATE, 2, Map.of("userId", "pulsealice",
+                            "displayName", "Forged", "bio", "forged")));
+            WireFrame response;
+            do {
+                response = FrameCodec.readFrame(attacker.getInputStream(), 64 * 1024);
+            } while (response.opcode() != WireOpcodes.EVT_ERROR);
+            Map<String, String> error = KvPayloadCodec.decode(response.payload());
+            assertEquals("403", error.get("code"), "Cross-user profile update was not forbidden");
+            assertTrue(rejectedRequests.await(20, TimeUnit.SECONDS),
+                    "An invalid upload or unauthorized/nonexistent social object was accepted");
+        } finally {
+            if (attacker != null) attacker.close();
+            if (alice != null) alice.close();
+            if (bob != null) bob.close();
+            server.close();
+        }
+    }
+
+    private byte[] pngHeader(int width, int height) throws IOException {
+        ByteBuffer header = ByteBuffer.allocate(33);
+        header.put(new byte[] {(byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A});
+        header.putInt(13).put(new byte[] {0x49, 0x48, 0x44, 0x52});
+        header.putInt(width).putInt(height).put(new byte[] {8, 2, 0, 0, 0});
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update(header.array(), 12, 17);
+        header.putInt((int) crc.getValue());
+        return header.array();
+    }
+
+    private byte[] paddedJpeg(int targetBytes) throws IOException {
+        java.awt.image.BufferedImage image = new java.awt.image.BufferedImage(64, 48,
+                java.awt.image.BufferedImage.TYPE_INT_RGB);
+        java.awt.Graphics2D graphics = image.createGraphics();
+        graphics.setColor(java.awt.Color.ORANGE);
+        graphics.fillRect(0, 0, image.getWidth(), image.getHeight());
+        graphics.dispose();
+        ByteArrayOutputStream jpeg = new ByteArrayOutputStream();
+        javax.imageio.ImageIO.write(image, "jpeg", jpeg);
+        byte[] result = new byte[targetBytes];
+        byte[] encoded = jpeg.toByteArray();
+        System.arraycopy(encoded, 0, result, 0, encoded.length);
+        return result;
     }
 
     private void collectTextAreas(java.awt.Container container,
