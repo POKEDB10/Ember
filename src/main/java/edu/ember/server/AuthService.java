@@ -5,6 +5,7 @@ import edu.ember.common.exceptions.AuthenticationLockedException;
 import edu.ember.common.exceptions.RateLimitedException;
 import edu.ember.common.exceptions.ValidationException;
 import edu.ember.common.model.UserRecord;
+import edu.ember.common.model.UserProfile;
 import edu.ember.common.security.InputValidator;
 import edu.ember.common.security.PasswordHasher;
 import edu.ember.server.storage.StorageEngine;
@@ -54,6 +55,7 @@ public final class AuthService {
         }
         UserRecord user = new UserRecord(normalized, normalized, displayName, passwordHash);
         storage.saveUser(user);
+        storage.saveProfile(new UserProfile(user.userId(), displayName, "", ""));
         return user;
     }
 

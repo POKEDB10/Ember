@@ -21,6 +21,7 @@ public final class EmberServer implements AutoCloseable {
     private final StorageEngine storage;
     private final AuthService authService;
     private final GroupService groupService;
+    private final SocialFeedService socialFeedService;
     private final SecurityAuditLogger auditLogger;
     private final AuthRateLimiter authRateLimiter = new AuthRateLimiter();
     private final java.util.concurrent.ConcurrentMap<String, TokenBucket> messageBuckets =
@@ -42,11 +43,17 @@ public final class EmberServer implements AutoCloseable {
 
     public EmberServer(Path keyStore, char[] password, int port) throws Exception {
         this(keyStore, password, port, new InMemoryStorageEngine(),
-                new SecurityAuditLogger(Path.of("logs", "security-audit.json")));
+                new SecurityAuditLogger(Path.of("logs", "security-audit.json")),
+                Path.of("server_data", "media"));
     }
 
     public EmberServer(Path keyStore, char[] password, int port, StorageEngine storage,
             SecurityAuditLogger auditLogger) throws Exception {
+        this(keyStore, password, port, storage, auditLogger, Path.of("server_data", "media"));
+    }
+
+    public EmberServer(Path keyStore, char[] password, int port, StorageEngine storage,
+            SecurityAuditLogger auditLogger, Path mediaDirectory) throws Exception {
         serverSocket = TlsSocketFactory.createServerSocket(keyStore, password, port);
         this.storage = storage;
         this.auditLogger = auditLogger;
@@ -54,6 +61,7 @@ public final class EmberServer implements AutoCloseable {
         PasswordHasher hasher = new Pbkdf2PasswordHasher();
         authService = new AuthService(storage, hasher, new UserLockManager(), auditLogger);
         groupService = new GroupService(storage);
+        socialFeedService = new SocialFeedService(storage, mediaDirectory);
         autoSaveThread = new AutoSaveThread(storage, 30_000);
     }
 
@@ -175,7 +183,10 @@ public final class EmberServer implements AutoCloseable {
                 while (running.get() && !socket.isClosed()) {
                     try {
                         var frame = edu.ember.common.protocol.FrameCodec.readFrame(input,
-                                userId == null ? 4096 : 64 * 1024);
+                                userId == null ? 4096 : 64 * 1024,
+                                userId == null ? -1
+                                        : edu.ember.common.protocol.WireOpcodes.CMD_MEDIA_UPLOAD,
+                                7 * 1024 * 1024);
                         route(frame);
                     } catch (IOException | edu.ember.common.exceptions.EmberException exception) {
                         break;
@@ -210,6 +221,14 @@ public final class EmberServer implements AutoCloseable {
                     case edu.ember.common.protocol.WireOpcodes.CMD_HISTORY_PULL -> history(frame);
                     case edu.ember.common.protocol.WireOpcodes.CMD_GROUP_CREATE -> createGroup(frame);
                     case edu.ember.common.protocol.WireOpcodes.CMD_GROUP_MEMBER -> changeGroupMember(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_PROFILE_UPDATE -> updateProfile(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_FOLLOW_ACTION -> follow(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_MEDIA_UPLOAD -> uploadMedia(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_POST_CREATE -> createPost(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_POST_INTERACT -> interactPost(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_FEED_PULL -> pullFeed(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_PROFILE_GET -> getProfile(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_MEDIA_GET -> getMedia(frame);
                     default -> sendError(frame.correlationId(), "400", "Unsupported command");
                 }
             } catch (edu.ember.common.exceptions.EmberException exception) {
@@ -221,7 +240,8 @@ public final class EmberServer implements AutoCloseable {
                         ? "423" : exception instanceof edu.ember.common.exceptions.AuthorizationException
                         ? "403" : exception instanceof edu.ember.common.exceptions.RateLimitedException
                         ? "429" : exception instanceof edu.ember.common.exceptions.AuthenticationException
-                        ? "401" : "400";
+                        ? "401" : exception instanceof edu.ember.common.exceptions.ResourceNotFoundException
+                        ? "404" : "400";
                 sendError(frame.correlationId(), code, exception.getMessage());
             }
         }
@@ -383,6 +403,168 @@ public final class EmberServer implements AutoCloseable {
             groupService.changeMember(userId, fields.required("groupId"),
                     fields.required("targetUser"), fields.required("action"));
             sendGroupUpdate(frame.correlationId(), fields.required("groupId"));
+        }
+
+        private void updateProfile(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            String requestedOwner = fields.required("userId");
+            if (!requestedOwner.equals(userId)) {
+                throw new edu.ember.common.exceptions.AuthorizationException("Profile update is not allowed");
+            }
+            var profile = socialFeedService.updateProfile(userId,
+                    fields.required("displayName"), fields.required("bio"));
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_PROFILE_DATA,
+                    frame.correlationId(), profileFields(profile)));
+        }
+
+        private void follow(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            String target = fields.required("targetUserId");
+            boolean following = Boolean.parseBoolean(fields.required("follow"));
+            socialFeedService.follow(userId, target, following);
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_PROFILE_DATA, frame.correlationId(),
+                    java.util.Map.of("followed", target,
+                            "following", Boolean.toString(following),
+                            "followerCount", Integer.toString(storage.followersOf(target).size()),
+                            "followingCount", Integer.toString(storage.followingOf(target).size()))));
+        }
+
+        private void uploadMedia(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            String encoded = fields.required("data");
+            if (encoded.length() > 7 * 1024 * 1024) {
+                throw new edu.ember.common.exceptions.MediaValidationException("Image upload exceeds the 5 MB limit");
+            }
+            byte[] bytes;
+            try {
+                bytes = java.util.Base64.getDecoder().decode(encoded);
+            } catch (IllegalArgumentException exception) {
+                throw new edu.ember.common.exceptions.MediaValidationException("Image data is invalid");
+            }
+            edu.ember.common.model.MediaAsset asset;
+            try {
+                asset = socialFeedService.upload(userId, bytes, fields.required("fileName"));
+            } catch (edu.ember.common.exceptions.MediaValidationException exception) {
+                auditLogger.log("upload_rejected", userId, "image");
+                throw exception;
+            }
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_MEDIA_OK, frame.correlationId(),
+                    java.util.Map.of("mediaId", asset.mediaId(), "width", Integer.toString(asset.width()),
+                            "height", Integer.toString(asset.height()))));
+        }
+
+        private void createPost(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            var post = socialFeedService.createPost(userId, fields.required("mediaId"),
+                    fields.required("caption"));
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_FEED_PAGE, frame.correlationId(),
+                    java.util.Map.of("post.n", "1", "post.0", post.postId(),
+                            "owner.0", post.ownerUserId(), "media.0", post.mediaId(),
+                            "caption.0", post.caption(), "created.0", Long.toString(post.createdAtMs()),
+                            "likes.0", "0", "comments.0", "0", "liked.0", "false")));
+        }
+
+        private void interactPost(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            if (fields.values.getOrDefault("action", "").equals("comments")) {
+                var comments = socialFeedService.comments(userId, fields.required("postId"));
+                java.util.Map<String, String> response = new java.util.HashMap<>();
+                response.put("postId", fields.required("postId"));
+                response.put("comment.n", Integer.toString(comments.size()));
+                for (int index = 0; index < comments.size(); index++) {
+                    var comment = comments.get(index);
+                    response.put("comment.id." + index, comment.commentId());
+                    response.put("comment.author." + index, comment.authorUserId());
+                    response.put("comment.text." + index, comment.text());
+                    response.put("comment.created." + index, Long.toString(comment.createdAtMs()));
+                }
+                send(edu.ember.common.protocol.FrameFactory.event(
+                        edu.ember.common.protocol.WireOpcodes.EVT_FEED_PAGE,
+                        frame.correlationId(), response));
+                return;
+            }
+            var post = socialFeedService.interact(userId, fields.required("postId"),
+                    fields.required("action"), fields.values.getOrDefault("text", ""));
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_FEED_PAGE, frame.correlationId(),
+                    java.util.Map.of("post.n", "1", "post.0", post.postId(),
+                            "owner.0", post.ownerUserId(), "media.0", post.mediaId(),
+                            "caption.0", post.caption(), "created.0", Long.toString(post.createdAtMs()),
+                            "likes.0", Integer.toString(post.likeCount()), "comments.0",
+                            Integer.toString(post.commentCount()), "liked.0",
+                            Boolean.toString(post.likedByViewer()))));
+        }
+
+        private void pullFeed(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            String owner = fields.values.getOrDefault("ownerUserId", "");
+            if (!owner.isEmpty()) { socialFeedService.profile(owner); }
+            java.util.List<edu.ember.common.model.SocialPost> posts = socialFeedService.feed(
+                    owner, userId, Integer.parseInt(fields.values.getOrDefault("limit", "30")));
+            java.util.Map<String, String> response = new java.util.HashMap<>();
+            response.put("post.n", Integer.toString(posts.size()));
+            for (int index = 0; index < posts.size(); index++) {
+                var post = posts.get(index);
+                response.put("post." + index, post.postId());
+                response.put("owner." + index, post.ownerUserId());
+                response.put("media." + index, post.mediaId());
+                response.put("caption." + index, post.caption());
+                response.put("created." + index, Long.toString(post.createdAtMs()));
+                response.put("likes." + index, Integer.toString(post.likeCount()));
+                response.put("comments." + index, Integer.toString(post.commentCount()));
+                response.put("liked." + index, Boolean.toString(post.likedByViewer()));
+            }
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_FEED_PAGE,
+                    frame.correlationId(), response));
+        }
+
+        private void getProfile(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            String target = new MapFields(frame.payload()).required("userId");
+            var profile = socialFeedService.profile(target);
+            java.util.Map<String, String> response = profileFields(profile);
+            response.put("followerCount", Integer.toString(storage.followersOf(target).size()));
+            response.put("followingCount", Integer.toString(storage.followingOf(target).size()));
+            response.put("following", Boolean.toString(storage.followingOf(userId).contains(target)));
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_PROFILE_DATA,
+                    frame.correlationId(), response));
+        }
+
+        private void getMedia(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            byte[] image = socialFeedService.media(userId, fields.required("mediaId"),
+                    Boolean.parseBoolean(fields.values.getOrDefault("thumbnail", "true")));
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_MEDIA_DATA, frame.correlationId(),
+                    java.util.Map.of("mediaId", fields.required("mediaId"),
+                            "data", java.util.Base64.getEncoder().encodeToString(image))));
+        }
+
+        private java.util.Map<String, String> profileFields(edu.ember.common.model.UserProfile profile) {
+            return new java.util.HashMap<>(java.util.Map.of("userId", profile.userId(),
+                    "displayName", profile.displayName(), "bio", profile.bio(),
+                    "avatarMediaId", profile.avatarMediaId()));
         }
 
         private void sendGroupUpdate(long correlationId, String groupId) throws IOException,
