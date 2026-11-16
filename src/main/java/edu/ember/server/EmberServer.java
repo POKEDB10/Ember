@@ -19,6 +19,7 @@ import javax.net.ssl.SSLServerSocket;
 /** Accepts TLS connections and routes each connection on a named platform thread. @concept threads, inner classes */
 public final class EmberServer implements AutoCloseable {
     private final SSLServerSocket serverSocket;
+    private volatile java.net.ServerSocket httpSocket;
     private final StorageEngine storage;
     private final AuthService authService;
     private final GroupService groupService;
@@ -37,7 +38,8 @@ public final class EmberServer implements AutoCloseable {
     private final AutoSaveThread autoSaveThread;
     private final ExpiryReaperThread expiryReaperThread;
     private final SessionStore sessions = new SessionStore();
-    private final java.util.concurrent.ConcurrentMap<String, ConnectionHandler> online =
+    /** Every live connection per user, so several devices can be signed in at once. */
+    private final java.util.concurrent.ConcurrentMap<String, java.util.Set<ConnectionHandler>> online =
             new java.util.concurrent.ConcurrentHashMap<>();
     private final ExecutorService clients = Executors.newCachedThreadPool(runnable -> {
         Thread thread = new Thread(runnable, "ember-connection-reader");
@@ -71,7 +73,14 @@ public final class EmberServer implements AutoCloseable {
     public EmberServer(Path keyStore, char[] password, int port, StorageEngine storage,
             SecurityAuditLogger auditLogger, Path mediaDirectory, int storyTtlSec,
             java.util.Set<String> adminUsernames) throws Exception {
-        serverSocket = TlsSocketFactory.createServerSocket(keyStore, password, port);
+        this(keyStore, password, port, storage, auditLogger, mediaDirectory, storyTtlSec,
+                adminUsernames, "127.0.0.1");
+    }
+
+    public EmberServer(Path keyStore, char[] password, int port, StorageEngine storage,
+            SecurityAuditLogger auditLogger, Path mediaDirectory, int storyTtlSec,
+            java.util.Set<String> adminUsernames, String bindAddress) throws Exception {
+        serverSocket = TlsSocketFactory.createServerSocket(keyStore, password, port, bindAddress);
         this.storage = storage;
         this.auditLogger = auditLogger;
         this.adminUsernames = adminUsernames.stream()
@@ -93,6 +102,8 @@ public final class EmberServer implements AutoCloseable {
         boolean demoSeed = false;
         int storyTtlSec = 86_400;
         java.util.Set<String> adminUsernames = new java.util.HashSet<>();
+        String bindAddress = "0.0.0.0";
+        int httpPort = -1;
         for (int index = 0; index < args.length; index++) {
             if (args[index].equals("--port")) {
                 port = Integer.parseInt(args[++index]);
@@ -104,6 +115,10 @@ public final class EmberServer implements AutoCloseable {
                 storyTtlSec = Integer.parseInt(args[++index]);
             } else if (args[index].equals("--admin-user")) {
                 adminUsernames.add(args[++index]);
+            } else if (args[index].equals("--http-port")) {
+                httpPort = Integer.parseInt(args[++index]);
+            } else if (args[index].equals("--bind")) {
+                bindAddress = args[++index];
             } else if (args[index].equals("--demo-seed")) {
                 demoSeed = true;
             }
@@ -121,7 +136,7 @@ public final class EmberServer implements AutoCloseable {
         EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, port,
                 new WalStorageEngine(dataDirectory, strictDurability),
                 new SecurityAuditLogger(Path.of("logs", "security-audit.json")),
-                dataDirectory.resolve("media"), storyTtlSec, adminUsernames);
+                dataDirectory.resolve("media"), storyTtlSec, adminUsernames, bindAddress);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 server.close();
@@ -131,7 +146,12 @@ public final class EmberServer implements AutoCloseable {
             }
         }, "ember-server-shutdown"));
         server.start();
-        System.out.println("Ember server listening on 127.0.0.1:" + server.port());
+        System.out.println("Ember server listening on " + bindAddress + ":" + server.port()
+                + " (desktop app, and web app at https://<this-host>:" + server.port() + "/)");
+        if (httpPort >= 0) {
+            System.out.println("Web app for a local reverse proxy at http://127.0.0.1:"
+                    + server.startHttp(httpPort) + "/");
+        }
         new java.util.concurrent.CountDownLatch(1).await();
     }
 
@@ -164,9 +184,21 @@ public final class EmberServer implements AutoCloseable {
     public void start() {
         autoSaveThread.start();
         expiryReaperThread.start();
-        Thread acceptThread = new Thread(this::acceptLoop, "ember-tls-accept");
+        Thread acceptThread = new Thread(() -> acceptLoop(serverSocket), "ember-tls-accept");
         acceptThread.setDaemon(true);
         acceptThread.start();
+    }
+
+    /**
+     * Plain-HTTP web app listener on loopback only, for a TLS reverse proxy (Caddy, nginx) that
+     * holds a browser-trusted certificate. Serves web pages and WebSockets, never desktop frames.
+     */
+    public int startHttp(int port) throws IOException {
+        httpSocket = new java.net.ServerSocket(port, 50, java.net.InetAddress.getLoopbackAddress());
+        Thread acceptThread = new Thread(() -> acceptLoop(httpSocket), "ember-http-accept");
+        acceptThread.setDaemon(true);
+        acceptThread.start();
+        return httpSocket.getLocalPort();
     }
 
     @Override
@@ -175,6 +207,9 @@ public final class EmberServer implements AutoCloseable {
         autoSaveThread.interrupt();
         expiryReaperThread.interrupt();
         serverSocket.close();
+        if (httpSocket != null) {
+            httpSocket.close();
+        }
         clients.shutdownNow();
         try {
             expiryReaperThread.join(1_000);
@@ -184,11 +219,10 @@ public final class EmberServer implements AutoCloseable {
         storage.close();
     }
 
-    private void acceptLoop() {
+    private void acceptLoop(java.net.ServerSocket listener) {
         while (running.get()) {
             try {
-                ConnectionHandler handler = new ConnectionHandler(
-                        (javax.net.ssl.SSLSocket) serverSocket.accept());
+                ConnectionHandler handler = new ConnectionHandler(listener.accept());
                 clients.execute(handler);
             } catch (SocketException exception) {
                 if (running.get()) {
@@ -204,11 +238,8 @@ public final class EmberServer implements AutoCloseable {
     }
 
     private void disconnect(ConnectionHandler handler) {
-        if (handler.userId != null) {
-            boolean wasOnline = online.remove(handler.userId, handler);
-            if (wasOnline) {
-                broadcastPresence(handler.userId, false);
-            }
+        if (handler.userId != null && removeOnline(handler.userId, handler)) {
+            broadcastPresence(handler.userId, false);
         }
         try {
             handler.socket.close();
@@ -220,31 +251,44 @@ public final class EmberServer implements AutoCloseable {
 
     /** Owns one connection's authenticated identity and frame routing. @concept member inner class, threads */
     private final class ConnectionHandler implements Runnable {
-        private final javax.net.ssl.SSLSocket socket;
+        private final java.net.Socket socket;
         private final Object outputLock = new Object();
         private java.io.OutputStream output;
         private String userId;
         private String token;
 
-        private ConnectionHandler(javax.net.ssl.SSLSocket socket) {
+        private ConnectionHandler(java.net.Socket socket) {
             this.socket = socket;
         }
 
         @Override
         public void run() {
             try (socket) {
-                socket.setEnabledProtocols(new String[] {"TLSv1.3"});
                 socket.setSoTimeout(45_000);
-                socket.startHandshake();
-                output = socket.getOutputStream();
-                java.io.InputStream input = socket.getInputStream();
+                if (socket instanceof javax.net.ssl.SSLSocket tls) {
+                    tls.setEnabledProtocols(new String[] {"TLSv1.3"});
+                    tls.startHandshake();
+                }
+                // Buffered so each frame leaves as one TLS record instead of one per header field.
+                output = new java.io.BufferedOutputStream(socket.getOutputStream());
+                java.io.InputStream input = new java.io.BufferedInputStream(socket.getInputStream());
+                boolean http = WebGateway.isHttp(input);
+                if (!http && !(socket instanceof javax.net.ssl.SSLSocket)) {
+                    return; // the plain listener is web-only; desktop frames need TLS
+                }
+                if (http) {
+                    WebGateway.Upgrade upgrade = WebGateway.serve(input, output);
+                    if (upgrade == null) {
+                        return;
+                    }
+                    input = upgrade.input();
+                    output = upgrade.output();
+                }
                 while (running.get() && !socket.isClosed()) {
                     try {
+                        // Before login only small frames; after login there is no size cap.
                         var frame = edu.ember.common.protocol.FrameCodec.readFrame(input,
-                                userId == null ? 4096 : 64 * 1024,
-                                userId == null ? -1
-                                        : edu.ember.common.protocol.WireOpcodes.CMD_MEDIA_UPLOAD,
-                                7 * 1024 * 1024);
+                                userId == null ? 4096 : Integer.MAX_VALUE);
                         route(frame);
                     } catch (IOException | edu.ember.common.exceptions.EmberException exception) {
                         break;
@@ -325,9 +369,8 @@ public final class EmberServer implements AutoCloseable {
             var user = register
                     ? authService.register(username, password, fields.required("displayName"))
                     : authService.login(username, password);
-            userId = user.userId();
+            goOnline(user.userId());
             token = sessions.create(userId);
-            online.put(userId, this);
             java.util.Map<String, String> response = new java.util.HashMap<>();
             response.put("token", token);
             response.put("userId", userId);
@@ -351,9 +394,8 @@ public final class EmberServer implements AutoCloseable {
                 sendError(frame.correlationId(), "401", "Authentication required");
                 return;
             }
-            userId = resumedUser;
+            goOnline(resumedUser);
             token = suppliedToken;
-            online.put(userId, this);
             java.util.Map<String, String> response = new java.util.HashMap<>();
             response.put("token", token);
             response.put("userId", userId);
@@ -366,6 +408,20 @@ public final class EmberServer implements AutoCloseable {
             sendSync(Long.parseLong(fields.required("lastGlobalSeq")));
             sendPresenceSnapshot(this);
             broadcastPresence(userId, true);
+        }
+
+        private void goOnline(String newUserId) {
+            if (userId != null && !userId.equals(newUserId)) {
+                removeOnline(userId, this);
+            }
+            userId = newUserId;
+            // compute(), not computeIfAbsent().add(), so a concurrent removeOnline cannot drop us.
+            online.compute(newUserId, (ignored, devices) -> {
+                java.util.Set<ConnectionHandler> set = devices != null ? devices
+                        : java.util.concurrent.ConcurrentHashMap.newKeySet();
+                set.add(this);
+                return set;
+            });
         }
 
         private void sendSync(long sinceGlobalSeq) throws IOException {
@@ -454,10 +510,7 @@ public final class EmberServer implements AutoCloseable {
                     java.util.Map.of("convId", conversationId, "userId", userId,
                             "typing", Boolean.toString(isTyping)));
             for (String recipient : recipients) {
-                ConnectionHandler target = online.get(recipient);
-                if (target != null) {
-                    target.send(event);
-                }
+                sendToUser(recipient, event, null);
             }
         }
 
@@ -569,9 +622,6 @@ public final class EmberServer implements AutoCloseable {
             requireAuthenticated(frame.correlationId());
             MapFields fields = new MapFields(frame.payload());
             String encoded = fields.required("data");
-            if (encoded.length() > 7 * 1024 * 1024) {
-                throw new edu.ember.common.exceptions.MediaValidationException("Image upload exceeds the 5 MB limit");
-            }
             byte[] bytes;
             try {
                 bytes = java.util.Base64.getDecoder().decode(encoded);
@@ -749,8 +799,7 @@ public final class EmberServer implements AutoCloseable {
             var event = edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_POLL_UPDATE, 0, fields);
             for (String member : groupService.memberIds(poll.groupId())) {
-                ConnectionHandler connection = online.get(member);
-                if (connection != null) { connection.send(event); }
+                sendToUser(member, event, null);
             }
         }
 
@@ -856,10 +905,7 @@ public final class EmberServer implements AutoCloseable {
             var event = edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_GROUP_UPDATE, correlationId, fields);
             for (String memberId : groupService.memberIds(groupId)) {
-                ConnectionHandler member = online.get(memberId);
-                if (member != null) {
-                    member.send(event);
-                }
+                sendToUser(memberId, event, null);
             }
         }
 
@@ -944,14 +990,12 @@ public final class EmberServer implements AutoCloseable {
             storage.appendMessage(message);
             receiptTrackers.put(receiptKey(message), new GroupReceiptTracker(recipients.size()));
             sendMessageAck(frame.correlationId(), message);
+            var deliver = edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_MSG_DELIVER, 0, messageFields(message));
             for (String recipient : recipients) {
-                ConnectionHandler target = online.get(recipient);
-                if (target != null) {
-                    target.send(edu.ember.common.protocol.FrameFactory.event(
-                            edu.ember.common.protocol.WireOpcodes.EVT_MSG_DELIVER, 0,
-                            messageFields(message)));
-                }
+                sendToUser(recipient, deliver, null);
             }
+            sendToUser(userId, deliver, this); // the sender's other signed-in devices
         }
 
         private void reactMessage(edu.ember.common.protocol.WireFrame frame) throws IOException,
@@ -1061,10 +1105,10 @@ public final class EmberServer implements AutoCloseable {
             requireMessageConversationAccess(message);
             boolean starred = Boolean.parseBoolean(fields.required("starred"));
             storage.setMessageStarred(id, userId, starred);
-            send(edu.ember.common.protocol.FrameFactory.event(
+            sendToUser(userId, edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_MSG_UPDATE, frame.correlationId(),
                     java.util.Map.of("state", "STARRED", "clientMsgId", id,
-                            "userId", userId, "starred", Boolean.toString(starred))));
+                            "userId", userId, "starred", Boolean.toString(starred))), null);
         }
 
         private void broadcastMessageState(edu.ember.common.model.Message message,
@@ -1091,8 +1135,7 @@ public final class EmberServer implements AutoCloseable {
                 recipients = groupService.memberIds(conversationId.substring(4));
             }
             for (String recipient : recipients) {
-                ConnectionHandler target = online.get(recipient);
-                if (target != null) { target.send(event); }
+                sendToUser(recipient, event, null);
             }
         }
 
@@ -1194,8 +1237,7 @@ public final class EmberServer implements AutoCloseable {
             } else if (summary.delivered() == summary.total()) {
                 storage.updateMessageStatus(messageId, edu.ember.common.model.MessageStatus.DELIVERED);
             }
-            ConnectionHandler sender = online.get(message.get().senderUserId());
-            if (sender != null) {
+            {
                 java.util.Map<String, String> receipt = new java.util.HashMap<>();
                 receipt.put("clientMsgId", messageId);
                 receipt.put("status", requestedStatus);
@@ -1203,8 +1245,8 @@ public final class EmberServer implements AutoCloseable {
                 receipt.put("read", Integer.toString(summary.read()));
                 receipt.put("total", Integer.toString(summary.total()));
                 receipt.put("readBy", String.join(", ", summary.readBy()));
-                sender.send(edu.ember.common.protocol.FrameFactory.event(
-                        edu.ember.common.protocol.WireOpcodes.EVT_RECEIPT_UPDATE, 0, receipt));
+                sendToUser(message.get().senderUserId(), edu.ember.common.protocol.FrameFactory.event(
+                        edu.ember.common.protocol.WireOpcodes.EVT_RECEIPT_UPDATE, 0, receipt), null);
             }
         }
 
@@ -1237,17 +1279,38 @@ public final class EmberServer implements AutoCloseable {
 
     }
 
-    private void broadcastPresence(String userId, boolean isOnline) {
-        var event = edu.ember.common.protocol.FrameFactory.event(
-                edu.ember.common.protocol.WireOpcodes.EVT_PRESENCE_UPDATE, 0,
-                java.util.Map.of("userId", userId, "online", Boolean.toString(isOnline)));
-        for (ConnectionHandler handler : online.values()) {
+    /** Sends to every device the user is signed in on; one dead device never fails the caller. */
+    private void sendToUser(String targetUserId, edu.ember.common.protocol.WireFrame event,
+            ConnectionHandler skip) {
+        for (ConnectionHandler handler : online.getOrDefault(targetUserId, java.util.Set.of())) {
+            if (handler == skip) {
+                continue;
+            }
             try {
                 handler.send(event);
             } catch (IOException exception) {
                 java.util.logging.Logger.getLogger(EmberServer.class.getName())
-                        .log(Level.FINE, "Presence notification failed", exception);
+                        .log(Level.FINE, "Event delivery failed", exception);
             }
+        }
+    }
+
+    /** Removes one device; returns true when it was the user's last live device. */
+    private boolean removeOnline(String targetUserId, ConnectionHandler handler) {
+        boolean[] wentOffline = new boolean[1];
+        online.computeIfPresent(targetUserId, (ignored, devices) -> {
+            wentOffline[0] = devices.remove(handler) && devices.isEmpty();
+            return devices.isEmpty() ? null : devices;
+        });
+        return wentOffline[0];
+    }
+
+    private void broadcastPresence(String userId, boolean isOnline) {
+        var event = edu.ember.common.protocol.FrameFactory.event(
+                edu.ember.common.protocol.WireOpcodes.EVT_PRESENCE_UPDATE, 0,
+                java.util.Map.of("userId", userId, "online", Boolean.toString(isOnline)));
+        for (String onlineUser : online.keySet()) {
+            sendToUser(onlineUser, event, null);
         }
     }
 
@@ -1256,13 +1319,8 @@ public final class EmberServer implements AutoCloseable {
                 edu.ember.common.protocol.WireOpcodes.EVT_MSG_UPDATE, 0,
                 java.util.Map.of("clientMsgId", message.clientMsgId(),
                         "convId", message.conversationId(), "state", "EXPIRED"));
-        for (ConnectionHandler handler : online.values()) {
-            try {
-                handler.send(event);
-            } catch (IOException exception) {
-                java.util.logging.Logger.getLogger(EmberServer.class.getName())
-                        .log(Level.FINE, "Expiry notification failed", exception);
-            }
+        for (String onlineUser : online.keySet()) {
+            sendToUser(onlineUser, event, null);
         }
     }
 
