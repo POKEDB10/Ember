@@ -1,6 +1,9 @@
 package edu.ember.client.ui;
 
 import edu.ember.client.ClientController;
+import edu.ember.client.ClientModelListener;
+import edu.ember.client.ClientStateModel;
+import edu.ember.common.model.Message;
 import java.awt.BorderLayout;
 import java.awt.CardLayout;
 import java.util.function.Consumer;
@@ -11,7 +14,7 @@ import javax.swing.SwingUtilities;
 import javax.swing.border.EmptyBorder;
 
 /** Composes the navigation rail, chat list, conversation, and settings screens. @concept CardLayout, MVC */
-public final class ChatWorkspacePanel extends JPanel {
+public final class ChatWorkspacePanel extends JPanel implements ClientModelListener {
     private final CardLayout pages = new CardLayout();
     private final JPanel content = new JPanel(pages);
     private final ChatListPanel chatList;
@@ -21,11 +24,15 @@ public final class ChatWorkspacePanel extends JPanel {
     private final SettingsPanel settings;
     private final CampusPulsePanel campusPulse;
     private final ProfilePanel profile;
+    private final AdminConsolePanel adminConsole;
+    private final JButton admin = new JButton("Admin");
+    private final ClientController controller;
 
     public ChatWorkspacePanel(ClientController controller, Runnable themeChanged,
             java.util.function.Consumer<Boolean> readReceipts, Runnable simulateNetworkDrop,
             Consumer<String> openConversation) {
         super(new BorderLayout());
+        this.controller = controller;
         setBackground(ThemeManager.current().background());
         conversation = new ConversationPanel(controller);
         chatList = new ChatListPanel(controller, id -> {
@@ -43,6 +50,8 @@ public final class ChatWorkspacePanel extends JPanel {
         content.add(campusPulse, "PULSE");
         profile = new ProfilePanel(controller);
         content.add(profile, "PROFILE");
+        adminConsole = new AdminConsolePanel(controller);
+        content.add(adminConsole, "ADMIN");
         rail.setBorder(new EmptyBorder(8, 6, 8, 6));
         rail.setBackground(ThemeManager.current().surface());
         rail.setLayout(new javax.swing.BoxLayout(rail, javax.swing.BoxLayout.Y_AXIS));
@@ -50,6 +59,7 @@ public final class ChatWorkspacePanel extends JPanel {
         JButton settings = new JButton("Settings");
         JButton pulse = new JButton("Campus Pulse");
         JButton profile = new JButton("Profile");
+        admin.setVisible(false);
         chats.addActionListener(event -> pages.show(content, "CHATS"));
         settings.addActionListener(event -> pages.show(content, "SETTINGS"));
         pulse.addActionListener(event -> {
@@ -57,7 +67,11 @@ public final class ChatWorkspacePanel extends JPanel {
             controller.requestFeed(null);
         });
         profile.addActionListener(event -> pages.show(content, "PROFILE"));
-        for (JButton button : java.util.List.of(chats, pulse, profile, settings)) {
+        admin.addActionListener(event -> {
+            pages.show(content, "ADMIN");
+            controller.requestAdminData();
+        });
+        for (JButton button : java.util.List.of(chats, pulse, profile, settings, admin)) {
             button.setMaximumSize(new java.awt.Dimension(140, 44));
             button.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
         }
@@ -65,12 +79,18 @@ public final class ChatWorkspacePanel extends JPanel {
         rail.add(pulse);
         rail.add(profile);
         rail.add(settings);
+        rail.add(admin);
         add(rail, BorderLayout.WEST);
         add(content, BorderLayout.CENTER);
         add(toast, BorderLayout.SOUTH);
         setMinimumSize(new java.awt.Dimension(960, 640));
         setPreferredSize(new java.awt.Dimension(1200, 780));
         ThemeManager.applyToTree(this);
+        controller.addListener(this);
+    }
+
+    @Override public void onModelChanged(ClientStateModel model, String eventType, Message message) {
+        if (eventType.equals("AUTH_OK")) { admin.setVisible(model.administrator()); }
     }
 
     public ChatListPanel chatList() { return chatList; }
@@ -87,6 +107,7 @@ public final class ChatWorkspacePanel extends JPanel {
         settings.applyTheme();
         campusPulse.applyTheme();
         profile.applyTheme();
+        adminConsole.setBackground(ThemeManager.current().background());
         toast.setBackground(ThemeManager.current().elevated());
         revalidate();
         repaint();

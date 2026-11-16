@@ -12,6 +12,7 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
+import javax.swing.JCheckBox;
 import javax.swing.border.EmptyBorder;
 
 /** Edits the signed-in profile and follows a selected public account. @concept MVC, Swing forms */
@@ -21,7 +22,8 @@ public final class ProfilePanel extends JPanel implements ClientModelListener {
     private final JTextField displayName = new JTextField();
     private final JTextArea bio = new JTextArea(5, 30);
     private final JTextField target = new JTextField();
-    private final JLabel counts = new JLabel("Your public profile");
+    private final JCheckBox privateAccount = new JCheckBox("Private account (approval required to follow)");
+    private final JLabel counts = new JLabel("Your profile");
 
     public ProfilePanel(ClientController controller) {
         super(new BorderLayout(10, 10));
@@ -37,11 +39,14 @@ public final class ProfilePanel extends JPanel implements ClientModelListener {
         bio.setLineWrap(true);
         bio.setWrapStyleWord(true);
         fields.add(new javax.swing.JScrollPane(bio));
+        privateAccount.setOpaque(false);
+        fields.add(privateAccount);
         JButton save = new JButton("Save profile");
-        save.addActionListener(event -> controller.updateProfile(displayName.getText(), bio.getText()));
+        save.addActionListener(event -> controller.updateProfile(displayName.getText(), bio.getText(),
+                privateAccount.isSelected()));
         fields.add(save);
         fields.add(counts);
-        fields.add(new JLabel("Follow or unfollow by username"));
+        fields.add(new JLabel("Account ID (for follow, block, report, or request review)"));
         JPanel followControls = new JPanel();
         followControls.setOpaque(false);
         followControls.add(target);
@@ -51,7 +56,29 @@ public final class ProfilePanel extends JPanel implements ClientModelListener {
         unfollow.addActionListener(event -> controller.follow(target.getText().strip(), false));
         followControls.add(follow);
         followControls.add(unfollow);
+        JButton approve = new JButton("Approve request");
+        approve.addActionListener(event -> controller.approveFollow(target.getText().strip(), true));
+        JButton reject = new JButton("Reject request");
+        reject.addActionListener(event -> controller.approveFollow(target.getText().strip(), false));
+        JButton block = new JButton("Block");
+        block.addActionListener(event -> controller.blockUser(target.getText().strip(), true));
+        JButton unblock = new JButton("Unblock");
+        unblock.addActionListener(event -> controller.blockUser(target.getText().strip(), false));
+        followControls.add(approve);
+        followControls.add(reject);
+        followControls.add(block);
+        followControls.add(unblock);
         fields.add(followControls);
+        fields.add(new JLabel("Report type (profile, post, or message)"));
+        JTextField reportType = new JTextField("profile");
+        fields.add(reportType);
+        fields.add(new JLabel("Reason (up to 300 characters)"));
+        JTextField reportReason = new JTextField();
+        fields.add(reportReason);
+        JButton report = new JButton("Submit report for account ID above");
+        report.addActionListener(event -> controller.reportObject(reportType.getText().strip(),
+                target.getText().strip(), reportReason.getText()));
+        fields.add(report);
         add(fields, BorderLayout.NORTH);
         controller.addListener(this);
     }
@@ -64,6 +91,7 @@ public final class ProfilePanel extends JPanel implements ClientModelListener {
             if (profile != null) {
                 displayName.setText(profile.displayName());
                 bio.setText(profile.bio());
+                privateAccount.setSelected(profile.privateAccount());
             }
         }
     }

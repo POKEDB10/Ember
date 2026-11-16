@@ -5,6 +5,7 @@ import edu.ember.client.ClientModelListener;
 import edu.ember.client.ClientStateModel;
 import edu.ember.common.model.Message;
 import edu.ember.common.model.SocialPost;
+import edu.ember.common.model.StoryItem;
 import java.awt.BorderLayout;
 import java.awt.FlowLayout;
 import java.awt.Graphics2D;
@@ -28,6 +29,7 @@ public final class CampusPulsePanel extends JPanel implements ClientModelListene
     private final ClientController controller;
     private final ClientStateModel model;
     private final JPanel cards = new JPanel();
+    private final JPanel storyStrip = new JPanel(new FlowLayout(FlowLayout.LEADING, 8, 4));
     private final JTextField caption = new JTextField(30);
     private final JLabel status = new JLabel("Public campus feed");
     private final Set<String> requestedMedia = new HashSet<>();
@@ -47,16 +49,27 @@ public final class CampusPulsePanel extends JPanel implements ClientModelListene
         choose.addActionListener(event -> choosePhoto());
         JButton create = new JButton("Create post");
         create.addActionListener(event -> createPost());
+        JButton story = new JButton("Share story");
+        story.addActionListener(event -> createStory());
         JButton refresh = new JButton("Refresh");
-        refresh.addActionListener(event -> controller.requestFeed(null));
+        refresh.addActionListener(event -> {
+            controller.requestFeed(null);
+            controller.requestStories();
+        });
         controls.add(choose);
         controls.add(caption);
         controls.add(create);
+        controls.add(story);
         controls.add(refresh);
         controls.add(status);
         cards.setLayout(new javax.swing.BoxLayout(cards, javax.swing.BoxLayout.Y_AXIS));
         cards.setBackground(ThemeManager.current().background());
-        add(controls, BorderLayout.NORTH);
+        JPanel top = new JPanel(new BorderLayout());
+        top.setOpaque(false);
+        storyStrip.setOpaque(false);
+        top.add(controls, BorderLayout.NORTH);
+        top.add(storyStrip, BorderLayout.SOUTH);
+        add(top, BorderLayout.NORTH);
         add(new JScrollPane(cards), BorderLayout.CENTER);
         controller.addListener(this);
     }
@@ -97,15 +110,58 @@ public final class CampusPulsePanel extends JPanel implements ClientModelListene
         status.setText("Creating post…");
     }
 
+    private void createStory() {
+        if (uploadedMediaId.isBlank()) {
+            status.setText("Choose a photo before sharing a story");
+            return;
+        }
+        controller.createStory(uploadedMediaId, caption.getText());
+        uploadedMediaId = "";
+        caption.setText("");
+        status.setText("Sharing story…");
+    }
+
     @Override public void onModelChanged(ClientStateModel changed, String eventType, Message message) {
         if (eventType.equals("AUTH_OK")) {
             controller.requestFeed(null);
+            controller.requestStories();
         } else if (eventType.equals("MEDIA_UPLOADED")) {
             uploadedMediaId = changed.lastUploadedMediaId();
             status.setText("Photo ready · " + uploadedMediaId.substring(0, 8));
         } else if (eventType.equals("SOCIAL_FEED") || eventType.equals("MEDIA")) {
             renderPosts();
+            renderStories();
+        } else if (eventType.equals("STORY_FEED")) {
+            renderStories();
         }
+    }
+
+    private void renderStories() {
+        storyStrip.removeAll();
+        long now = System.currentTimeMillis();
+        for (StoryItem story : model.stories()) {
+            if (story.expiresAtMs() <= now) { continue; }
+            JButton item = new JButton("Story · " + story.ownerUserId().substring(0,
+                    Math.min(8, story.ownerUserId().length())));
+            item.addActionListener(event -> openStory(story));
+            storyStrip.add(item);
+            if (model.mediaBytes(story.mediaId()) == null
+                    && requestedMedia.add("story:" + story.mediaId())) {
+                controller.requestMedia(story.mediaId(), false);
+            }
+        }
+        storyStrip.revalidate();
+        storyStrip.repaint();
+    }
+
+    private void openStory(StoryItem story) {
+        byte[] image = model.mediaBytes(story.mediaId());
+        if (image == null) {
+            status.setText("Loading story image…");
+            controller.requestMedia(story.mediaId(), false);
+            return;
+        }
+        new StoryViewerDialog(javax.swing.SwingUtilities.getWindowAncestor(this), story, image).setVisible(true);
     }
 
     private void renderPosts() {
