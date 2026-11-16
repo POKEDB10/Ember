@@ -40,6 +40,7 @@ import edu.ember.server.TokenBucket;
 import edu.ember.server.UserLockManager;
 import edu.ember.server.storage.InMemoryStorageEngine;
 import edu.ember.server.storage.WalStorageEngine;
+import edu.ember.tools.DemoSeeder;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
@@ -124,6 +125,8 @@ public final class EmberTestSuite {
                 this::testExpiringMessages);
         runTest("replies, six quick reactions, and reaction authorization",
                 this::testRepliesAndReactions);
+        runTest("demo seed persists sample accounts and content idempotently",
+                this::testDemoSeeder);
         System.out.println("Ember tests: " + passed + " passed, " + failed + " failed.");
         if (failed != 0) {
             throw new AssertionError("Test suite failed");
@@ -1572,6 +1575,28 @@ public final class EmberTestSuite {
             if (charlie != null) charlie.close();
             server.close();
             java.util.Arrays.fill(password, '\0');
+        }
+    }
+
+    private void testDemoSeeder() throws Exception {
+        Path root = Path.of("build", "test-data", "demo-seed-" + System.nanoTime());
+        assertTrue(DemoSeeder.seed(root), "First demo seed did not populate the store");
+        assertFalse(DemoSeeder.seed(root), "Second demo seed was not idempotent");
+        try (WalStorageEngine storage = new WalStorageEngine(root, true)) {
+            storage.init();
+            assertTrue(storage.findUser("alice").isPresent(), "Seeded Alice account is missing");
+            assertTrue(storage.findUser("bob").isPresent(), "Seeded Bob account is missing");
+            assertTrue(storage.findUser("charlie").isPresent(), "Seeded Charlie account is missing");
+            assertEquals(3, storage.findGroup("study-group").orElseThrow().members().size(),
+                    "Seeded study group does not contain three members");
+            assertTrue(storage.findPost("demo-post", "bob").isPresent(),
+                    "Seeded Campus Pulse post is missing");
+            assertTrue(storage.findMedia("demo-campus").isPresent(), "Seeded image is missing");
+            assertEquals(1, storage.pollsForGroup("study-group").size(),
+                    "Seeded study group poll is missing");
+            assertEquals(1, storage.listStories().size(), "Seeded story is missing");
+            assertTrue(Files.exists(root.resolve("media").resolve("demo-campus.jpg")),
+                    "Seeded image file is missing");
         }
     }
 
