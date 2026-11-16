@@ -10,4 +10,10 @@ keytool -genkeypair -alias ember-server -keyalg RSA -keysize 2048 -validity 3650
 if errorlevel 1 exit /b %errorlevel%
 keytool -exportcert -alias ember-server -keystore config\ember-server.p12 -storepass "%EMBER_KEYSTORE_PASS%" -file config\ember-server.cer
 if errorlevel 1 exit /b %errorlevel%
-keytool -importcert -noprompt -alias ember-server -file config\ember-server.cer -storetype PKCS12 -keystore config\ember-client-trust.p12 -storepass "%EMBER_KEYSTORE_PASS%"
+if not exist build mkdir build
+set "EMBER_TRUSTSTORE_TEMP=build\ember-client-trust-%RANDOM%.p12"
+keytool -importcert -noprompt -alias ember-server -file config\ember-server.cer -storetype PKCS12 -keystore "%EMBER_TRUSTSTORE_TEMP%" -storepass "%EMBER_KEYSTORE_PASS%"
+if errorlevel 1 exit /b %errorlevel%
+copy /y "%EMBER_TRUSTSTORE_TEMP%" config\ember-client-trust.p12 > nul
+if errorlevel 1 exit /b %errorlevel%
+echo Client truststore refreshed from the generated server certificate.
