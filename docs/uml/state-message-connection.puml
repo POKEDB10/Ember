@@ -1,0 +1,22 @@
+@startuml
+state "Message status" as Message {
+  [*] --> PENDING_LOCAL
+  PENDING_LOCAL --> SENT : server stores / ACK
+  SENT --> DELIVERED : all recipients delivered
+  DELIVERED --> READ : all recipients read
+  SENT --> EXPIRED : TTL elapsed
+  DELIVERED --> EXPIRED : TTL elapsed
+  READ --> EXPIRED : TTL elapsed
+  PENDING_LOCAL --> [*] : local send rejected
+  EXPIRED --> [*] : reaper purges record
+}
+state "Client connection" as Connection {
+  [*] --> CONNECTING
+  CONNECTING --> AUTHENTICATED : EVT_AUTH_OK
+  AUTHENTICATED --> DISCONNECTED : socket ends
+  DISCONNECTED --> BACKOFF : reconnect scheduled
+  BACKOFF --> CONNECTING : delay elapsed
+  CONNECTING --> AUTHENTICATED : resume + sync complete
+  BACKOFF --> [*] : user closes app
+}
+@enduml

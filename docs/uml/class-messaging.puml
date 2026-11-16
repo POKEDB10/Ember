@@ -1,0 +1,30 @@
+@startuml
+skinparam classAttributeIconSize 0
+class ClientController {
+  +register(username, password, displayName)
+  +sendMessage(conversationId, body)
+  +markRead(conversationId, messageId)
+  +model()
+}
+class OutboundSenderThread
+class InboundReceiverThread
+class ClientStateModel
+interface ClientModelListener
+class EmberServer
+class "EmberServer.ConnectionHandler" as ConnectionHandler
+class AuthService
+class GroupService
+interface StorageEngine
+class WalStorageEngine
+class Message
+ClientController --> OutboundSenderThread : queues frames
+ClientController --> InboundReceiverThread : reads events
+ClientController --> ClientStateModel : updates
+ClientStateModel o--> ClientModelListener : notifies
+EmberServer *-- ConnectionHandler
+ConnectionHandler --> AuthService : authenticates
+ConnectionHandler --> GroupService : checks membership
+ConnectionHandler --> StorageEngine : reads / writes
+WalStorageEngine ..|> StorageEngine
+StorageEngine ..> Message : persists
+@enduml

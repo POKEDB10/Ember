@@ -1,0 +1,31 @@
+@startuml
+start
+:Open login panel;
+if (Register or sign in?) then (Register)
+  :Validate username and password;
+  :Send register command over TLS;
+else (Sign in)
+  :Send login command over TLS;
+endif
+:Server applies rate limit and password verification;
+if (Credentials accepted?) then (yes)
+  :Bind user identity to connection;
+  :Return token and sync events;
+  :Show chat workspace;
+else (no)
+  :Show authentication error;
+  stop
+endif
+:Select image in Campus Pulse;
+:SwingWorker reads image bytes;
+:Server validates signature and header dimensions;
+if (Image within limits?) then (yes)
+  :Decode and re-encode fresh RGB image;
+  :Save media metadata and thumbnail;
+  :Return media ID;
+  :Create post or story;
+else (no)
+  :Return validation error without full decode;
+endif
+stop
+@enduml

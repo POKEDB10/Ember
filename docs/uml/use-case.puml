@@ -1,0 +1,29 @@
+@startuml
+left to right direction
+actor Student
+actor Moderator
+actor Administrator
+rectangle Ember {
+  usecase "Register / sign in" as Auth
+  usecase "Send and read direct messages" as Direct
+  usecase "Create groups and manage members" as Groups
+  usecase "Send messages, reactions and polls" as GroupChat
+  usecase "Publish posts and stories" as Publish
+  usecase "Follow profiles and interact with posts" as Feed
+  usecase "Review reports and unlock accounts" as Admin
+  usecase "Authorize object access" as Authorize
+}
+Student --> Auth
+Student --> Direct
+Student --> Groups
+Student --> GroupChat
+Student --> Publish
+Student --> Feed
+Moderator --> Groups
+Moderator --> GroupChat
+Administrator --> Admin
+Direct ..> Authorize : <<include>>
+Groups ..> Authorize : <<include>>
+Publish ..> Authorize : <<include>>
+Feed ..> Authorize : <<include>>
+@enduml

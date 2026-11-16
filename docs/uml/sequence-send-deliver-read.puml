@@ -1,0 +1,22 @@
+@startuml
+actor Alice
+participant "ClientController (Alice)" as AliceController
+participant "OutboundSenderThread" as Sender
+participant "EmberServer.ConnectionHandler" as Handler
+participant "StorageEngine" as Storage
+participant "ClientController (Bob)" as BobController
+participant "ClientStateModel (Bob)" as BobModel
+Alice -> AliceController : sendMessage(convId, body)
+AliceController -> Sender : enqueue CMD_MSG_SEND
+Sender -> Handler : TLS frame
+Handler -> Storage : appendMessage(message)
+Storage --> Handler : conversation sequence
+Handler --> AliceController : EVT_MSG_ACK (SENT)
+Handler --> BobController : EVT_MSG_DELIVER
+BobController -> BobModel : addMessage(message)
+BobController -> Handler : CMD_MSG_RECEIPT DELIVERED
+Bob -> BobController : open conversation / markRead
+BobController -> Handler : CMD_MSG_RECEIPT READ
+Handler --> AliceController : EVT_RECEIPT_UPDATE
+AliceController -> AliceController : update receipt summary / READ
+@enduml
