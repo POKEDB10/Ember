@@ -14,11 +14,14 @@ import edu.ember.common.security.TlsSocketFactory;
 import edu.ember.common.security.ImageValidator;
 import edu.ember.common.exceptions.MediaValidationException;
 import edu.ember.common.model.UserProfile;
+import edu.ember.common.model.FollowStatus;
+import edu.ember.common.model.ModerationReport;
 import edu.ember.common.model.MediaAsset;
 import edu.ember.common.model.SocialPost;
 import edu.ember.common.model.PostComment;
 import edu.ember.client.ClientController;
 import edu.ember.client.ClientStateModel;
+import edu.ember.client.SearchEngine;
 import edu.ember.client.LocalOutbox;
 import edu.ember.client.ReconnectManager;
 import edu.ember.common.model.MessageStatus;
@@ -78,6 +81,7 @@ public final class EmberTestSuite {
 
     private void runAll() {
         runTest("KV codec round trip", this::testKvRoundTrip);
+        runTest("in-chat search matches every token including Arabic", this::testSearchEngine);
         runTest("bad frame magic rejected", this::testBadMagic);
         runTest("oversized frames rejected before payload read", this::testFrameLimits);
         runTest("password hashing and dummy verification", this::testPasswordHasher);
@@ -89,6 +93,7 @@ public final class EmberTestSuite {
         runTest("WAL restart recovers Arabic and emoji records and trims torn tail",
                 this::testWalTornTailRecovery);
         runTest("WAL CRC failure truncates invalid tail", this::testWalCrcRecovery);
+        runTest("compressed WAL snapshot compacts and restores later records", this::testWalSnapshotCompaction);
         runTest("WAL restart restores group members and roles", this::testWalGroupRecovery);
         runTest("server restart restores accounts and messages from WAL",
                 this::testWalServerRestart);
@@ -109,6 +114,16 @@ public final class EmberTestSuite {
                 this::testSocialWalRecovery);
         runTest("Campus Pulse TLS upload, feed, and object authorization",
                 this::testCampusPulseNetwork);
+        runTest("private profile requests, block enforcement, reports, and WAL recovery",
+                this::testPrivateBlockAndReport);
+        runTest("story upload, viewer access, WAL recovery, and TTL expiry",
+                this::testStories);
+        runTest("administrator report queue and role authorization over TLS",
+                this::testAdminConsoleProtocol);
+        runTest("15-second messages expire on both live clients",
+                this::testExpiringMessages);
+        runTest("replies, six quick reactions, and reaction authorization",
+                this::testRepliesAndReactions);
         System.out.println("Ember tests: " + passed + " passed, " + failed + " failed.");
         if (failed != 0) {
             throw new AssertionError("Test suite failed");
@@ -123,6 +138,15 @@ public final class EmberTestSuite {
         original.put("body", escaped);
         Map<String, String> decoded = KvPayloadCodec.decode(KvPayloadCodec.encode(original));
         assertEquals(original, decoded, "KV payload changed during UTF-8 round trip");
+    }
+
+    private void testSearchEngine() {
+        Message first = new Message("search-1", "alice", "dm:alice:bob",
+                "Campus study مرحبا", 1);
+        Message second = new Message("search-2", "bob", "dm:alice:bob",
+                "Campus event", 2);
+        List<Message> matches = new SearchEngine().search(List.of(first, second), "CAMPUS مرحبا");
+        assertEquals(List.of(first), matches, "Search should match every term case-insensitively");
     }
 
     private void testBadMagic() throws IOException {
@@ -236,6 +260,48 @@ public final class EmberTestSuite {
         }
         assertEquals(0L, Files.size(walFile), "Invalid CRC tail was not truncated");
         deleteTree(root);
+    }
+
+    private void testWalSnapshotCompaction() throws Exception {
+        Path directory = Files.createTempDirectory("ember-wal-snapshot");
+        Path walPath = directory.resolve("wal").resolve("events.wal");
+        WalStorageEngine first = new WalStorageEngine(directory, true);
+        first.init();
+        first.saveUser(new UserRecord("snapshot-alice", "snapshot-alice", "Alice", "hash"));
+        first.saveProfile(new UserProfile("snapshot-alice", "Alice", "Before snapshot", ""));
+        Message before = new Message("snapshot-before", "snapshot-alice", "dm:snapshot-alice:bob",
+                "Before snapshot 🌋", System.currentTimeMillis());
+        first.appendMessage(before);
+        byte[] coveredWal = Files.readAllBytes(walPath);
+        first.compact();
+        assertTrue(Files.exists(directory.resolve("snapshots").resolve("state.snap")),
+                "Snapshot file was not written");
+        assertEquals(0L, Files.size(walPath), "WAL was not compacted after snapshot commit");
+        first.close();
+        Files.write(walPath, coveredWal);
+        WalStorageEngine recovered = new WalStorageEngine(directory, true);
+        recovered.init();
+        assertEquals("Alice", recovered.findUser("snapshot-alice").orElseThrow().displayName(),
+                "Crash between snapshot replacement and WAL truncation replayed records twice");
+        Message after = new Message("snapshot-after", "snapshot-alice", "dm:snapshot-alice:bob",
+                "After snapshot 🌟", System.currentTimeMillis());
+        recovered.appendMessage(after);
+        recovered.saveProfile(new UserProfile("snapshot-alice", "Alice", "After snapshot", ""));
+        assertEquals("After snapshot", recovered.findProfile("snapshot-alice").orElseThrow().bio(),
+                "Post-snapshot records did not replay");
+        assertEquals("Before snapshot 🌋", recovered.findByClientMsgId("snapshot-before")
+                .orElseThrow().body(), "Snapshot data did not replay");
+        assertEquals("After snapshot 🌟", recovered.findByClientMsgId("snapshot-after")
+                .orElseThrow().body(), "WAL tail after snapshot did not replay");
+        assertTrue(coveredWal.length > 0 && Files.size(walPath) > 0,
+                "Snapshot test did not preserve its compacted prefix and new WAL tail");
+        recovered.compact();
+        recovered.close();
+        WalStorageEngine finalRecovery = new WalStorageEngine(directory, true);
+        finalRecovery.init();
+        assertEquals("After snapshot", finalRecovery.findProfile("snapshot-alice").orElseThrow().bio(),
+                "Repeated compaction lost the combined snapshot state");
+        finalRecovery.close();
     }
 
     private void testLockoutAndAudit() throws Exception {
@@ -552,11 +618,15 @@ public final class EmberTestSuite {
             CountDownLatch groupReady = new CountDownLatch(1);
             CountDownLatch groupMessages = new CountDownLatch(3);
             CountDownLatch groupRead = new CountDownLatch(1);
+            CountDownLatch pollCreated = new CountDownLatch(2);
+            CountDownLatch pollVoted = new CountDownLatch(2);
             CountDownLatch bobMemberDenied = new CountDownLatch(1);
             CountDownLatch eveSendDenied = new CountDownLatch(4);
             CountDownLatch eveReceiptDenied = new CountDownLatch(1);
             CountDownLatch senderReceiptDenied = new CountDownLatch(1);
+            CountDownLatch outsiderPollDenied = new CountDownLatch(1);
             AtomicReference<Boolean> expectEveReceiptError = new AtomicReference<>(false);
+            AtomicReference<Boolean> expectEvePollError = new AtomicReference<>(false);
             AtomicReference<String> groupId = new AtomicReference<>();
             for (String user : users) {
                 ClientController client = new ClientController("127.0.0.1", server.port(),
@@ -581,6 +651,12 @@ public final class EmberTestSuite {
                             && message.conversationId().equals("grp:" + groupId.get())) {
                         groupMessages.countDown();
                     }
+                    if (event.equals("POLL_UPDATE") && model.polls(groupId.get()).size() == 1) {
+                        pollCreated.countDown();
+                        if (model.polls(groupId.get()).get(0).totals().get(0) == 1) {
+                            pollVoted.countDown();
+                        }
+                    }
                     if (event.equals("RECEIPT") && message != null
                             && message.conversationId().equals("grp:" + groupId.get())) {
                         ClientStateModel.ReceiptSummary receipt = model.receiptSummary(message.clientMsgId());
@@ -599,6 +675,7 @@ public final class EmberTestSuite {
                             if (expectEveReceiptError.get()) {
                                 eveReceiptDenied.countDown();
                             }
+                            if (expectEvePollError.get()) { outsiderPollDenied.countDown(); }
                         } else if (user.equals("alice")) {
                             senderReceiptDenied.countDown();
                         }
@@ -612,10 +689,24 @@ public final class EmberTestSuite {
             clients.get("alice").createGroup("Study", "Study group");
             assertTrue(groupCreated.await(10, TimeUnit.SECONDS), "Group creation was not returned");
             String group = groupId.get();
+            clients.get("alice").requestGroupInfo(group);
+            waitFor(() -> clients.get("alice").model().groupDetails(group) != null,
+                    "Authorized group info was not returned");
+            assertEquals(UserRole.MODERATOR,
+                    clients.get("alice").model().groupDetails(group).roleOf("alice"),
+                    "Group info omitted the moderator role");
             clients.get("alice").changeGroupMember(group, "bob", "ADD");
             clients.get("alice").changeGroupMember(group, "charlie", "ADD");
             clients.get("alice").changeGroupMember(group, "dana", "ADD");
             assertTrue(groupReady.await(10, TimeUnit.SECONDS), "Group did not reach four members");
+            clients.get("alice").createPoll(group, "Study session?", List.of("Today", "Tomorrow"));
+            assertTrue(pollCreated.await(15, TimeUnit.SECONDS), "Group poll was not broadcast");
+            String pollId = clients.get("alice").model().polls(group).get(0).pollId();
+            clients.get("bob").votePoll(pollId, 0);
+            assertTrue(pollVoted.await(15, TimeUnit.SECONDS), "Poll vote totals did not update");
+            expectEvePollError.set(true);
+            clients.get("eve").votePoll(pollId, 0);
+            assertTrue(outsiderPollDenied.await(10, TimeUnit.SECONDS), "Outsider poll vote was allowed");
             clients.get("bob").changeGroupMember(group, "eve", "ADD");
             assertTrue(bobMemberDenied.await(10, TimeUnit.SECONDS), "Non-moderator member change was allowed");
             clients.get("eve").sendMessage("grp:" + group, "forbidden group send");
@@ -907,10 +998,31 @@ public final class EmberTestSuite {
         WalStorageEngine first = new WalStorageEngine(directory, true);
         first.init();
         first.saveUser(user);
-        first.saveProfile(new UserProfile("alice", "Alice", "Campus life", ""));
+        first.saveProfile(new UserProfile("alice", "Alice", "Campus life", "", true));
+        Message walMessage = new Message("wal-social-message", "alice", "dm:alice:bob",
+                "Saved message", 99);
+        first.appendMessage(walMessage);
+        first.setMessageReaction(walMessage.clientMsgId(), "bob", "🔥", true);
+        first.setMessagePinned(walMessage.clientMsgId(), true);
+        first.setMessageStarred(walMessage.clientMsgId(), "bob", true);
+        first.editMessage(walMessage.clientMsgId(), "Updated WAL text");
+        Message deletedMessage = new Message("wal-deleted-message", "alice", "dm:alice:bob",
+                "Delete me", 100);
+        first.appendMessage(deletedMessage);
+        first.deleteMessage(deletedMessage.clientMsgId());
         first.setFollow("bob", "alice", true);
+        first.setFollowStatus("charlie", "alice", FollowStatus.PENDING);
+        first.setBlocked("alice", "charlie", true);
+        first.saveReport(new ModerationReport("report-1", "bob", "profile", "alice",
+                "Abusive profile 🌋", 103));
         first.saveMedia(media);
         first.savePost(post);
+        first.saveStory(new edu.ember.common.model.StoryItem("story-1", "alice", "media-1",
+                "WAL story 🌋", System.currentTimeMillis(), System.currentTimeMillis() + 60_000));
+        edu.ember.common.model.PollData poll = new edu.ember.common.model.PollData("poll-1",
+                "group-1", "When?", List.of("Today", "Tomorrow"), List.of("alice", "bob"));
+        first.savePoll(poll);
+        first.votePoll("poll-1", "bob", 1);
         first.setPostLike(post.postId(), "bob", true);
         first.addComment(new PostComment("comment-1", post.postId(), "bob", "مرحبا 🌋", 102));
         first.close();
@@ -918,6 +1030,18 @@ public final class EmberTestSuite {
         recovered.init();
         assertEquals("Campus life", recovered.findProfile("alice").orElseThrow().bio(),
                 "Profile was not restored from WAL");
+        assertTrue(recovered.findProfile("alice").orElseThrow().privateAccount(),
+                "Private-account setting was not restored from WAL");
+        assertTrue(recovered.isBlockedEitherDirection("alice", "charlie"),
+                "Block relationship was not restored from WAL");
+        assertEquals("Abusive profile 🌋", recovered.listReports().get(0).reason(),
+                "Moderation report was not restored from WAL");
+        assertEquals("WAL story 🌋", recovered.findStory("story-1").orElseThrow().caption(),
+                "Story was not restored from WAL");
+        assertEquals(List.of(0, 1), recovered.findPoll("poll-1").orElseThrow().totals(),
+                "Poll and vote were not restored from WAL");
+        assertTrue(recovered.followStatus("charlie", "alice").isEmpty(),
+                "Blocking did not clear a pending follow in recovered state");
         assertEquals(List.of("bob"), recovered.followersOf("alice"),
                 "Follow relationship was not restored from WAL");
         SocialPost restored = recovered.findPost(post.postId(), "bob").orElseThrow();
@@ -925,6 +1049,15 @@ public final class EmberTestSuite {
                 "Post like was not restored from WAL");
         assertEquals("مرحبا 🌋", recovered.commentsForPost(post.postId(), 10).get(0).text(),
                 "Comment text did not survive WAL UTF-8 replay");
+        assertEquals(1, recovered.findByClientMsgId(walMessage.clientMsgId()).orElseThrow()
+                .reactionCounts().get("🔥"), "Message reaction was not restored from WAL");
+        Message restoredMessage = recovered.findByClientMsgId(walMessage.clientMsgId()).orElseThrow();
+        assertTrue(restoredMessage.pinned() && restoredMessage.starredBy("bob"),
+                "Pinned or starred message state was not restored from WAL");
+        assertEquals("Updated WAL text", recovered.findByClientMsgId(walMessage.clientMsgId())
+                .orElseThrow().body(), "Message edit was not restored from WAL");
+        assertTrue(recovered.findByClientMsgId(deletedMessage.clientMsgId()).isEmpty(),
+                "Message deletion was not restored from WAL");
         recovered.close();
     }
 
@@ -1043,6 +1176,206 @@ public final class EmberTestSuite {
         }
     }
 
+    private void testPrivateBlockAndReport() throws Exception {
+        Path config = Path.of("config");
+        Path temporary = Files.createTempDirectory("ember-private-profile");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        InMemoryStorageEngine storage = new InMemoryStorageEngine();
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0,
+                storage, new SecurityAuditLogger(temporary.resolve("audit.json")),
+                temporary.resolve("media"));
+        ClientController alice = null;
+        ClientController bob = null;
+        try {
+            server.start();
+            Path trust = config.resolve("ember-client-trust.p12");
+            alice = new ClientController("127.0.0.1", server.port(), trust, password,
+                    temporary.resolve("client-a"));
+            bob = new ClientController("127.0.0.1", server.port(), trust, password,
+                    temporary.resolve("client-b"));
+            CountDownLatch authenticated = new CountDownLatch(2);
+            CountDownLatch bobError = new CountDownLatch(2);
+            bob.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("ERROR") && "404".equals(model.errorCode())) bobError.countDown();
+            });
+            alice.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+            });
+            alice.register("privatealice", "alice-pass-42".toCharArray(), "Private Alice");
+            bob.register("privatebob", "bob-pass-42".toCharArray(), "Private Bob");
+            assertTrue(authenticated.await(30, TimeUnit.SECONDS), "Private-account clients did not authenticate");
+            String aliceId = alice.model().userId();
+            String bobId = bob.model().userId();
+            ClientController bobClient = bob;
+            alice.updateProfile("Private Alice", "Members only", true);
+            waitFor(() -> storage.findProfile(aliceId).orElseThrow().privateAccount(),
+                    "Private setting was not saved");
+            bob.requestProfile(aliceId);
+            bob.requestFeed(aliceId);
+            assertTrue(bobError.await(20, TimeUnit.SECONDS),
+                    "A non-follower could access a private profile or feed");
+            bob.follow(aliceId, true);
+            waitFor(() -> storage.followStatus(bobId, aliceId).orElse(null) == FollowStatus.PENDING,
+                    "Private follow request was not recorded as pending");
+            alice.approveFollow(bobId, true);
+            waitFor(() -> storage.followStatus(bobId, aliceId).orElse(null) == FollowStatus.ACCEPTED,
+                    "Owner approval did not accept the follow request");
+            bob.requestProfile(aliceId);
+            waitFor(() -> bobClient.model().profile(aliceId) != null,
+                    "Approved follower could not access private profile");
+            bob.blockUser(aliceId, true);
+            waitFor(() -> storage.isBlockedEitherDirection(bobId, aliceId),
+                    "Block request was not persisted");
+            assertTrue(storage.followStatus(bobId, aliceId).isEmpty(),
+                    "Blocking did not remove the follow relationship");
+            bob.sendMessage("dm:" + aliceId + ":" + bobId, "blocked direct message");
+            waitFor(() -> "403".equals(bobClient.model().errorCode()),
+                    "Blocked user was able to send a direct message");
+            alice.reportObject("profile", bobId, "Harassment 🌋");
+            waitFor(() -> storage.listReports().size() == 1,
+                    "A report was not stored after the TLS command");
+            assertEquals("Harassment 🌋", storage.listReports().get(0).reason(),
+                    "Report reason changed during protocol handling");
+        } finally {
+            if (alice != null) alice.close();
+            if (bob != null) bob.close();
+            server.close();
+            java.util.Arrays.fill(password, '\0');
+        }
+    }
+
+    private void testStories() throws Exception {
+        Path config = Path.of("config");
+        Path temporary = Files.createTempDirectory("ember-stories");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        InMemoryStorageEngine storage = new InMemoryStorageEngine();
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0,
+                storage, new SecurityAuditLogger(temporary.resolve("audit.json")),
+                temporary.resolve("media"), 2);
+        ClientController alice = null;
+        ClientController bob = null;
+        try {
+            server.start();
+            Path trust = config.resolve("ember-client-trust.p12");
+            alice = new ClientController("127.0.0.1", server.port(), trust, password,
+                    temporary.resolve("client-a"));
+            bob = new ClientController("127.0.0.1", server.port(), trust, password,
+                    temporary.resolve("client-b"));
+            CountDownLatch authenticated = new CountDownLatch(2);
+            CountDownLatch uploaded = new CountDownLatch(1);
+            bob.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("MEDIA_UPLOADED")) uploaded.countDown();
+            });
+            alice.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("MEDIA_UPLOADED")) uploaded.countDown();
+            });
+            alice.register("storyalice", "alice-pass-42".toCharArray(), "Story Alice");
+            bob.register("storybob", "bob-pass-42".toCharArray(), "Story Bob");
+            assertTrue(authenticated.await(30, TimeUnit.SECONDS), "Story clients did not authenticate");
+            ClientController bobClient = bob;
+            alice.uploadMedia(paddedJpeg(2048), "story.jpg");
+            assertTrue(uploaded.await(20, TimeUnit.SECONDS), "Story media upload did not finish");
+            String mediaId = alice.model().lastUploadedMediaId();
+            alice.createStory(mediaId, "Temporary campus moment 🌋");
+            waitFor(() -> storage.listStories().size() == 1,
+                    "Story record was not persisted");
+            bob.requestStories();
+            waitFor(() -> bobClientStories(bobClient).size() == 1,
+                    "Public story was not delivered to another TLS client");
+            String storyMedia = storage.findStory(storage.listStories().get(0).storyId())
+                    .orElseThrow().mediaId();
+            CountDownLatch storyImage = new CountDownLatch(1);
+            bob.addListener((model, event, message) -> {
+                if (event.equals("MEDIA") && model.mediaBytes(storyMedia) != null) storyImage.countDown();
+            });
+            bob.requestMedia(storyMedia, false);
+            assertTrue(storyImage.await(20, TimeUnit.SECONDS), "Story image was not retrievable");
+            Thread.sleep(2_100);
+            bob.requestStories();
+            waitFor(() -> bobClientStories(bobClient).isEmpty(),
+                    "Story remained visible after configured TTL");
+        } finally {
+            if (alice != null) alice.close();
+            if (bob != null) bob.close();
+            server.close();
+            java.util.Arrays.fill(password, '\0');
+        }
+    }
+
+    private List<edu.ember.common.model.StoryItem> bobClientStories(ClientController client) {
+        return client.model().stories();
+    }
+
+    private boolean clientHasMessage(ClientController client, String id, String body) {
+        return client.model().conversationIds().stream().flatMap(conversation ->
+                client.model().messages(conversation).stream()).anyMatch(message ->
+                        message.clientMsgId().equals(id) && message.body().equals(body));
+    }
+
+    private void testAdminConsoleProtocol() throws Exception {
+        Path config = Path.of("config");
+        Path temporary = Files.createTempDirectory("ember-admin-console");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        InMemoryStorageEngine storage = new InMemoryStorageEngine();
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0,
+                storage, new SecurityAuditLogger(temporary.resolve("audit.json")),
+                temporary.resolve("media"), 86_400, java.util.Set.of("paneladmin"));
+        ClientController admin = null;
+        ClientController member = null;
+        try {
+            server.start();
+            Path trust = config.resolve("ember-client-trust.p12");
+            admin = new ClientController("127.0.0.1", server.port(), trust, password,
+                    temporary.resolve("client-admin"));
+            member = new ClientController("127.0.0.1", server.port(), trust, password,
+                    temporary.resolve("client-member"));
+            CountDownLatch authenticated = new CountDownLatch(2);
+            CountDownLatch forbidden = new CountDownLatch(1);
+            member.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("ERROR") && "403".equals(model.errorCode())) forbidden.countDown();
+            });
+            admin.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+            });
+            admin.register("paneladmin", "admin-pass-42".toCharArray(), "Admin");
+            member.register("panelmember", "member-pass-42".toCharArray(), "Member");
+            assertTrue(authenticated.await(30, TimeUnit.SECONDS), "Admin clients did not authenticate");
+            ClientController adminClient = admin;
+            assertTrue(admin.model().administrator(), "Configured administrator role was not assigned");
+            assertTrue(!member.model().administrator(), "Regular member received administrator role");
+            member.requestAdminData();
+            assertTrue(forbidden.await(10, TimeUnit.SECONDS), "Regular member accessed admin queue");
+            admin.reportObject("profile", member.model().userId(), "Needs review");
+            waitFor(() -> storage.listReports().size() == 1, "Moderation report was not recorded");
+            admin.requestAdminData();
+            waitFor(() -> adminClient.model().moderationReports().size() == 1,
+                    "Admin queue did not return the moderation report");
+            admin.unlockUser("panelmember");
+            Thread.sleep(100);
+            assertTrue(admin.model().errorCode() == null,
+                    "Administrator unlock action was rejected");
+        } finally {
+            if (admin != null) admin.close();
+            if (member != null) member.close();
+            server.close();
+            java.util.Arrays.fill(password, '\0');
+        }
+    }
+
+    private void waitFor(java.util.function.BooleanSupplier condition, String failure)
+            throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) return;
+            Thread.sleep(20);
+        }
+        throw new AssertionError(failure);
+    }
+
     private byte[] pngHeader(int width, int height) throws IOException {
         ByteBuffer header = ByteBuffer.allocate(33);
         header.put(new byte[] {(byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A});
@@ -1067,6 +1400,179 @@ public final class EmberTestSuite {
         byte[] encoded = jpeg.toByteArray();
         System.arraycopy(encoded, 0, result, 0, encoded.length);
         return result;
+    }
+
+    private void testExpiringMessages() throws Exception {
+        Path config = Path.of("config");
+        Path temporary = Files.createTempDirectory("ember-expiring-message");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0,
+                new InMemoryStorageEngine(), new SecurityAuditLogger(
+                        temporary.resolve("audit.json")), temporary.resolve("media"));
+        ClientController alice = null;
+        ClientController bob = null;
+        try {
+            server.start();
+            alice = new ClientController("127.0.0.1", server.port(),
+                    config.resolve("ember-client-trust.p12"), password,
+                    temporary.resolve("client-a"));
+            bob = new ClientController("127.0.0.1", server.port(),
+                    config.resolve("ember-client-trust.p12"), password,
+                    temporary.resolve("client-b"));
+            CountDownLatch authenticated = new CountDownLatch(2);
+            CountDownLatch expired = new CountDownLatch(2);
+            alice.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("MESSAGE_EXPIRED")) expired.countDown();
+            });
+            bob.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("MESSAGE_EXPIRED")) expired.countDown();
+            });
+            alice.register("fadealice", "alice-pass-42".toCharArray(), "Fade Alice");
+            bob.register("fadebob", "bob-pass-42".toCharArray(), "Fade Bob");
+            assertTrue(authenticated.await(30, TimeUnit.SECONDS), "Expiry clients did not authenticate");
+            String id = alice.sendMessage("dm:fadealice:fadebob", "This disappears 🌋", 15);
+            assertTrue(expired.await(25, TimeUnit.SECONDS), "15-second message did not expire on both clients");
+            assertTrue(alice.model().messages("dm:fadealice:fadebob").stream()
+                    .noneMatch(message -> message.clientMsgId().equals(id)),
+                    "Expired message remained in the sender model");
+            assertTrue(bob.model().messages("dm:fadealice:fadebob").stream()
+                    .noneMatch(message -> message.clientMsgId().equals(id)),
+                    "Expired message remained in the recipient model");
+        } finally {
+            if (alice != null) alice.close();
+            if (bob != null) bob.close();
+            server.close();
+            java.util.Arrays.fill(password, '\0');
+        }
+    }
+
+    private void testRepliesAndReactions() throws Exception {
+        Path config = Path.of("config");
+        Path temporary = Files.createTempDirectory("ember-replies-reactions");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0,
+                new InMemoryStorageEngine(), new SecurityAuditLogger(
+                        temporary.resolve("audit.json")), temporary.resolve("media"));
+        ClientController alice = null;
+        ClientController bob = null;
+        ClientController charlie = null;
+        try {
+            server.start();
+            Path trust = config.resolve("ember-client-trust.p12");
+            alice = new ClientController("127.0.0.1", server.port(), trust, password,
+                    temporary.resolve("client-a"));
+            bob = new ClientController("127.0.0.1", server.port(), trust, password,
+                    temporary.resolve("client-b"));
+            charlie = new ClientController("127.0.0.1", server.port(), trust, password,
+                    temporary.resolve("client-c"));
+            CountDownLatch authenticated = new CountDownLatch(3);
+            CountDownLatch originalReceived = new CountDownLatch(1);
+            CountDownLatch replyReceived = new CountDownLatch(1);
+            CountDownLatch reactionReceived = new CountDownLatch(1);
+            CountDownLatch editReceived = new CountDownLatch(1);
+            CountDownLatch deleteReceived = new CountDownLatch(2);
+            CountDownLatch pinnedReceived = new CountDownLatch(2);
+            CountDownLatch starredReceived = new CountDownLatch(1);
+            CountDownLatch forwardedReceived = new CountDownLatch(1);
+            CountDownLatch forbiddenActions = new CountDownLatch(5);
+            AtomicReference<String> parentId = new AtomicReference<>();
+            alice.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("MESSAGE") && message != null
+                        && message.replyToId().equals(parentId.get())
+                        && message.body().equals("Reply 🌋")) replyReceived.countDown();
+                if (event.equals("MESSAGE_REACTION") && message != null
+                        && message.clientMsgId().equals(parentId.get())
+                        && message.reactionCounts().getOrDefault("🔥", 0) == 1) {
+                    reactionReceived.countDown();
+                }
+                if (event.equals("MESSAGE_EDITED") && message != null
+                        && message.clientMsgId().equals(parentId.get())
+                        && message.body().equals("Edited original 🌋")) editReceived.countDown();
+                if (event.equals("MESSAGE_DELETED") && message != null
+                        && message.clientMsgId().equals(parentId.get())) deleteReceived.countDown();
+                if (event.equals("MESSAGE_PINNED") && message != null && message.pinned()) {
+                    pinnedReceived.countDown();
+                }
+            });
+            bob.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("MESSAGE") && message != null
+                        && message.body().equals("Original 🌟")) originalReceived.countDown();
+                if (event.equals("MESSAGE_EDITED") && message != null
+                        && message.clientMsgId().equals(parentId.get())
+                        && message.body().equals("Edited original 🌋")) editReceived.countDown();
+                if (event.equals("MESSAGE_DELETED") && message != null
+                        && message.clientMsgId().equals(parentId.get())) deleteReceived.countDown();
+                if (event.equals("MESSAGE_PINNED") && message != null && message.pinned()) {
+                    pinnedReceived.countDown();
+                }
+                if (event.equals("MESSAGE_STARRED") && message != null
+                        && message.starredBy(model.userId())) starredReceived.countDown();
+                if (event.equals("ERROR") && "403".equals(model.errorCode())) {
+                    forbiddenActions.countDown();
+                }
+            });
+            charlie.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("MESSAGE") && message != null
+                        && message.conversationId().equals("dm:replyalice:replycharlie")
+                        && message.body().equals("Original 🌟")) forwardedReceived.countDown();
+                if (event.equals("ERROR") && "403".equals(model.errorCode())) {
+                    forbiddenActions.countDown();
+                }
+            });
+            alice.register("replyalice", "alice-pass-42".toCharArray(), "Reply Alice");
+            bob.register("replybob", "bob-pass-42".toCharArray(), "Reply Bob");
+            charlie.register("replycharlie", "charlie-pass-42".toCharArray(), "Reply Charlie");
+            assertTrue(authenticated.await(30, TimeUnit.SECONDS), "Reply clients did not authenticate");
+            ClientController aliceClient = alice;
+            String originalId = alice.sendMessage("dm:replyalice:replybob", "Original 🌟");
+            parentId.set(originalId);
+            assertTrue(originalReceived.await(20, TimeUnit.SECONDS), "Original message was not delivered");
+            bob.sendReply("dm:replyalice:replybob", "Reply 🌋", 0, originalId);
+            assertTrue(replyReceived.await(20, TimeUnit.SECONDS), "Reply did not reach Alice");
+            Message reply = alice.model().messages("dm:replyalice:replybob").stream()
+                    .filter(message -> message.body().equals("Reply 🌋")).findFirst().orElseThrow();
+            assertEquals(originalId, reply.replyToId(), "Reply target ID changed");
+            assertEquals("Original 🌟", reply.replyPreview(), "Reply quote changed");
+            String forwardedId = alice.forwardMessage(originalId, "dm:replyalice:replycharlie");
+            assertTrue(!forwardedId.equals(originalId), "Forward reused the original message ID");
+            assertTrue(forwardedReceived.await(20, TimeUnit.SECONDS),
+                    "Forwarded message did not reach the target chat");
+            alice.editMessage(forwardedId, "Edited forwarded copy 🌋");
+            waitFor(() -> clientHasMessage(aliceClient, forwardedId, "Edited forwarded copy 🌋"),
+                    "Forwarded copy could not be edited independently");
+            assertEquals("Original 🌟", alice.model().messages("dm:replyalice:replybob").stream()
+                    .filter(message -> message.clientMsgId().equals(originalId)).findFirst()
+                    .orElseThrow().body(), "Editing the forwarded copy changed the source");
+            bob.reactMessage(originalId, "🔥", false);
+            assertTrue(reactionReceived.await(20, TimeUnit.SECONDS),
+                    "Reaction was not broadcast to the other conversation participant");
+            alice.pinMessage(originalId, true);
+            assertTrue(pinnedReceived.await(20, TimeUnit.SECONDS), "Pinned state was not broadcast");
+            bob.starMessage(originalId, true);
+            assertTrue(starredReceived.await(20, TimeUnit.SECONDS), "Starred state was not returned");
+            bob.editMessage(originalId, "forged edit");
+            bob.deleteMessage(originalId);
+            charlie.reactMessage(originalId, "👍", false);
+            charlie.pinMessage(originalId, true);
+            charlie.starMessage(originalId, true);
+            assertTrue(forbiddenActions.await(20, TimeUnit.SECONDS),
+                    "Nonparticipant reaction or cross-user edit/delete was allowed");
+            alice.editMessage(originalId, "Edited original 🌋");
+            assertTrue(editReceived.await(20, TimeUnit.SECONDS), "Edited message was not broadcast");
+            alice.deleteMessage(originalId);
+            assertTrue(deleteReceived.await(20, TimeUnit.SECONDS), "Deleted message was not removed on both clients");
+        } finally {
+            if (alice != null) alice.close();
+            if (bob != null) bob.close();
+            if (charlie != null) charlie.close();
+            server.close();
+            java.util.Arrays.fill(password, '\0');
+        }
     }
 
     private void collectTextAreas(java.awt.Container container,
