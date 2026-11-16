@@ -30,13 +30,14 @@ KV payloads contain one `key=value` pair per line. Split at the first `=`. Escap
 | 20 | CMD_GROUP_CREATE | C→S | name, desc, member.n, member.i |
 | 21 | CMD_GROUP_MEMBER | C→S | groupId, targetUser, action |
 | 22 | CMD_USER_SEARCH | C→S | prefix |
+| 23 | CMD_GROUP_INFO | C→S | groupId |
 | 30 | CMD_PROFILE_UPDATE | C→S | bio, isPrivate, avatarMediaId |
 | 31 | CMD_FOLLOW_ACTION | C→S | targetUser, action |
 | 32 | CMD_MEDIA_UPLOAD | C→S | binary upload payload |
 | 33 | CMD_POST_CREATE | C→S | mediaId, caption |
 | 34 | CMD_POST_INTERACT | C→S | postId, type, commentText |
 | 35 | CMD_STORY_CREATE | C→S | mediaId, caption |
-| 36 | CMD_STORY_VIEW | C→S | storyId |
+| 36 | CMD_STORY_VIEW | C→S | no fields (request visible stories) |
 | 37 | CMD_USER_BLOCK | C→S | targetUser, blocked |
 | 38 | CMD_MOD_REPORT | C→S | targetId, reason |
 | 39 | CMD_ADMIN_ACTION | C→S | action, targetId |
@@ -63,6 +64,7 @@ KV payloads contain one `key=value` pair per line. Split at the first `=`. Escap
 | 54 | EVT_NOTIFY | S→C | follow request, like, comment, story view |
 | 55 | EVT_STORY_UPDATE | S→C | story added/expired |
 | 56 | EVT_ADMIN_DATA | S→C | reports, audit rows |
+| 57 | EVT_POLL_UPDATE | S→C | pollId, groupId, options, vote totals |
 | 70 | EVT_ERROR | S→C | code, message |
 
 Opcodes `0x01–0x3F` are commands, `0x40–0x6F` are server events, and `0x70` is the error event. New opcodes must remain in those ranges. Error codes are 400, 401, 403, 404, 409, 413, 415, 423, 429, and 500. Error wording must not reveal whether a username exists.

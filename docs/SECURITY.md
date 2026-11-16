@@ -1,12 +1,12 @@
 # Security design
 
-## Implementation status after Phase 6
+## Implementation status after Phase 7
 
-Phases 1–6 implement TLS 1.3 loopback sockets, bounded length-prefixed frames, PBKDF2-HMAC-SHA256 password hashing, account registration/login, WAL persistence with CRC and torn-tail recovery, username lockout, per-user message throttling, structured audit events, core messaging/groups, and Campus Pulse. Social profiles and posts are public in this phase. Profile updates are self-only; follows require an existing target; post interactions require an existing post; media reads require a media record linked to a published post. Private-account filtering and block rules are not implemented yet.
+Phases 1–7 implement TLS 1.3 loopback sockets, bounded length-prefixed frames, PBKDF2-HMAC-SHA256 password hashing, account registration/login, WAL persistence with CRC and torn-tail recovery, username lockout, per-user message throttling, structured audit events, core messaging/groups, and Campus Pulse. Private profiles, follow approval, block checks, report submission, stories, and polls are now enforced by the server. Private profile/feed/story/media reads require owner access or an accepted follow and are denied when either side has blocked the other. Admin actions are enabled only for usernames explicitly listed with `--admin-user`; the default is no configured admin.
 
 ## Claims and implementation status
 
-TLS 1.3 sockets, frame size checks, no Java serialization, PBKDF2-HMAC-SHA256 at 600,000 iterations, username/message validation, server-side object checks for implemented commands, durable audit logging, rate limits, and signature/size-validated image re-encoding are implemented and tested. Phase 6 feeds and profiles are public; private accounts and blocking remain future work.
+TLS 1.3 sockets, frame size checks, no Java serialization, PBKDF2-HMAC-SHA256 at 600,000 iterations, username/message validation, server-side object checks for implemented commands, durable audit logging, rate limits, signature/size-validated image re-encoding, private-account filtering, block checks, and rate-limited reports are implemented and tested.
 
 - Traffic between client and server is encrypted with TLS 1.3. Clients trust only Ember's generated truststore and verify the server name.
 - Passwords are stored with salted PBKDF2-HMAC-SHA256 at 600,000 iterations, the OWASP work factor for that algorithm. OWASP's first choice is Argon2id, which the JDK does not include.
@@ -23,20 +23,25 @@ TLS 1.3 sockets, frame size checks, no Java serialization, PBKDF2-HMAC-SHA256 at
 | `CMD_MSG_REACT`, `CMD_MSG_STAR` | Member of containing conversation | 403 |
 | `CMD_MSG_EDIT` | Message sender | 403 and audit |
 | `CMD_MSG_DELETE` | Sender or group moderator for group message | 403 and audit |
-| `CMD_MSG_PIN` | DM participant or group moderator | 403 |
-| `CMD_POLL_VOTE` | Group member, once per poll | 403 or 409 |
+| `CMD_MSG_PIN` | Member of the containing conversation | 403 |
+| `CMD_MSG_EDIT` / `CMD_MSG_DELETE` | Sender; group moderator may delete a group message | 403 |
+| `CMD_POLL_CREATE`, `CMD_POLL_VOTE` | Group member; a member may change their current vote | 403 |
 | `CMD_GROUP_MEMBER` | Group moderator | 403 |
 | `CMD_SYNC_PULL`, `CMD_HISTORY_PULL` | Conversation member | 403 |
 | `CMD_PROFILE_UPDATE` | The authenticated user's own profile | 403 and audit |
 | `CMD_FOLLOW_ACTION` | Authenticated user; target profile must exist; self-follow is invalid | 400/404 |
 | `CMD_MEDIA_UPLOAD` | Authenticated owner; size/signature/dimensions/extension must pass validation | 400 and `upload_rejected` audit |
 | `CMD_POST_CREATE` | Authenticated owner of the referenced media | 403; missing media returns 404 |
-| `CMD_MEDIA_GET` | Authenticated user, only for media linked to a published public post | 404 |
-| `CMD_POST_INTERACT` | Authenticated user, only for an existing public post | 404 |
-| `CMD_PROFILE_GET`, `CMD_FEED_PULL` | Authenticated user; target profile must exist when specified | 404 |
-| `CMD_STORY_VIEW` | Owner, or permitted followers when private, and not blocked | 404 (Phase 7 scope) |
-| `CMD_ADMIN_ACTION` | Admin | 403 and audit |
-| `CMD_MOD_REPORT` | Authenticated user, rate limited | 429 |
+| `CMD_MEDIA_GET` | Authenticated user with access to a published post or active story | 404 |
+| `CMD_POST_INTERACT` | Authenticated user with access to the post owner | 404 |
+| `CMD_PROFILE_GET`, `CMD_FEED_PULL` | Authenticated user; target must be visible under private/block rules | 404 |
+| `CMD_STORY_CREATE`, `CMD_STORY_VIEW` | Owner of referenced media; viewer must pass private/block rules | 403 or 404 |
+| `CMD_GROUP_INFO` | Current group member | 403 |
+| `CMD_ADMIN_ACTION` | Username configured through `--admin-user` | 403 and audit |
+| `CMD_MOD_REPORT` | Authenticated user, existing target, valid reason, rate limited | 404, 400, or 429 |
+| `CMD_USER_BLOCK` | Authenticated user; self-block is invalid | 400 |
+| `CMD_GROUP_INFO` | Current group member | 403 |
+| `CMD_STORY_CREATE`, `CMD_STORY_VIEW` | Owner creates own media story; viewer must pass profile/block rules | 403 or 404 |
 
 ## Threat model
 

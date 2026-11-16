@@ -111,3 +111,19 @@ The scaffold establishes the package root, shared product identity, plain `javac
 1. **Why check image dimensions before decoding?** Image dimensions come from the encoded file header and are available through `ImageReader` without allocating the full pixel array. Ember rejects either side above 4096 or more than 16 million pixels before calling `read(0)`, which limits image-bomb memory use.
 2. **Why does the server rename uploaded files?** User-provided names are used only for extension validation and are never resolved as paths. The server uses generated UUID names in its media directory, preventing traversal through a crafted upload name.
 3. **How does the server stop a user from changing another profile or fetching arbitrary media?** Profile update requires the submitted profile ID to match the identity bound to the connection. Media lookup requires a real media record linked to a published post; missing or unlinked media and posts return 404, and the TLS integration tests check these cases.
+
+## Phase 7: signature features
+
+Phase 7 extends chat and Campus Pulse with TTL expiry, replies/reactions, edit/delete, private profiles, moderation, pins/stars/search, stories, polls, admin/group information, forwarding, and compacted WAL snapshots. The server continues to authorize every message, group, profile, post, media, story, poll, and admin action against the authenticated connection.
+
+**Key classes:** `ExpiryReaperThread`, `SearchEngine`, `FollowStatus`, `ModerationReport`, `StoryItem`, `StoryViewerDialog`, `PollData`, `AdminConsolePanel`, `GroupInfoDrawer`, `WalStorageEngine`.
+
+**Trace:** a private-account follow request is saved as PENDING → the owner approves it → the follower can see the profile/feed/story → either side blocks and both follow directions are cleared → subsequent DM commands fail authorization. Poll votes and moderation reports are persisted through WAL records; snapshot compaction compresses the event history and rotates the WAL.
+
+**Concepts:** TTL and daemon thread, `Iterator`, `StringTokenizer`, enums, maps/sets, 2D arrays, MVC observers, role checks, `SwingWorker`, `Timer`, GZIP, CRC, atomic file replacement, WAL replay.
+
+### Likely questions
+
+1. **Why does a private follow use PENDING instead of immediately adding the follower?** The server stores a request state separately from ACCEPTED so feed, profile, and story authorization can consistently require owner approval. Blocking removes both directions of the follow relationship.
+2. **How does snapshot compaction avoid losing records if the process stops at the wrong time?** The compressed snapshot is fully written and atomically moved into place before WAL rotation. It records the covered WAL length and checksum, allowing restart to skip a still-present prefix if the process stopped between snapshot replacement and truncation.
+3. **Why does forwarding construct a new `Message`?** A forwarded message has a new ID, sender, destination, and timestamp, and does not inherit mutable reactions, reply state, expiry, or sequence values. Editing the copy therefore cannot change the source message.

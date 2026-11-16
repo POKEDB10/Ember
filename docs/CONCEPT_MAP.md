@@ -43,3 +43,15 @@ This map will be updated as concepts appear in implemented classes. Phase 0 demo
 | Opcode-specific large frames | `FrameCodec`, `InboundReceiverThread`, `EmberServer.ConnectionHandler` |
 
 Later concept mappings are added with the phase that implements the corresponding code.
+
+| Concept | Where it lives |
+|---|---|
+| TTL expiry, iterator cleanup, daemon scheduling | `ExpiryReaperThread`, `Message.expiresAtMs` |
+| Tokenized in-chat search | `SearchEngine`, `StringTokenizer` |
+| Per-user pins and stars | `Message`, `StorageEngine`, WAL pin/star records |
+| Private profile authorization and pending approval | `FollowStatus`, `SocialFeedService`, `ProfilePanel` |
+| Moderation reports and role-gated admin actions | `ModerationReport`, `AdminConsolePanel`, `EmberServer` |
+| Expiring stories and timer-driven viewer | `StoryItem`, `StoryViewerDialog`, `--story-ttl-sec` |
+| 2D vote matrix and per-member poll updates | `PollData`, `CMD_POLL_CREATE`, `CMD_POLL_VOTE` |
+| Deep-copy message forwarding | `Message(Message source, ...)`, `ClientController.forwardMessage` |
+| GZIP snapshot rotation and recovery | `WalStorageEngine.compact`, CRC-protected snapshot and covered-prefix check |
