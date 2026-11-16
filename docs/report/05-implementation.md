@@ -12,6 +12,8 @@ Phase 4 extends messaging with client-generated idempotency keys, server-assigne
 
 Phase 5 adds Ember Night and Campus Daylight theme tokens, a resolved font fallback, reusable rounded panels, initials avatars, wrapped text bubbles, message receipt marks, a searchable conversation list, an authentication panel, a conversation composer, settings, timed toasts, and system-tray notification fallback. The client includes Ctrl+D/Ctrl+F shortcuts, a reconnect banner, and a developer network-drop control. Offscreen screenshots are generated at 1280×720 and 1920×1080 in both themes; the visual verifier checks message wrapping and non-empty screenshot output.
 
+Phase 6 adds public user profiles, follow/unfollow, safe PNG/JPEG upload, UUID-named media storage, 300-pixel thumbnails, feed posts, likes, comments, and the Campus Pulse, profile, post-card, and post-detail views. `ImageValidator` checks file size, extension, and signature, reads width and height through `ImageReader` before decode, rejects dimensions above 4096 or 16 million pixels, then re-encodes a fresh RGB JPEG. Upload frames use a separate bounded limit and allow large payloads only for `CMD_MEDIA_UPLOAD`; the client reads files and prepares Base64 outside the EDT. Social metadata is persisted as WAL records. Profile updates are self-only, and unpublished or missing media/post objects return 404.
+
 | Concept | Class | File |
 |---|---|---|
 | Builder and immutable frame | `WireFrame.Builder`, `WireFrame` | `common/protocol/WireFrame.java` |
@@ -23,6 +25,10 @@ Phase 5 adds Ember Night and Campus Daylight theme tokens, a resolved font fallb
 | Custom painting and Swing composition | `RoundedPanel`, `AvatarComponent`, `ChatBubblePanel` | `client/ui/` |
 | MVC views and event listeners | `AuthPanel`, `ChatListPanel`, `ConversationPanel`, `SettingsPanel` | `client/ui/` |
 | Notification fallback | `NotificationService`, `ToastBanner` | `client/ui/` |
+| Header-first image safety and thumbnail generation | `ImageValidator`, `SocialFeedService` | `common/security/ImageValidator.java`, `server/SocialFeedService.java` |
+| Social persistence and feed authorization | `StorageEngine`, `WalStorageEngine` | `server/storage/StorageEngine.java`, `WalStorageEngine.java` |
+| Feed/profile/post/comment UI | `CampusPulsePanel`, `ProfilePanel`, `PostCardPanel`, `PostDetailDialog` | `client/ui/` |
+| Background upload preparation | `CampusPulsePanel`, `ClientController` | `client/ui/CampusPulsePanel.java`, `client/ClientController.java` |
 
 ## Security
 
