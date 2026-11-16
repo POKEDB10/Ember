@@ -14,6 +14,8 @@ Phase 5 adds Ember Night and Campus Daylight theme tokens, a resolved font fallb
 
 Phase 6 adds public user profiles, follow/unfollow, safe PNG/JPEG upload, UUID-named media storage, 300-pixel thumbnails, feed posts, likes, comments, and the Campus Pulse, profile, post-card, and post-detail views. `ImageValidator` checks file size, extension, and signature, reads width and height through `ImageReader` before decode, rejects dimensions above 4096 or 16 million pixels, then re-encodes a fresh RGB JPEG. Upload frames use a separate bounded limit and allow large payloads only for `CMD_MEDIA_UPLOAD`; the client reads files and prepares Base64 outside the EDT. Social metadata is persisted as WAL records. Profile updates are self-only, and unpublished or missing media/post objects return 404.
 
+Phase 7 adds expiring messages, replies, reactions, edit/delete, private accounts with follow approval, blocking and rate-limited reports, message pins/stars/search, expiring stories, group polls, group information, an admin report/unlock panel, and message forwarding. The WAL stores these changes and compacts its event history into a checksummed GZIP snapshot. A forwarded message receives a new ID and independent body state. The demo server enables administrators only when usernames are passed with `--admin-user`.
+
 | Concept | Class | File |
 |---|---|---|
 | Builder and immutable frame | `WireFrame.Builder`, `WireFrame` | `common/protocol/WireFrame.java` |
@@ -29,6 +31,12 @@ Phase 6 adds public user profiles, follow/unfollow, safe PNG/JPEG upload, UUID-n
 | Social persistence and feed authorization | `StorageEngine`, `WalStorageEngine` | `server/storage/StorageEngine.java`, `WalStorageEngine.java` |
 | Feed/profile/post/comment UI | `CampusPulsePanel`, `ProfilePanel`, `PostCardPanel`, `PostDetailDialog` | `client/ui/` |
 | Background upload preparation | `CampusPulsePanel`, `ClientController` | `client/ui/CampusPulsePanel.java`, `client/ClientController.java` |
+| Private account and block authorization | `SocialFeedService`, `FollowStatus` | `server/SocialFeedService.java`, `common/model/FollowStatus.java` |
+| Reports and admin actions | `ModerationReport`, `AdminConsolePanel` | `common/model/ModerationReport.java`, `client/ui/AdminConsolePanel.java` |
+| TTL stories and viewer | `StoryItem`, `StoryViewerDialog` | `common/model/StoryItem.java`, `client/ui/StoryViewerDialog.java` |
+| Group polls and 2D vote matrix | `PollData`, `ConversationPanel` | `common/model/PollData.java`, `client/ui/ConversationPanel.java` |
+| Snapshot compaction and crash recovery | `WalStorageEngine.compact` | `server/storage/WalStorageEngine.java` |
+| In-chat search and deep-copy forwarding | `SearchEngine`, `Message` copy constructor | `client/SearchEngine.java`, `common/model/Message.java` |
 
 ## Security
 
@@ -36,5 +44,5 @@ Use only the claims recorded in `docs/SECURITY.md` and the project claims table.
 
 ## Screenshots
 
-Shot list: login/register, chat list, conversation, group conversation, Campus Pulse feed, post detail, profile, and settings.  
+Shot list: login/register, chat list, conversation, group conversation and poll, Campus Pulse feed, post detail, profile, story viewer, admin console, and settings.
 Phase 5 captures: `docs/screenshots/phase-5-dark-1280x720.png`, `phase-5-dark-1920x1080.png`, `phase-5-light-1280x720.png`, `phase-5-light-1920x1080.png`. Remaining shot list: login/register, Campus Pulse feed, post detail, profile, and settings walkthrough.
