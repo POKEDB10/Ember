@@ -43,6 +43,7 @@ public final class ClientController implements AutoCloseable {
     private volatile String sessionToken;
     private volatile LocalOutbox outbox;
     private volatile boolean closing;
+    private volatile boolean readReceiptsEnabled = true;
     private final Path clientDataRoot;
 
     public ClientController(String host, int port, Path trustStore, char[] password)
@@ -118,12 +119,22 @@ public final class ClientController implements AutoCloseable {
         sendCommand(WireOpcodes.CMD_PING, Map.of());
     }
 
+    public void simulateNetworkDrop() {
+        try {
+            socket.close();
+        } catch (IOException exception) {
+            model.setError("500", "Could not simulate connection drop");
+        }
+    }
+
     public void requestHistory(String conversationId, long beforeSequence, int limit) {
         sendCommand(WireOpcodes.CMD_HISTORY_PULL, Map.of("convId", conversationId,
                 "beforeSeq", Long.toString(beforeSequence), "limit", Integer.toString(limit)));
     }
 
     public String sessionToken() { return sessionToken; }
+    public boolean readReceiptsEnabled() { return readReceiptsEnabled; }
+    public void setReadReceiptsEnabled(boolean enabled) { readReceiptsEnabled = enabled; }
 
     public void openConversation(String conversationId) {
         activeConversationId = conversationId;

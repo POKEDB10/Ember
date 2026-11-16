@@ -36,6 +36,10 @@ public final class ClientStateModel {
         return List.copyOf(conversations.getOrDefault(conversationId, List.of()));
     }
 
+    public synchronized java.util.Set<String> conversationIds() {
+        return java.util.Set.copyOf(conversations.keySet());
+    }
+
     public synchronized ReceiptSummary receiptSummary(String clientMsgId) {
         return receiptSummaries.get(clientMsgId);
     }

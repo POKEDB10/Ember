@@ -1,5 +1,9 @@
 package edu.ember.client;
 
+import edu.ember.client.ui.AuthPanel;
+import edu.ember.client.ui.ChatWorkspacePanel;
+import edu.ember.client.ui.NotificationService;
+import edu.ember.client.ui.ThemeManager;
 import edu.ember.common.model.Message;
 import edu.ember.common.util.AppInfo;
 import java.awt.BorderLayout;
@@ -11,35 +15,32 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.concurrent.ExecutionException;
-import javax.swing.BorderFactory;
+import javax.swing.AbstractAction;
+import javax.swing.ActionMap;
+import javax.swing.InputMap;
 import javax.swing.JButton;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
-import javax.swing.JPasswordField;
-import javax.swing.JScrollPane;
-import javax.swing.JTextArea;
-import javax.swing.JTextField;
+import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
+import javax.swing.UIManager;
 
-/** Swing entry point for the minimal login and direct chat client. @concept Swing, MVC, listeners */
+/** Starts the themed Swing client and coordinates login, chat, and reconnect. @concept Swing, MVC, listeners */
 public final class EmberClientApp {
     private final JFrame frame = new JFrame(AppInfo.NAME);
     private final CardLayout cards = new CardLayout();
     private final JPanel root = new JPanel(cards);
-    private final JTextField username = new JTextField(18);
-    private final JPasswordField password = new JPasswordField(18);
-    private final JTextField recipient = new JTextField("bob", 14);
-    private final JTextArea transcript = new JTextArea();
-    private final JTextField composer = new JTextField();
-    private final JLabel status = new JLabel("Connecting to 127.0.0.1…");
+    private final JLabel status = new JLabel("Connecting…");
     private final String host;
     private final int port;
     private final Path trustStore;
     private final char[] storePassword;
+    private final AuthPanel authPanel;
     private ClientController controller;
+    private ChatWorkspacePanel workspace;
     private ReconnectManager reconnectManager;
 
     private EmberClientApp(String host, int port, String profile, Path trustStore,
@@ -48,12 +49,30 @@ public final class EmberClientApp {
         this.port = port;
         this.trustStore = trustStore;
         this.storePassword = storePassword;
-        username.setText(profile);
+        authPanel = new AuthPanel(new AuthPanel.AuthActions() {
+            @Override
+            public void login(String username, char[] password) {
+                authenticate(false, username, password);
+            }
+
+            @Override
+            public void register(String username, char[] password) {
+                String displayName = JOptionPane.showInputDialog(frame, "Display name");
+                if (displayName != null) {
+                    authenticate(true, username, password, displayName);
+                }
+            }
+        });
+        if (!profile.isBlank()) {
+            authPanel.setUsername(profile);
+        }
         buildWindow();
         connect();
     }
 
     public static void main(String[] args) throws Exception {
+        UIManager.setLookAndFeel("javax.swing.plaf.nimbus.NimbusLookAndFeel");
+        ThemeManager.apply(ThemeManager.Theme.DARK);
         String host = "127.0.0.1";
         String profile = "";
         int port = 7443;
@@ -86,15 +105,20 @@ public final class EmberClientApp {
 
     private void buildWindow() {
         frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-        frame.setMinimumSize(new Dimension(640, 480));
-        frame.setSize(840, 620);
+        frame.setMinimumSize(new Dimension(960, 640));
+        frame.setSize(1200, 780);
         frame.setLocationRelativeTo(null);
-        root.add(createLoginPanel(), "AUTH");
-        root.add(createChatPanel(), "CHAT");
-        frame.setContentPane(root);
+        root.add(authPanel, "AUTH");
+        frame.add(root, BorderLayout.CENTER);
+        status.setBorder(javax.swing.BorderFactory.createEmptyBorder(4, 12, 6, 12));
+        frame.add(status, BorderLayout.SOUTH);
+        bindShortcuts();
         frame.addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosed(WindowEvent event) {
+                if (reconnectManager != null) {
+                    reconnectManager.cancelReconnect();
+                }
                 if (controller != null) {
                     controller.close();
                 }
@@ -102,44 +126,6 @@ public final class EmberClientApp {
             }
         });
         frame.setVisible(true);
-    }
-
-    private JPanel createLoginPanel() {
-        JPanel panel = new JPanel(new BorderLayout(8, 8));
-        panel.setBorder(BorderFactory.createEmptyBorder(48, 90, 48, 90));
-        JPanel fields = new JPanel(new java.awt.GridLayout(0, 1, 6, 6));
-        fields.add(new JLabel(AppInfo.NAME + " — " + AppInfo.TAGLINE));
-        fields.add(new JLabel("Username"));
-        fields.add(username);
-        fields.add(new JLabel("Password"));
-        fields.add(password);
-        JButton login = new JButton("Log in");
-        JButton register = new JButton("Register");
-        JPanel actions = new JPanel();
-        actions.add(login);
-        actions.add(register);
-        fields.add(actions);
-        fields.add(status);
-        login.addActionListener(event -> authenticate(false));
-        register.addActionListener(event -> authenticate(true));
-        panel.add(fields, BorderLayout.CENTER);
-        return panel;
-    }
-
-    private JPanel createChatPanel() {
-        JPanel panel = new JPanel(new BorderLayout(8, 8));
-        JPanel header = new JPanel(new BorderLayout(8, 8));
-        header.setBorder(BorderFactory.createEmptyBorder(8, 8, 0, 8));
-        header.add(new JLabel("Conversation with"), BorderLayout.WEST);
-        header.add(recipient, BorderLayout.CENTER);
-        panel.add(header, BorderLayout.NORTH);
-        transcript.setEditable(false);
-        transcript.setLineWrap(true);
-        transcript.setWrapStyleWord(true);
-        panel.add(new JScrollPane(transcript), BorderLayout.CENTER);
-        composer.addActionListener(event -> sendMessage());
-        panel.add(composer, BorderLayout.SOUTH);
-        return panel;
     }
 
     private void connect() {
@@ -153,64 +139,76 @@ public final class EmberClientApp {
             @Override
             protected void done() {
                 try {
-                    controller = get();
-                    controller.addListener(EmberClientApp.this::modelChanged);
+                    attachController(get(), null);
                     status.setText("Connected with TLS 1.3");
                 } catch (InterruptedException exception) {
                     Thread.currentThread().interrupt();
                     status.setText("Connection cancelled");
                 } catch (ExecutionException exception) {
                     status.setText("Connection failed: " + exception.getCause().getMessage());
+                    startReconnect(null);
                 }
             }
         }.execute();
     }
 
-    private void authenticate(boolean register) {
+    private void attachController(ClientController replacement, String conversationId) {
+        controller = replacement;
+        controller.addListener(this::modelChanged);
+        if (workspace != null) {
+            root.remove(workspace);
+        }
+        workspace = new ChatWorkspacePanel(controller, this::applyTheme,
+                controller::setReadReceiptsEnabled, controller::simulateNetworkDrop, ignored -> { });
+        root.add(workspace, "MAIN");
+        if (conversationId != null) {
+            workspace.conversation().openConversation(conversationId);
+        }
+        root.revalidate();
+        root.repaint();
+    }
+
+    private void authenticate(boolean register, String username, char[] secret) {
+        if (register) {
+            String displayName = JOptionPane.showInputDialog(frame, "Display name");
+            if (displayName != null) {
+                authenticate(true, username, secret, displayName);
+            }
+        } else {
+            authenticate(false, username, secret, "");
+        }
+    }
+
+    private void authenticate(boolean register, String username, char[] secret, String displayName) {
         if (controller == null) {
             status.setText("Wait for the server connection");
             return;
         }
-        String name = username.getText().trim();
-        char[] secret = password.getPassword();
         if (register) {
-            String displayName = JOptionPane.showInputDialog(frame, "Display name");
-            if (displayName == null) {
-                Arrays.fill(secret, '\0');
-                return;
-            }
-            controller.register(name, secret, displayName);
+            controller.register(username, secret, displayName);
         } else {
-            controller.login(name, secret);
+            controller.login(username, secret);
         }
-        Arrays.fill(secret, '\0');
         status.setText("Verifying…");
-    }
-
-    private void sendMessage() {
-        String target = recipient.getText().trim().toLowerCase(java.util.Locale.ROOT);
-        String sender = controller.model().userId();
-        String conversationId = sender.compareTo(target) < 0
-                ? "dm:" + sender + ":" + target : "dm:" + target + ":" + sender;
-        String body = composer.getText();
-        if (!body.isBlank()) {
-            controller.sendMessage(conversationId, body);
-            composer.setText("");
-        }
     }
 
     private void modelChanged(ClientStateModel model, String eventType, Message message) {
         if (eventType.equals("AUTH_OK")) {
-            cards.show(root, "CHAT");
+            cards.show(root, "MAIN");
             frame.setTitle(AppInfo.NAME + " — " + model.userId());
+            status.setText("Connected · TLS 1.3");
+            bindShortcuts();
         } else if (eventType.equals("MESSAGE") && message != null) {
-            transcript.append(message.senderUserId() + ": " + message.body() + "\n");
+            if (!frame.isFocused() && workspace != null) {
+                NotificationService.show(frame, workspace.toast(), message.senderUserId(), message.body());
+            }
         } else if (eventType.equals("MESSAGE_STATUS") && message != null) {
             if (message.senderUserId().equals(model.userId())) {
                 status.setText(message.status().name());
             }
         } else if (eventType.equals("ERROR")) {
             status.setText(model.errorMessage());
+            authPanel.setError(model.errorMessage());
             if ("503".equals(model.errorCode()) && reconnectManager == null) {
                 startReconnect(model.userId());
             }
@@ -218,28 +216,32 @@ public final class EmberClientApp {
     }
 
     private void startReconnect(String userId) {
-        status.setText("Connection lost. Reconnecting…");
+        if (reconnectManager != null) {
+            return;
+        }
+        status.setText("Connection lost · reconnecting…");
         reconnectManager = new ReconnectManager(
                 () -> new ClientController(host, port, trustStore, storePassword),
                 new ReconnectManager.ReconnectListener() {
                     @Override
                     public void onReconnected(ClientController replacement) {
                         SwingUtilities.invokeLater(() -> {
-                            ClientController previous = controller;
-                            controller = replacement;
-                            replacement.addListener(EmberClientApp.this::modelChanged);
+                            String active = controller == null ? null
+                                    : controller.model().activeConversationId();
+                            if (controller != null) {
+                                controller.close();
+                            }
+                            attachController(replacement, active);
                             if (userId != null) {
                                 try {
                                     replacement.resumeStoredSession(userId);
                                 } catch (java.io.IOException exception) {
-                                    status.setText("Reconnect failed: " + exception.getMessage());
+                                    status.setText("Reconnect session unavailable: "
+                                            + exception.getMessage());
                                 }
                             }
-                            if (previous != null) {
-                                previous.close();
-                            }
                             reconnectManager = null;
-                            status.setText("Reconnected; syncing messages…");
+                            status.setText("Reconnected · syncing messages…");
                         });
                     }
 
@@ -250,5 +252,36 @@ public final class EmberClientApp {
                     }
                 });
         reconnectManager.start();
+    }
+
+    private void bindShortcuts() {
+        InputMap input = root.getInputMap(JPanel.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT);
+        ActionMap actions = root.getActionMap();
+        input.put(KeyStroke.getKeyStroke("control D"), "toggle-theme");
+        actions.put("toggle-theme", new AbstractAction() {
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent event) {
+                ThemeManager.apply(ThemeManager.current() == ThemeManager.Theme.DARK
+                        ? ThemeManager.Theme.LIGHT : ThemeManager.Theme.DARK);
+                applyTheme();
+            }
+        });
+        input.put(KeyStroke.getKeyStroke("control F"), "focus-search");
+        actions.put("focus-search", new AbstractAction() {
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent event) {
+                if (workspace != null) {
+                    workspace.chatList().searchField().requestFocusInWindow();
+                }
+            }
+        });
+    }
+
+    private void applyTheme() {
+        if (workspace != null) {
+            workspace.applyTheme();
+        }
+        authPanel.applyTheme();
+        frame.repaint();
     }
 }
