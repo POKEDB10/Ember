@@ -20,6 +20,9 @@ import edu.ember.common.model.Message;
 import edu.ember.common.model.GroupChat;
 import edu.ember.common.model.UserRole;
 import edu.ember.common.model.UserRecord;
+import edu.ember.client.ui.ChatBubblePanel;
+import edu.ember.client.ui.FontResolver;
+import edu.ember.client.ui.ThemeManager;
 import edu.ember.server.EmberServer;
 import edu.ember.server.AuthRateLimiter;
 import edu.ember.server.AuthService;
@@ -44,6 +47,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
@@ -74,6 +78,8 @@ public final class EmberTestSuite {
         runTest("input validation", this::testInputValidation);
         runTest("TLS 1.3 loopback frame round trip", this::testTlsRoundTrip);
         runTest("headless registration, message, and delivery", this::testWalkingSkeleton);
+        runTest("theme palettes, wrapped message bodies, and EDT notifications",
+                this::testUiBasics);
         runTest("WAL restart recovers Arabic and emoji records and trims torn tail",
                 this::testWalTornTailRecovery);
         runTest("WAL CRC failure truncates invalid tail", this::testWalCrcRecovery);
@@ -768,9 +774,13 @@ public final class EmberTestSuite {
             CountDownLatch arabicDeliveryLatch = new CountDownLatch(1);
             CountDownLatch sentLatch = new CountDownLatch(1);
             CountDownLatch deliveredReceiptLatch = new CountDownLatch(1);
+            AtomicBoolean callbacksOnEdt = new AtomicBoolean(true);
             ClientStateModel aliceModel = alice.model();
             ClientStateModel bobModel = bob.model();
             alice.addListener((model, event, message) -> {
+                if (!javax.swing.SwingUtilities.isEventDispatchThread()) {
+                    callbacksOnEdt.set(false);
+                }
                 if (event.equals("AUTH_OK")) {
                     authLatch.countDown();
                 }
@@ -784,6 +794,9 @@ public final class EmberTestSuite {
                 }
             });
             bob.addListener((model, event, message) -> {
+                if (!javax.swing.SwingUtilities.isEventDispatchThread()) {
+                    callbacksOnEdt.set(false);
+                }
                 if (event.equals("AUTH_OK")) {
                     authLatch.countDown();
                 }
@@ -818,6 +831,7 @@ public final class EmberTestSuite {
                     "Arabic/emoji message did not reach Bob's client model");
             assertEquals("مرحبا 🌋", bobModel.messages("dm:alice:bob").get(1).body(),
                     "Client model changed Arabic/emoji text");
+            assertTrue(callbacksOnEdt.get(), "Client model listeners ran outside the Swing EDT");
         } finally {
             if (alice != null) {
                 alice.close();
@@ -826,6 +840,47 @@ public final class EmberTestSuite {
                 bob.close();
             }
             server.close();
+        }
+    }
+
+    private void testUiBasics() throws Exception {
+        javax.swing.SwingUtilities.invokeAndWait(() -> {
+            ThemeManager.apply(ThemeManager.Theme.DARK);
+            assertEquals(new java.awt.Color(0x0F172A), ThemeManager.current().background(),
+                    "Dark theme background token changed");
+            assertEquals(new java.awt.Color(0x0F172A), ThemeManager.Theme.LIGHT.text(),
+                    "Light theme text token changed");
+            assertTrue(FontResolver.resolve() != null, "Font resolver returned null");
+            Message message = new Message("ui-test", "alice", "dm:alice:bob",
+                    "مرحبا 🌋 ".repeat(20), System.currentTimeMillis());
+            ChatBubblePanel bubble = new ChatBubblePanel(message, false, "Delivered 1/1");
+            bubble.setSize(460, 220);
+            layoutComponentTree(bubble);
+            java.util.List<javax.swing.JTextArea> bodies = new java.util.ArrayList<>();
+            collectTextAreas(bubble, bodies);
+            assertEquals(1, bodies.size(), "Chat bubble should use a single wrapping text area");
+            assertTrue(bodies.get(0).getLineWrap() && bodies.get(0).getWrapStyleWord(),
+                    "Chat bubble text does not wrap at word boundaries");
+            assertTrue(javax.swing.SwingUtilities.isEventDispatchThread(),
+                    "UI fixture was not constructed on the EDT");
+            ThemeManager.apply(ThemeManager.Theme.LIGHT);
+            assertEquals(ThemeManager.Theme.LIGHT, ThemeManager.current(),
+                    "Theme switch did not apply");
+        });
+    }
+
+    private void collectTextAreas(java.awt.Container container,
+            java.util.List<javax.swing.JTextArea> result) {
+        for (java.awt.Component child : container.getComponents()) {
+            if (child instanceof javax.swing.JTextArea area) result.add(area);
+            if (child instanceof java.awt.Container nested) collectTextAreas(nested, result);
+        }
+    }
+
+    private void layoutComponentTree(java.awt.Container container) {
+        container.doLayout();
+        for (java.awt.Component child : container.getComponents()) {
+            if (child instanceof java.awt.Container nested) layoutComponentTree(nested);
         }
     }
 
