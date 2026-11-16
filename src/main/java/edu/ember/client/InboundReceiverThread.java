@@ -21,7 +21,8 @@ public final class InboundReceiverThread extends Thread {
     public void run() {
         try {
             while (!isInterrupted()) {
-                controller.handleFrame(FrameCodec.readFrame(input, 64 * 1024));
+                controller.handleFrame(FrameCodec.readFrame(input, 64 * 1024,
+                        edu.ember.common.protocol.WireOpcodes.EVT_MEDIA_DATA, 7 * 1024 * 1024));
             }
         } catch (IOException | EmberException exception) {
             controller.connectionEnded(exception);

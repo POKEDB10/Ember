@@ -2,6 +2,8 @@ package edu.ember.client;
 
 import edu.ember.common.model.Message;
 import edu.ember.common.model.MessageStatus;
+import edu.ember.common.model.SocialPost;
+import edu.ember.common.model.UserProfile;
 import edu.ember.common.exceptions.EmberException;
 import edu.ember.common.protocol.FrameFactory;
 import edu.ember.common.protocol.KvPayloadCodec;
@@ -36,6 +38,11 @@ public final class ClientController implements AutoCloseable {
     });
     private final ScheduledExecutorService heartbeat = Executors.newSingleThreadScheduledExecutor(runnable -> {
         Thread thread = new Thread(runnable, "ember-client-heartbeat");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final ExecutorService mediaWorker = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "ember-client-media-worker");
         thread.setDaemon(true);
         return thread;
     });
@@ -161,6 +168,47 @@ public final class ClientController implements AutoCloseable {
                 Map.of("groupId", groupId, "targetUser", targetUser, "action", action));
     }
 
+    public void updateProfile(String displayName, String bio) {
+        sendCommand(WireOpcodes.CMD_PROFILE_UPDATE, Map.of("userId", model.userId(),
+                "displayName", displayName, "bio", bio));
+    }
+
+    public void follow(String targetUserId, boolean following) {
+        sendCommand(WireOpcodes.CMD_FOLLOW_ACTION, Map.of("targetUserId", targetUserId,
+                "follow", Boolean.toString(following)));
+    }
+
+    public void uploadMedia(byte[] imageBytes, String fileName) {
+        mediaWorker.execute(() -> {
+            String encoded = java.util.Base64.getEncoder().encodeToString(imageBytes);
+            sendCommand(WireOpcodes.CMD_MEDIA_UPLOAD,
+                    Map.of("fileName", fileName, "data", encoded));
+        });
+    }
+
+    public void createPost(String mediaId, String caption) {
+        sendCommand(WireOpcodes.CMD_POST_CREATE, Map.of("mediaId", mediaId, "caption", caption));
+    }
+
+    public void interactPost(String postId, String action, String text) {
+        sendCommand(WireOpcodes.CMD_POST_INTERACT,
+                Map.of("postId", postId, "action", action, "text", text == null ? "" : text));
+    }
+
+    public void requestFeed(String ownerUserId) {
+        sendCommand(WireOpcodes.CMD_FEED_PULL,
+                Map.of("ownerUserId", ownerUserId == null ? "" : ownerUserId, "limit", "30"));
+    }
+
+    public void requestProfile(String userId) {
+        sendCommand(WireOpcodes.CMD_PROFILE_GET, Map.of("userId", userId));
+    }
+
+    public void requestMedia(String mediaId, boolean thumbnail) {
+        sendCommand(WireOpcodes.CMD_MEDIA_GET, Map.of("mediaId", mediaId,
+                "thumbnail", Boolean.toString(thumbnail)));
+    }
+
     public void logout() {
         sendCommand(WireOpcodes.CMD_AUTH_LOGOUT, Map.of());
         close();
@@ -173,6 +221,7 @@ public final class ClientController implements AutoCloseable {
     public void close() {
         closing = true;
         heartbeat.shutdownNow();
+        mediaWorker.shutdownNow();
         outbound.stopSending();
         outboxWriter.shutdown();
         try {
@@ -218,6 +267,40 @@ public final class ClientController implements AutoCloseable {
         } else if (frame.opcode() == WireOpcodes.EVT_TYPING) {
             model.updateTyping(fields.get("convId"), fields.get("userId"),
                     Boolean.parseBoolean(fields.get("typing")));
+        } else if (frame.opcode() == WireOpcodes.EVT_PROFILE_DATA) {
+            if (fields.containsKey("displayName")) {
+                model.setProfile(new UserProfile(fields.get("userId"), fields.get("displayName"),
+                        fields.getOrDefault("bio", ""), fields.getOrDefault("avatarMediaId", "")));
+            }
+        } else if (frame.opcode() == WireOpcodes.EVT_FEED_PAGE) {
+            if (fields.containsKey("comment.n")) {
+                int count = Integer.parseInt(fields.getOrDefault("comment.n", "0"));
+                java.util.List<edu.ember.common.model.PostComment> comments = new java.util.ArrayList<>();
+                for (int index = 0; index < count; index++) {
+                    comments.add(new edu.ember.common.model.PostComment(
+                            fields.get("comment.id." + index), fields.get("postId"),
+                            fields.get("comment.author." + index),
+                            fields.get("comment.text." + index),
+                            Long.parseLong(fields.get("comment.created." + index))));
+                }
+                model.setComments(fields.get("postId"), comments);
+                return;
+            }
+            int count = Integer.parseInt(fields.getOrDefault("post.n", "0"));
+            java.util.List<SocialPost> posts = new java.util.ArrayList<>();
+            for (int index = 0; index < count; index++) {
+                posts.add(new SocialPost(fields.get("post." + index), fields.get("owner." + index),
+                        fields.get("media." + index), fields.getOrDefault("caption." + index, ""),
+                        Long.parseLong(fields.getOrDefault("created." + index, "0")),
+                        Integer.parseInt(fields.getOrDefault("likes." + index, "0")),
+                        Integer.parseInt(fields.getOrDefault("comments." + index, "0")),
+                        Boolean.parseBoolean(fields.getOrDefault("liked." + index, "false"))));
+            }
+            model.setSocialPosts(posts);
+        } else if (frame.opcode() == WireOpcodes.EVT_MEDIA_OK) {
+            model.mediaUploaded(fields.get("mediaId"));
+        } else if (frame.opcode() == WireOpcodes.EVT_MEDIA_DATA) {
+            model.setMedia(fields.get("mediaId"), java.util.Base64.getDecoder().decode(fields.get("data")));
         } else if (frame.opcode() == WireOpcodes.EVT_ERROR) {
             model.setError(fields.getOrDefault("code", "500"),
                     fields.getOrDefault("message", "Request failed"));

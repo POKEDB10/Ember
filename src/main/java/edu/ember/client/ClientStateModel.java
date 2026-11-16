@@ -2,6 +2,9 @@ package edu.ember.client;
 
 import edu.ember.common.model.Message;
 import edu.ember.common.model.MessageStatus;
+import edu.ember.common.model.SocialPost;
+import edu.ember.common.model.UserProfile;
+import edu.ember.common.model.PostComment;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -17,6 +20,11 @@ public final class ClientStateModel {
     private final Map<String, Integer> groupMemberCounts = new HashMap<>();
     private final Map<String, Boolean> presence = new HashMap<>();
     private final Map<String, String> typingUsers = new HashMap<>();
+    private final Map<String, UserProfile> profiles = new HashMap<>();
+    private final Map<String, byte[]> mediaBytes = new HashMap<>();
+    private final Map<String, List<PostComment>> comments = new HashMap<>();
+    private List<SocialPost> socialPosts = List.of();
+    private String lastUploadedMediaId;
     private String userId;
     private String activeConversationId;
     private String errorMessage;
@@ -58,6 +66,42 @@ public final class ClientStateModel {
 
     public synchronized String typingUser(String conversationId) {
         return typingUsers.get(conversationId);
+    }
+
+    public synchronized List<SocialPost> socialPosts() { return List.copyOf(socialPosts); }
+    public synchronized UserProfile profile(String userId) { return profiles.get(userId); }
+    public synchronized List<PostComment> comments(String postId) {
+        return List.copyOf(comments.getOrDefault(postId, List.of()));
+    }
+    public synchronized byte[] mediaBytes(String mediaId) {
+        byte[] bytes = mediaBytes.get(mediaId);
+        return bytes == null ? null : bytes.clone();
+    }
+    public synchronized String lastUploadedMediaId() { return lastUploadedMediaId; }
+
+    synchronized void setSocialPosts(List<SocialPost> posts) {
+        socialPosts = List.copyOf(posts);
+        fire("SOCIAL_FEED", null);
+    }
+
+    synchronized void setProfile(UserProfile profile) {
+        profiles.put(profile.userId(), profile);
+        fire("PROFILE", null);
+    }
+
+    synchronized void setComments(String postId, List<PostComment> postComments) {
+        comments.put(postId, List.copyOf(postComments));
+        fire("COMMENTS", null);
+    }
+
+    synchronized void setMedia(String mediaId, byte[] bytes) {
+        mediaBytes.put(mediaId, bytes.clone());
+        fire("MEDIA", null);
+    }
+
+    synchronized void mediaUploaded(String mediaId) {
+        lastUploadedMediaId = mediaId;
+        fire("MEDIA_UPLOADED", null);
     }
 
     synchronized void authenticated(String newUserId) {
