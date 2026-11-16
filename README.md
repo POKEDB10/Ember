@@ -4,7 +4,7 @@
 
 Ember is a Java desktop messenger and campus social feed.
 
-The current build provides TLS 1.3 transport, a bounded wire protocol, registration/login, a themed Swing chat workspace, live 1:1 and group messaging, server-assigned order, sent/delivered/read receipts, duplicate resend handling, a durable local outbox, session resume and sync, history pulls, presence, typing, and heartbeat. The server uses CRC-protected WAL storage, username lockout, message rate limits, and authentication audit events. Campus Pulse is an upcoming phase.
+The current build provides TLS 1.3 transport, a bounded wire protocol, registration/login, a themed Swing chat workspace, live 1:1 and group messaging, server-assigned order, sent/delivered/read receipts, duplicate resend handling, a durable local outbox, session resume and sync, history pulls, presence, typing, heartbeat, public profiles and follows, image posts, likes, and comments. The server uses CRC-protected WAL storage, username lockout, message rate limits, and authentication audit events. Campus Pulse images are checked by signature and size, then re-encoded.
 
 ## Requirements
 
@@ -29,4 +29,4 @@ The transport uses a local server keystore and client truststore. Run `scripts/g
 
 ## Security claims
 
-Implemented claims: “Traffic between client and server is encrypted with TLS 1.3.” “Passwords are stored with salted PBKDF2-HMAC-SHA256 at 600,000 iterations, the OWASP work factor for that algorithm. OWASP's first choice is Argon2id, which the JDK does not include.” “The wire protocol is length-prefixed with size limits and does not use Java serialization.” The object-level authorization and image-validation claims remain targets until their phases and negative tests are complete.
+Implemented claims: “Traffic between client and server is encrypted with TLS 1.3.” “Passwords are stored with salted PBKDF2-HMAC-SHA256 at 600,000 iterations, the OWASP work factor for that algorithm. OWASP's first choice is Argon2id, which the JDK does not include.” “The wire protocol is length-prefixed with size limits and does not use Java serialization.” “Every command that names an object is authorization-checked on the server, with a negative test per rule.” “Uploaded images are validated by signature and size, then re-encoded.” Phase 6 profiles, feeds, and posts are public; private-account filtering and blocking are not implemented yet.
