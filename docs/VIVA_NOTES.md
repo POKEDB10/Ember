@@ -79,3 +79,19 @@ The scaffold establishes the package root, shared product identity, plain `javac
 1. **How does duplicate resend avoid creating a second message?** The server looks up the authenticated sender and client message ID before appending. A matching conversation and body receive the original acknowledgement; reusing the ID for different content is rejected.
 2. **How does a client recover after a disconnect?** It reconnects with bounded exponential backoff, resumes with its saved session token and last global sequence, processes missing events, then sends frames still present in its durable local outbox. The integration tests verify an offline message appears once after resume.
 3. **Why are group receipts counted on the server?** The server knows the current recipient set and authenticates each receipt against group membership. It reports delivered/read counts and advances status only when every recipient has reached that state, avoiding a client claiming completion based on its own view.
+
+## Phase 5: chat UI system
+
+`ThemeManager` owns the dark and light palettes and `FontResolver` chooses the first supported font. `ChatWorkspacePanel` composes the left conversation list, main conversation view, and settings card. Message bodies use a wrapping `JTextArea` inside a custom painted rounded panel; client-model events update the list, presence line, typing line, receipts, and messages on the Swing EDT. Tray alerts fall back to an in-app `ToastBanner` when the system tray is unavailable.
+
+**Key classes:** `ThemeManager`, `FontResolver`, `RoundedPanel`, `AvatarComponent`, `ChatBubblePanel`, `BadgeLabel`, `AuthPanel`, `ChatListPanel`, `ConversationPanel`, `SettingsPanel`, `ToastBanner`, `NotificationService`, and `ChatWorkspacePanel`.
+
+**Trace:** a login action submits credentials through `AuthPanel` → `ClientController` writes the auth command on its sender thread → `ClientStateModel` receives the auth event → `EmberClientApp` switches to the workspace → message-model notifications cause the conversation panel to repaint wrapped bubbles and receipt marks.
+
+**Concepts:** component composition, `Graphics2D`, Swing layouts, key/focus/document/action listeners, `CardLayout`, `Swing Timer`, Observer/MVC, EDT confinement.
+
+### Likely questions
+
+1. **Why use a `JTextArea` for each message bubble instead of an HTML label?** `JTextArea` wraps plain text and avoids the HTML-label emoji wrapping issue on scaled displays. It keeps hostile text literal rather than interpreting markup.
+2. **How does theme switching update the interface?** `ThemeManager` changes shared palette tokens, then each workspace panel applies those tokens to its controls and repaints dynamic components. Keeping colors centralized makes dark/light behavior consistent.
+3. **How are notifications shown when the window is not focused?** `NotificationService` uses the desktop tray when supported. If the platform has no tray or refuses the tray icon, `ToastBanner` presents the same message inside the app.

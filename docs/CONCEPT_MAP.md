@@ -30,5 +30,9 @@ This map will be updated as concepts appear in implemented classes. Phase 0 demo
 | Exponential backoff and session recovery | `ReconnectManager`, `ClientController.resume` |
 | Presence, typing, and heartbeat events | `EmberServer.ConnectionHandler`, `ClientStateModel` |
 | Authorized history and sequence paging | `StorageEngine.getHistory`, `CMD_HISTORY_PULL` |
+| Swing theme tokens and font fallback | `client.ui.ThemeManager`, `FontResolver` |
+| Reusable custom-painted components | `RoundedPanel`, `AvatarComponent`, `ChatBubblePanel`, `BadgeLabel` |
+| Swing panels, focus, key and document listeners | `AuthPanel`, `ChatListPanel`, `ConversationPanel`, `SettingsPanel` |
+| Timed notification and system tray fallback | `ToastBanner`, `NotificationService` |
 
 Later concept mappings are added with the phase that implements the corresponding code.
