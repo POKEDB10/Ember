@@ -89,6 +89,10 @@ public final class AuthService {
         return user.get();
     }
 
+    public boolean unlock(String username) { return locks.unlock(username); }
+
+    public java.util.List<String> lockedUsers() { return locks.lockedUsers(); }
+
     private void acquireHashSlot() throws RateLimitedException {
         try {
             hashSlots.acquire();

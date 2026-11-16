@@ -48,6 +48,13 @@ public final class UserLockManager {
         return lockedUntil.remove(key) != null;
     }
 
+    public synchronized java.util.List<String> lockedUsers() {
+        java.util.List<String> names = new java.util.ArrayList<>(lockedUntil.keySet());
+        names.removeIf(name -> !isLocked(name));
+        names.sort(String::compareTo);
+        return java.util.List.copyOf(names);
+    }
+
     private static String normalize(String username) {
         return username.toLowerCase(java.util.Locale.ROOT);
     }

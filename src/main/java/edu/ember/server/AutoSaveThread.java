@@ -24,6 +24,7 @@ public final class AutoSaveThread extends Thread {
             try {
                 Thread.sleep(intervalMs);
                 storage.flush();
+                storage.compact();
             } catch (InterruptedException exception) {
                 interrupt();
             } catch (IOException exception) {
