@@ -1,0 +1,106 @@
+/* Ember retro: phosphor terminals and beveled windows. System mono fonts only, so nothing extra downloads. */
+:root, [data-theme="amber"] {
+  --bg: #120b06; --panel: #1b1109; --raised: #28190c; --line: #6b4420; --text: #ffb347;
+  --dim: #b5813f; --accent: #ff6a1a; --mine: #3a200c; --ok: #a6e86f; --err: #ff5d5d;
+  --glow: 0 0 6px rgba(255, 150, 50, .35); --scan: rgba(0, 0, 0, .22);
+}
+[data-theme="green"] {
+  --bg: #040b06; --panel: #08140b; --raised: #0e2013; --line: #1f5a2c; --text: #7dff9a;
+  --dim: #4fae66; --accent: #c6ff4a; --mine: #0f2b16; --ok: #c6ff4a; --err: #ff6b6b;
+  --glow: 0 0 6px rgba(90, 255, 130, .35); --scan: rgba(0, 0, 0, .25);
+}
+[data-theme="paper"] {
+  --bg: #e9dfc8; --panel: #f6efdf; --raised: #fffaf0; --line: #8a6a44; --text: #2b1d10;
+  --dim: #6e5536; --accent: #b8430b; --mine: #f3dcc0; --ok: #2f7a1f; --err: #b3261e;
+  --glow: none; --scan: rgba(80, 50, 20, .05);
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--text); text-shadow: var(--glow);
+  font: 15px/1.45 "Cascadia Mono", "JetBrains Mono", Consolas, "SF Mono", Menlo, ui-monospace, monospace;
+  display: grid; place-items: center; overflow: hidden;
+}
+body::after { /* static scanlines: one gradient, no animation, near-zero CPU */
+  content: ""; position: fixed; inset: 0; pointer-events: none;
+  background: repeating-linear-gradient(var(--scan) 0 1px, transparent 1px 3px);
+}
+[hidden] { display: none !important; }
+button, input, textarea {
+  font: inherit; color: inherit; text-shadow: inherit; background: var(--raised);
+  border: 2px solid var(--line); border-radius: 0; padding: 6px 10px;
+}
+button { cursor: pointer; box-shadow: 3px 3px 0 var(--line); text-transform: uppercase; letter-spacing: .05em; }
+button:hover:not(:disabled) { color: var(--bg); background: var(--text); text-shadow: none; }
+button:active:not(:disabled) { transform: translate(3px, 3px); box-shadow: none; }
+button:disabled { opacity: .45; cursor: default; }
+button.icon { box-shadow: none; border: 0; background: transparent; padding: 2px 6px; text-transform: none; }
+button.icon[aria-pressed="true"] { color: var(--bg); background: var(--accent); }
+button.link { border: 0; box-shadow: none; background: none; text-transform: none; text-decoration: underline; color: var(--dim); }
+input:focus, textarea:focus, button:focus-visible { outline: 2px dashed var(--accent); outline-offset: 2px; }
+::placeholder { color: var(--dim); opacity: .8; }
+.dim { color: var(--dim); }
+.error { color: var(--err); min-height: 1.2em; margin: 0; }
+
+.window { background: var(--panel); border: 2px solid var(--line); box-shadow: 6px 6px 0 var(--line); display: flex; flex-direction: column; min-height: 0; }
+.titlebar {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  padding: 4px 8px; background: var(--line); color: var(--bg); text-shadow: none; font-weight: 700;
+  letter-spacing: .08em; white-space: nowrap; overflow: hidden;
+}
+.titlebar button.icon { color: var(--bg); }
+.titlebar .dim { color: var(--panel); font-weight: 400; }
+
+.login { width: min(420px, calc(100vw - 32px)); }
+.stack { display: flex; flex-direction: column; gap: 12px; padding: 20px; }
+.stack label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; letter-spacing: .1em; color: var(--dim); }
+.stack input { color: var(--text); }
+.logo { margin: 0; color: var(--accent); font-size: 13px; line-height: 1.1; overflow: hidden; }
+.stack p { margin: 0; }
+
+#app { display: grid; grid-template-columns: minmax(240px, 320px) 1fr; gap: 16px; width: 100vw; height: 100vh; height: 100dvh; padding: 16px 22px 22px 16px; }
+.row { display: flex; }
+.pad { padding: 8px; }
+.gap { gap: 10px; }
+.row > * { flex: 1; min-width: 0; }
+.chats { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; border-top: 2px solid var(--line); }
+.chats li { padding: 8px 10px; border-bottom: 1px dashed var(--line); cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 0 8px; }
+.chats li:hover, .chats li.active { background: var(--raised); }
+.chats li.active { box-shadow: inset 4px 0 0 var(--accent); }
+.chats .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chats .last { grid-column: 1 / -1; color: var(--dim); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { background: var(--accent); color: var(--bg); text-shadow: none; padding: 0 6px; font-size: 12px; align-self: center; }
+.dot::before { content: "○ "; color: var(--dim); }
+.dot.on::before { content: "● "; color: var(--ok); }
+.status { padding: 4px 10px; border-top: 2px solid var(--line); font-size: 12px; }
+
+.messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; overscroll-behavior: contain; }
+.more { align-self: center; }
+.msg { max-width: min(78%, 720px); align-self: flex-start; border: 2px solid var(--line); background: var(--raised); padding: 6px 10px; box-shadow: 3px 3px 0 var(--line); cursor: pointer; }
+.msg.mine { align-self: flex-end; background: var(--mine); border-color: var(--accent); box-shadow: 3px 3px 0 var(--accent); }
+.msg .who { font-size: 12px; color: var(--accent); }
+.msg .body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg .meta { font-size: 11px; color: var(--dim); text-align: right; }
+.msg .quote { font-size: 12px; color: var(--dim); border-left: 3px solid var(--line); padding-left: 6px; margin-bottom: 4px; }
+.msg .reacts { display: flex; gap: 6px; flex-wrap: wrap; font-size: 13px; }
+.msg .actions { display: none; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+.msg.sel .actions { display: flex; }
+.msg .actions button { padding: 1px 6px; font-size: 13px; box-shadow: none; }
+.msg.pending .meta::after { content: " …"; }
+.empty { margin: auto; color: var(--dim); text-align: center; white-space: pre; }
+.typing { min-height: 1.4em; padding: 0 12px; font-size: 12px; }
+.replybar { display: flex; justify-content: space-between; padding: 4px 12px; border-top: 2px dashed var(--line); font-size: 13px; color: var(--dim); }
+.composer { display: flex; gap: 8px; padding: 10px; border-top: 2px solid var(--line); align-items: flex-end; }
+.composer textarea { flex: 1; resize: none; max-height: 40vh; color: var(--text); }
+.toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); text-shadow: none; padding: 8px 14px; border: 2px solid var(--line); box-shadow: 4px 4px 0 var(--line); max-width: calc(100vw - 32px); z-index: 2; }
+.back { display: none; }
+
+@media (max-width: 720px) {
+  #app { grid-template-columns: 1fr; padding: 8px 12px 12px 8px; }
+  .window { box-shadow: 4px 4px 0 var(--line); }
+  #app .chat { display: none; }
+  #app.open .chat { display: flex; }
+  #app.open .side { display: none; }
+  .back { display: inline; }
+  .msg { max-width: 90%; }
+}

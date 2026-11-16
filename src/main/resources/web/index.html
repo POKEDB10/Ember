@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en" data-theme="amber">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ember</title>
+<meta name="description" content="Ember messenger: say it, spark it, let it fade.">
+<meta name="theme-color" content="#120b06">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<main id="login" class="window login" hidden>
+  <header class="titlebar"><span>▣ EMBER.EXE</span><span aria-hidden="true">_ □ ×</span></header>
+  <form id="loginForm" class="stack">
+    <pre class="logo" aria-hidden="true">  ╔═╗╔╦╗╔╗ ╔═╗╦═╗
+  ║╣ ║║║╠╩╗║╣ ╠╦╝
+  ╚═╝╩ ╩╚═╝╚═╝╩╚═</pre>
+    <p class="dim">say it · spark it · let it fade</p>
+    <label>USERNAME<input id="user" autocomplete="username" required minlength="3" maxlength="20" pattern="[A-Za-z0-9_]+"></label>
+    <label>PASSWORD<input id="pass" type="password" autocomplete="current-password" required minlength="8"></label>
+    <label id="nameRow" hidden>DISPLAY NAME<input id="displayName" autocomplete="nickname"></label>
+    <p id="loginError" class="error" role="alert"></p>
+    <button id="loginBtn" type="submit">&gt; LOG IN</button>
+    <button id="modeBtn" type="button" class="link">New here? Create an account</button>
+  </form>
+</main>
+
+<div id="app" hidden>
+  <aside class="window side">
+    <header class="titlebar"><span id="me">▣ CHATS</span>
+      <span class="tools">
+        <button id="themeBtn" class="icon" title="Change theme" aria-label="Change theme">◐</button>
+        <button id="logoutBtn" class="icon" title="Log out" aria-label="Log out">⏻</button>
+      </span></header>
+    <div class="row pad">
+      <input id="filter" type="search" placeholder="search…" aria-label="Search chats">
+    </div>
+    <div class="row pad gap">
+      <button id="newDm">+ DM</button><button id="newGroup">+ GROUP</button>
+    </div>
+    <ul id="chats" class="chats" aria-label="Conversations"></ul>
+    <footer id="status" class="status dim">offline</footer>
+  </aside>
+
+  <section class="window chat">
+    <header class="titlebar">
+      <span><button id="back" class="icon back" aria-label="Back to chats">◄</button>
+        <span id="chatTitle">▣ NO CHAT OPEN</span> <span id="chatSub" class="dim"></span></span>
+      <span class="tools"><button id="addMember" class="icon" title="Add member" aria-label="Add member" hidden>+👤</button></span>
+    </header>
+    <div id="messages" class="messages" aria-live="polite"></div>
+    <div id="typing" class="typing dim"></div>
+    <div id="replyBar" class="replybar" hidden><span id="replyText"></span><button id="replyCancel" class="icon" aria-label="Cancel reply">×</button></div>
+    <form id="composer" class="composer">
+      <button id="ttlBtn" type="button" class="icon" title="Disappear after 15 s" aria-pressed="false">⏱</button>
+      <textarea id="input" rows="1" placeholder="type a message_" aria-label="Message" disabled></textarea>
+      <button id="sendBtn" type="submit" disabled>SEND</button>
+    </form>
+  </section>
+</div>
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
