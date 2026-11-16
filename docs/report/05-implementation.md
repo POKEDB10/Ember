@@ -16,6 +16,8 @@ Phase 6 adds public user profiles, follow/unfollow, safe PNG/JPEG upload, UUID-n
 
 Phase 7 adds expiring messages, replies, reactions, edit/delete, private accounts with follow approval, blocking and rate-limited reports, message pins/stars/search, expiring stories, group polls, group information, an admin report/unlock panel, and message forwarding. The WAL stores these changes and compacts its event history into a checksummed GZIP snapshot. A forwarded message receives a new ID and independent body state. The demo server enables administrators only when usernames are passed with `--admin-user`.
 
+Phase 8 adds `AttackSimulator` for hostile protocol inputs over TLS, `ConcurrencyStressHarness` for ten concurrent headless clients and 500 messages per run (run twice), and `DemoSeeder` for Alice/Bob/Charlie, a study group, poll, sample post, and story. `EmberServer --demo-seed` seeds an empty store and assigns Alice the administrator role for the demo launch. Matching `run-demo` scripts start the local server and three clients. `package-demo` creates runnable JARs and app-images with `jpackage`; the bundled client was launched with no JDK on `PATH`.
+
 | Concept | Class | File |
 |---|---|---|
 | Builder and immutable frame | `WireFrame.Builder`, `WireFrame` | `common/protocol/WireFrame.java` |
@@ -37,6 +39,11 @@ Phase 7 adds expiring messages, replies, reactions, edit/delete, private account
 | Group polls and 2D vote matrix | `PollData`, `ConversationPanel` | `common/model/PollData.java`, `client/ui/ConversationPanel.java` |
 | Snapshot compaction and crash recovery | `WalStorageEngine.compact` | `server/storage/WalStorageEngine.java` |
 | In-chat search and deep-copy forwarding | `SearchEngine`, `Message` copy constructor | `client/SearchEngine.java`, `common/model/Message.java` |
+| TLS attack scenarios and identity spoofing proof | `AttackSimulator` | `tools/AttackSimulator.java` |
+| Concurrent client ordering and duplicate checks | `ConcurrencyStressHarness` | `tools/ConcurrencyStressHarness.java` |
+| Reproducible demo accounts and social fixtures | `DemoSeeder` | `tools/DemoSeeder.java` |
+| JAR and bundled app-image build | `package-demo` scripts | `scripts/package-demo.bat`, `scripts/package-demo.sh` |
+| UML diagrams from implemented flows | PlantUML sources | `docs/uml/*.puml` |
 
 ## Security
 
