@@ -4,6 +4,8 @@ import edu.ember.common.model.Message;
 import edu.ember.common.model.MessageStatus;
 import edu.ember.common.model.SocialPost;
 import edu.ember.common.model.UserProfile;
+import edu.ember.common.model.StoryItem;
+import edu.ember.common.model.PollData;
 import edu.ember.common.exceptions.EmberException;
 import edu.ember.common.protocol.FrameFactory;
 import edu.ember.common.protocol.KvPayloadCodec;
@@ -88,22 +90,59 @@ public final class ClientController implements AutoCloseable {
     }
 
     public String sendMessage(String conversationId, String body) {
-        return sendMessageWithId(conversationId, body, UUID.randomUUID().toString());
+        return sendMessageWithIdAndTtl(conversationId, body, UUID.randomUUID().toString(), 0);
+    }
+
+    public String sendMessage(String conversationId, String body, int ttlSec) {
+        return sendMessageWithIdAndTtl(conversationId, body, UUID.randomUUID().toString(), ttlSec);
     }
 
     public String sendMessageWithId(String conversationId, String body, String clientMsgId) {
+        return sendMessageWithIdAndTtl(conversationId, body, clientMsgId, 0);
+    }
+
+    public String sendMessageWithIdAndTtl(String conversationId, String body, String clientMsgId,
+            int ttlSec) {
+        return sendMessageWithReply(conversationId, body, clientMsgId, ttlSec, "");
+    }
+
+    public String sendReply(String conversationId, String body, int ttlSec, String replyToId) {
+        return sendMessageWithReply(conversationId, body, UUID.randomUUID().toString(), ttlSec,
+                replyToId);
+    }
+
+    public String forwardMessage(String sourceMessageId, String targetConversationId) {
+        Message source = model.conversationIds().stream()
+                .flatMap(id -> model.messages(id).stream())
+                .filter(message -> message.clientMsgId().equals(sourceMessageId))
+                .findFirst().orElseThrow();
+        Message forwarded = new Message(source, UUID.randomUUID().toString(), model.userId(),
+                targetConversationId, System.currentTimeMillis());
+        return sendMessageWithId(targetConversationId, forwarded.body(), forwarded.clientMsgId());
+    }
+
+    private String sendMessageWithReply(String conversationId, String body, String clientMsgId,
+            int ttlSec, String replyToId) {
         if (model.userId() == null) {
             throw new IllegalStateException("Authenticate before sending a message");
         }
+        if (ttlSec != 0 && ttlSec != 15) {
+            throw new IllegalArgumentException("Supported message TTL values are 0 and 15 seconds");
+        }
+        String replyPreview = model.messages(conversationId).stream()
+                .filter(message -> message.clientMsgId().equals(replyToId)).findFirst()
+                .map(message -> message.body().substring(0, Math.min(100, message.body().length())))
+                .orElse("");
         if (model.messages(conversationId).stream()
                 .noneMatch(existing -> existing.clientMsgId().equals(clientMsgId))) {
             Message message = new Message(clientMsgId, model.userId(), conversationId, body,
-                    System.currentTimeMillis());
+                    System.currentTimeMillis(), ttlSec, replyToId, replyPreview);
             message.advanceStatus(MessageStatus.PENDING_LOCAL);
             model.addMessage(message);
         }
         WireFrame frame = commandFrame(WireOpcodes.CMD_MSG_SEND,
-                Map.of("clientMsgId", clientMsgId, "convId", conversationId, "body", body));
+                Map.of("clientMsgId", clientMsgId, "convId", conversationId, "body", body,
+                        "ttlSec", Integer.toString(ttlSec), "replyToId", replyToId));
         outboxWriter.execute(() -> persistAndSend(frame));
         return clientMsgId;
     }
@@ -158,6 +197,30 @@ public final class ClientController implements AutoCloseable {
                 "typing", Boolean.toString(typing)));
     }
 
+    public void reactMessage(String clientMsgId, String emoji, boolean remove) {
+        sendCommand(WireOpcodes.CMD_MSG_REACT, Map.of("clientMsgId", clientMsgId,
+                "emoji", emoji, "remove", Boolean.toString(remove)));
+    }
+
+    public void editMessage(String clientMsgId, String newBody) {
+        sendCommand(WireOpcodes.CMD_MSG_EDIT,
+                Map.of("clientMsgId", clientMsgId, "newBody", newBody));
+    }
+
+    public void deleteMessage(String clientMsgId) {
+        sendCommand(WireOpcodes.CMD_MSG_DELETE, Map.of("clientMsgId", clientMsgId));
+    }
+
+    public void pinMessage(String clientMsgId, boolean pinned) {
+        sendCommand(WireOpcodes.CMD_MSG_PIN, Map.of("clientMsgId", clientMsgId,
+                "pinned", Boolean.toString(pinned)));
+    }
+
+    public void starMessage(String clientMsgId, boolean starred) {
+        sendCommand(WireOpcodes.CMD_MSG_STAR, Map.of("clientMsgId", clientMsgId,
+                "starred", Boolean.toString(starred)));
+    }
+
     public void createGroup(String name, String description) {
         sendCommand(WireOpcodes.CMD_GROUP_CREATE,
                 Map.of("name", name, "desc", description, "member.n", "0"));
@@ -168,14 +231,38 @@ public final class ClientController implements AutoCloseable {
                 Map.of("groupId", groupId, "targetUser", targetUser, "action", action));
     }
 
+    public void requestGroupInfo(String groupId) {
+        sendCommand(WireOpcodes.CMD_GROUP_INFO, Map.of("groupId", groupId));
+    }
+
     public void updateProfile(String displayName, String bio) {
+        updateProfile(displayName, bio, false);
+    }
+
+    public void updateProfile(String displayName, String bio, boolean privateAccount) {
         sendCommand(WireOpcodes.CMD_PROFILE_UPDATE, Map.of("userId", model.userId(),
-                "displayName", displayName, "bio", bio));
+                "displayName", displayName, "bio", bio,
+                "privateAccount", Boolean.toString(privateAccount)));
     }
 
     public void follow(String targetUserId, boolean following) {
         sendCommand(WireOpcodes.CMD_FOLLOW_ACTION, Map.of("targetUserId", targetUserId,
                 "follow", Boolean.toString(following)));
+    }
+
+    public void approveFollow(String followerUserId, boolean approve) {
+        sendCommand(WireOpcodes.CMD_FOLLOW_ACTION, Map.of("targetUserId", followerUserId,
+                "action", "APPROVE", "approve", Boolean.toString(approve)));
+    }
+
+    public void blockUser(String targetUserId, boolean blocked) {
+        sendCommand(WireOpcodes.CMD_USER_BLOCK, Map.of("targetUserId", targetUserId,
+                "blocked", Boolean.toString(blocked)));
+    }
+
+    public void reportObject(String targetType, String targetId, String reason) {
+        sendCommand(WireOpcodes.CMD_MOD_REPORT, Map.of("targetType", targetType,
+                "targetId", targetId, "reason", reason));
     }
 
     public void uploadMedia(byte[] imageBytes, String fileName) {
@@ -188,6 +275,40 @@ public final class ClientController implements AutoCloseable {
 
     public void createPost(String mediaId, String caption) {
         sendCommand(WireOpcodes.CMD_POST_CREATE, Map.of("mediaId", mediaId, "caption", caption));
+    }
+
+    public void createStory(String mediaId, String caption) {
+        sendCommand(WireOpcodes.CMD_STORY_CREATE,
+                Map.of("mediaId", mediaId, "caption", caption));
+    }
+
+    public void requestStories() {
+        sendCommand(WireOpcodes.CMD_STORY_VIEW, Map.of());
+    }
+
+    public void createPoll(String groupId, String question, java.util.List<String> options) {
+        Map<String, String> fields = new HashMap<>();
+        fields.put("groupId", groupId);
+        fields.put("question", question);
+        fields.put("option.n", Integer.toString(options.size()));
+        for (int index = 0; index < options.size(); index++) {
+            fields.put("option." + index, options.get(index));
+        }
+        sendCommand(WireOpcodes.CMD_POLL_CREATE, fields);
+    }
+
+    public void votePoll(String pollId, int option) {
+        sendCommand(WireOpcodes.CMD_POLL_VOTE,
+                Map.of("pollId", pollId, "option", Integer.toString(option)));
+    }
+
+    public void requestAdminData() {
+        sendCommand(WireOpcodes.CMD_ADMIN_ACTION, Map.of("action", "REPORTS"));
+    }
+
+    public void unlockUser(String username) {
+        sendCommand(WireOpcodes.CMD_ADMIN_ACTION,
+                Map.of("action", "UNLOCK", "username", username));
     }
 
     public void interactPost(String postId, String action, String text) {
@@ -238,12 +359,33 @@ public final class ClientController implements AutoCloseable {
             sessionToken = fields.get("token");
             String userId = fields.get("userId");
             initializeOutbox(userId);
-            model.authenticated(userId);
+            model.authenticated(userId, "ADMIN".equals(fields.get("role")));
         } else if (frame.opcode() == WireOpcodes.EVT_MSG_ACK) {
             model.updateAcknowledgement(fields.get("clientMsgId"),
-                    Long.parseLong(fields.get("convSeq")), Long.parseLong(fields.get("globalSeq")));
+                    Long.parseLong(fields.get("convSeq")), Long.parseLong(fields.get("globalSeq")),
+                    Long.parseLong(fields.getOrDefault("expiresAtMs", "0")));
             model.updateStatus(fields.get("clientMsgId"), MessageStatus.SENT);
             acknowledgeOutbox();
+        } else if (frame.opcode() == WireOpcodes.EVT_MSG_UPDATE
+                && fields.getOrDefault("state", "").equals("EXPIRED")) {
+            model.removeMessage(fields.get("clientMsgId"));
+        } else if (frame.opcode() == WireOpcodes.EVT_MSG_UPDATE
+                && fields.getOrDefault("state", "").equals("REACTION")) {
+            model.updateReaction(fields.get("clientMsgId"), fields.get("emoji"),
+                    Integer.parseInt(fields.get("count")));
+        } else if (frame.opcode() == WireOpcodes.EVT_MSG_UPDATE
+                && fields.getOrDefault("state", "").equals("EDITED")) {
+            model.updateMessageBody(fields.get("clientMsgId"), fields.get("body"));
+        } else if (frame.opcode() == WireOpcodes.EVT_MSG_UPDATE
+                && fields.getOrDefault("state", "").equals("DELETED")) {
+            model.deleteMessage(fields.get("clientMsgId"));
+        } else if (frame.opcode() == WireOpcodes.EVT_MSG_UPDATE
+                && fields.getOrDefault("state", "").equals("PINNED")) {
+            model.updatePinned(fields.get("clientMsgId"), Boolean.parseBoolean(fields.get("pinned")));
+        } else if (frame.opcode() == WireOpcodes.EVT_MSG_UPDATE
+                && fields.getOrDefault("state", "").equals("STARRED")) {
+            model.updateStarred(fields.get("clientMsgId"), fields.get("userId"),
+                    Boolean.parseBoolean(fields.get("starred")));
         } else if (frame.opcode() == WireOpcodes.EVT_MSG_DELIVER) {
             handleDelivery(fields);
         } else if (frame.opcode() == WireOpcodes.EVT_RECEIPT_UPDATE) {
@@ -258,6 +400,16 @@ public final class ClientController implements AutoCloseable {
             drainOutbox();
         } else if (frame.opcode() == WireOpcodes.EVT_GROUP_UPDATE) {
             model.updateGroup(fields.get("groupId"), Integer.parseInt(fields.get("member.n")));
+            if (fields.containsKey("groupName")) {
+                int count = Integer.parseInt(fields.get("member.n"));
+                java.util.Map<String, edu.ember.common.model.UserRole> members = new java.util.HashMap<>();
+                for (int index = 0; index < count; index++) {
+                    members.put(fields.get("member." + index),
+                            edu.ember.common.model.UserRole.valueOf(fields.get("role." + index)));
+                }
+                model.updateGroup(new edu.ember.common.model.GroupChat(fields.get("groupId"),
+                        fields.get("groupName"), fields.get("description"), members));
+            }
         } else if (frame.opcode() == WireOpcodes.EVT_HISTORY_PAGE) {
             model.addHistoryMessage(readMessage(fields));
         } else if (frame.opcode() == WireOpcodes.EVT_PONG) {
@@ -270,7 +422,8 @@ public final class ClientController implements AutoCloseable {
         } else if (frame.opcode() == WireOpcodes.EVT_PROFILE_DATA) {
             if (fields.containsKey("displayName")) {
                 model.setProfile(new UserProfile(fields.get("userId"), fields.get("displayName"),
-                        fields.getOrDefault("bio", ""), fields.getOrDefault("avatarMediaId", "")));
+                        fields.getOrDefault("bio", ""), fields.getOrDefault("avatarMediaId", ""),
+                        Boolean.parseBoolean(fields.getOrDefault("privateAccount", "false"))));
             }
         } else if (frame.opcode() == WireOpcodes.EVT_FEED_PAGE) {
             if (fields.containsKey("comment.n")) {
@@ -297,6 +450,49 @@ public final class ClientController implements AutoCloseable {
                         Boolean.parseBoolean(fields.getOrDefault("liked." + index, "false"))));
             }
             model.setSocialPosts(posts);
+        } else if (frame.opcode() == WireOpcodes.EVT_STORY_UPDATE) {
+            int count = Integer.parseInt(fields.getOrDefault("story.n", "0"));
+            java.util.List<StoryItem> stories = new java.util.ArrayList<>();
+            for (int index = 0; index < count; index++) {
+                stories.add(new StoryItem(fields.get("story." + index), fields.get("owner." + index),
+                        fields.get("media." + index), fields.getOrDefault("caption." + index, ""),
+                        Long.parseLong(fields.get("created." + index)),
+                        Long.parseLong(fields.get("expires." + index))));
+            }
+            model.setStories(stories);
+        } else if (frame.opcode() == WireOpcodes.EVT_POLL_UPDATE) {
+            int optionCount = Integer.parseInt(fields.get("option.n"));
+            int memberCount = Integer.parseInt(fields.get("member.n"));
+            java.util.List<String> options = new java.util.ArrayList<>();
+            java.util.List<String> members = new java.util.ArrayList<>();
+            java.util.Map<String, Integer> votes = new java.util.HashMap<>();
+            for (int index = 0; index < optionCount; index++) {
+                options.add(fields.get("option." + index));
+            }
+            for (int index = 0; index < memberCount; index++) {
+                String member = fields.get("member." + index);
+                members.add(member);
+                if (fields.containsKey("vote." + index)) {
+                    votes.put(member, Integer.parseInt(fields.get("vote." + index)));
+                }
+            }
+            PollData poll = new PollData(fields.get("pollId"), fields.get("groupId"),
+                    fields.get("question"), options, members);
+            votes.forEach(poll::vote);
+            model.setPoll(poll);
+        } else if (frame.opcode() == WireOpcodes.EVT_ADMIN_DATA) {
+            int reportCount = Integer.parseInt(fields.getOrDefault("report.n", "0"));
+            int lockedCount = Integer.parseInt(fields.getOrDefault("locked.n", "0"));
+            java.util.List<edu.ember.common.model.ModerationReport> reports = new java.util.ArrayList<>();
+            java.util.List<String> locked = new java.util.ArrayList<>();
+            for (int index = 0; index < reportCount; index++) {
+                reports.add(new edu.ember.common.model.ModerationReport(fields.get("report.id." + index),
+                        fields.get("reporter." + index), fields.get("targetType." + index),
+                        fields.get("targetId." + index), fields.get("reason." + index),
+                        Long.parseLong(fields.get("created." + index))));
+            }
+            for (int index = 0; index < lockedCount; index++) { locked.add(fields.get("locked." + index)); }
+            model.setAdminData(reports, locked);
         } else if (frame.opcode() == WireOpcodes.EVT_MEDIA_OK) {
             model.mediaUploaded(fields.get("mediaId"));
         } else if (frame.opcode() == WireOpcodes.EVT_MEDIA_DATA) {
@@ -326,7 +522,16 @@ public final class ClientController implements AutoCloseable {
     private Message readMessage(Map<String, String> fields) {
         Message message = new Message(fields.get("clientMsgId"), fields.get("senderUserId"),
                 fields.get("convId"), fields.get("body"),
-                Long.parseLong(fields.get("serverTs")));
+                Long.parseLong(fields.get("serverTs")),
+                Integer.parseInt(fields.getOrDefault("ttlSec", "0")),
+                fields.getOrDefault("replyToId", ""),
+                fields.getOrDefault("replyPreview", ""));
+        message.setExpiresAtMs(Long.parseLong(fields.getOrDefault("expiresAtMs", "0")));
+        int reactionCount = Integer.parseInt(fields.getOrDefault("reaction.n", "0"));
+        for (int index = 0; index < reactionCount; index++) {
+            message.setReactionCount(fields.get("reaction.emoji." + index),
+                    Integer.parseInt(fields.get("reaction.count." + index)));
+        }
         message.assignSequences(Long.parseLong(fields.get("convSeq")),
                 Long.parseLong(fields.get("globalSeq")));
         message.advanceStatus(MessageStatus.DELIVERED);
