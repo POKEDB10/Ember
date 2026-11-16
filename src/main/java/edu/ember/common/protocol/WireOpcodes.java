@@ -22,6 +22,7 @@ public final class WireOpcodes {
     public static final int CMD_GROUP_CREATE = 0x20;
     public static final int CMD_GROUP_MEMBER = 0x21;
     public static final int CMD_USER_SEARCH = 0x22;
+    public static final int CMD_GROUP_INFO = 0x23;
     public static final int CMD_PROFILE_UPDATE = 0x30;
     public static final int CMD_FOLLOW_ACTION = 0x31;
     public static final int CMD_MEDIA_UPLOAD = 0x32;
@@ -55,6 +56,7 @@ public final class WireOpcodes {
     public static final int EVT_NOTIFY = 0x54;
     public static final int EVT_STORY_UPDATE = 0x55;
     public static final int EVT_ADMIN_DATA = 0x56;
+    public static final int EVT_POLL_UPDATE = 0x57;
     public static final int EVT_ERROR = 0x70;
 
     private WireOpcodes() {
