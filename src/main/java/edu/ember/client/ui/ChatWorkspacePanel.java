@@ -17,8 +17,10 @@ public final class ChatWorkspacePanel extends JPanel {
     private final ChatListPanel chatList;
     private final ConversationPanel conversation;
     private final ToastBanner toast = new ToastBanner();
-    private final JPanel rail = new JPanel(new java.awt.GridLayout(0, 1, 4, 4));
+    private final JPanel rail = new JPanel();
     private final SettingsPanel settings;
+    private final CampusPulsePanel campusPulse;
+    private final ProfilePanel profile;
 
     public ChatWorkspacePanel(ClientController controller, Runnable themeChanged,
             java.util.function.Consumer<Boolean> readReceipts, Runnable simulateNetworkDrop,
@@ -37,13 +39,31 @@ public final class ChatWorkspacePanel extends JPanel {
         content.add(split, "CHATS");
         settings = new SettingsPanel(themeChanged, readReceipts, simulateNetworkDrop);
         content.add(settings, "SETTINGS");
+        campusPulse = new CampusPulsePanel(controller);
+        content.add(campusPulse, "PULSE");
+        profile = new ProfilePanel(controller);
+        content.add(profile, "PROFILE");
         rail.setBorder(new EmptyBorder(8, 6, 8, 6));
         rail.setBackground(ThemeManager.current().surface());
+        rail.setLayout(new javax.swing.BoxLayout(rail, javax.swing.BoxLayout.Y_AXIS));
         JButton chats = new JButton("Chats");
         JButton settings = new JButton("Settings");
+        JButton pulse = new JButton("Campus Pulse");
+        JButton profile = new JButton("Profile");
         chats.addActionListener(event -> pages.show(content, "CHATS"));
         settings.addActionListener(event -> pages.show(content, "SETTINGS"));
+        pulse.addActionListener(event -> {
+            pages.show(content, "PULSE");
+            controller.requestFeed(null);
+        });
+        profile.addActionListener(event -> pages.show(content, "PROFILE"));
+        for (JButton button : java.util.List.of(chats, pulse, profile, settings)) {
+            button.setMaximumSize(new java.awt.Dimension(140, 44));
+            button.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+        }
         rail.add(chats);
+        rail.add(pulse);
+        rail.add(profile);
         rail.add(settings);
         add(rail, BorderLayout.WEST);
         add(content, BorderLayout.CENTER);
@@ -65,6 +85,8 @@ public final class ChatWorkspacePanel extends JPanel {
         chatList.applyTheme();
         conversation.applyTheme();
         settings.applyTheme();
+        campusPulse.applyTheme();
+        profile.applyTheme();
         toast.setBackground(ThemeManager.current().elevated());
         revalidate();
         repaint();
