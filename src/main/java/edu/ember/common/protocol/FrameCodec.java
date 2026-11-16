@@ -41,8 +41,11 @@ public final class FrameCodec {
         if (length < 0 || length > limit) {
             throw new ProtocolFrameException("Frame length exceeds the allowed limit");
         }
-        byte[] payload = new byte[length];
-        data.readFully(payload);
+        // readNBytes grows as bytes arrive, so a forged huge length cannot pre-allocate memory.
+        byte[] payload = data.readNBytes(length);
+        if (payload.length != length) {
+            throw new java.io.EOFException("Frame ended early");
+        }
         return new WireFrame.Builder(opcode).correlationId(correlationId).payload(payload).build();
     }
 
