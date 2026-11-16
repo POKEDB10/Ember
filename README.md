@@ -19,13 +19,33 @@ scripts/run.bat
 scripts/run-tests.bat
 scripts/run-server.bat --port 7443 --storage server_data --durability strict
 scripts/run-client.bat --host 127.0.0.1 --port 7443 --profile alice
+scripts/run-demo.bat
+scripts/package-demo.bat
+java -cp build\classes edu.ember.tools.AttackSimulator
+java -cp build\classes edu.ember.tools.ConcurrencyStressHarness
 ```
 
 On Unix-like systems, use the matching `scripts/build.sh`, `scripts/run.sh`, `scripts/run-tests.sh`, `scripts/run-server.sh`, and `scripts/run-client.sh` scripts.
 
+## Local demo
+
+Run `scripts\run-demo.bat` (Windows) or `scripts/run-demo.sh` (Linux/macOS) to build and start a server plus three clients on `localhost:7443`. If keys are missing, the script runs `gen-keys`; `--demo-seed` adds Alice, Bob, Charlie, a study group, a poll, and sample Campus Pulse content to an empty demo data directory. Seeded credentials are `alice` / `alice-demo-42`, `bob` / `bob-demo-42`, and `charlie` / `charlie-demo-42`. Alice receives the administrator role only in this demo launch, which explicitly passes `--admin-user alice`. The seed skips when Alice already exists and does not reset server data.
+
+## Proof tools and packaging
+
+`edu.ember.tools.AttackSimulator` opens real local TLS connections and demonstrates protocol rejection, five-failure account lockout, username allowlist validation, literal hostile text, connection-bound identity, duplicate-resend idempotency, object authorization, renamed-script upload rejection, and oversized-PNG header rejection. `ConcurrencyStressHarness` runs twice by default: each run starts 10 headless TLS clients and sends 500 messages, checking loss, duplicate IDs, and sequence order. Both use ephemeral ports and close their clients and server when finished.
+
+`scripts/package-demo.bat` or `scripts/package-demo.sh` creates runnable `build/jars/ember-client.jar` and `build/jars/ember-server.jar`, plus Windows/Linux client and server app-images under `build/phase8/package`. The exact Windows app-image invocation is:
+
+```text
+jpackage --type app-image --input build\jars --dest build\phase8\package --name EmberClient --main-jar ember-client.jar --main-class edu.ember.client.EmberClientApp
+```
+
+`jpackage --type app-image` bundles a Java runtime and does not need WiX on Windows. Building the app-image still requires JDK 21 and `jpackage`. If `jpackage` is unavailable, use the runnable JAR with `java -jar build/jars/ember-client.jar` or `java -jar build/jars/ember-server.jar` on a machine with a Java runtime. Runtime key material remains local under the ignored `config/` directory; do not distribute private keystores or `secrets.properties`.
+
 ## TLS development keys
 
-The transport uses a local server keystore and client truststore. Run `scripts/gen-keys.bat` (or `scripts/gen-keys.sh`) once. The script reads `EMBER_KEYSTORE_PASS` from the environment, then from the git-ignored `config/secrets.properties`; if neither is present, it creates a random password there. On Windows, `setx EMBER_KEYSTORE_PASS value` only affects new terminals, so open a new terminal before running the script. The server keystore and secrets file are local-only and git-ignored; the generated certificate and client truststore are safe to commit for the offline demo. Do not reuse the generated password elsewhere.
+The transport uses a local server keystore and client truststore. Run `scripts/gen-keys.bat` (or `scripts/gen-keys.sh`) once. The script reads `EMBER_KEYSTORE_PASS` from the environment, then from the git-ignored `config/secrets.properties`; if neither is present, it creates a random password there. On Windows, `setx EMBER_KEYSTORE_PASS value` only affects new terminals, so open a new terminal before running the script. The server keystore, client truststore, and secrets file are local-only and git-ignored; `gen-keys` creates a matching certificate/truststore pair for each local keystore. Do not reuse the generated password elsewhere.
 
 ## Security claims
 
