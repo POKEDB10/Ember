@@ -1,12 +1,12 @@
 # Security design
 
-## Phase 0 status
+## Implementation status after Phase 6
 
-Phases 1–3 implement TLS 1.3 loopback sockets, the bounded length-prefixed frame codec, PBKDF2-HMAC-SHA256 password hashing, input validation, account registration/login, WAL persistence with CRC and torn-tail recovery, username lockout, per-user message throttling, and structured authentication audit events. Tests verify TLS and a server restart. Object-level authorization for all command types, private-account filtering, and image validation remain unimplemented; do not describe them as active.
+Phases 1–6 implement TLS 1.3 loopback sockets, bounded length-prefixed frames, PBKDF2-HMAC-SHA256 password hashing, account registration/login, WAL persistence with CRC and torn-tail recovery, username lockout, per-user message throttling, structured audit events, core messaging/groups, and Campus Pulse. Social profiles and posts are public in this phase. Profile updates are self-only; follows require an existing target; post interactions require an existing post; media reads require a media record linked to a published post. Private-account filtering and block rules are not implemented yet.
 
 ## Claims and implementation status
 
-TLS 1.3 sockets, frame size checks, no Java serialization, PBKDF2-HMAC-SHA256 at 600,000 iterations, and username/message validation are implemented and covered by Phase 1/2 checks. Server-side object-level authorization for every command, durable audit logging, rate limits, and image validation are still planned and are not current product claims.
+TLS 1.3 sockets, frame size checks, no Java serialization, PBKDF2-HMAC-SHA256 at 600,000 iterations, username/message validation, server-side object checks for implemented commands, durable audit logging, rate limits, and signature/size-validated image re-encoding are implemented and tested. Phase 6 feeds and profiles are public; private accounts and blocking remain future work.
 
 - Traffic between client and server is encrypted with TLS 1.3. Clients trust only Ember's generated truststore and verify the server name.
 - Passwords are stored with salted PBKDF2-HMAC-SHA256 at 600,000 iterations, the OWASP work factor for that algorithm. OWASP's first choice is Argon2id, which the JDK does not include.
@@ -27,7 +27,14 @@ TLS 1.3 sockets, frame size checks, no Java serialization, PBKDF2-HMAC-SHA256 at
 | `CMD_POLL_VOTE` | Group member, once per poll | 403 or 409 |
 | `CMD_GROUP_MEMBER` | Group moderator | 403 |
 | `CMD_SYNC_PULL`, `CMD_HISTORY_PULL` | Conversation member | 403 |
-| `CMD_MEDIA_GET`, `CMD_POST_INTERACT`, `CMD_STORY_VIEW`, `CMD_PROFILE_GET`, `CMD_FEED_PULL` | Owner, or permitted followers, and not blocked | 404 |
+| `CMD_PROFILE_UPDATE` | The authenticated user's own profile | 403 and audit |
+| `CMD_FOLLOW_ACTION` | Authenticated user; target profile must exist; self-follow is invalid | 400/404 |
+| `CMD_MEDIA_UPLOAD` | Authenticated owner; size/signature/dimensions/extension must pass validation | 400 and `upload_rejected` audit |
+| `CMD_POST_CREATE` | Authenticated owner of the referenced media | 403; missing media returns 404 |
+| `CMD_MEDIA_GET` | Authenticated user, only for media linked to a published public post | 404 |
+| `CMD_POST_INTERACT` | Authenticated user, only for an existing public post | 404 |
+| `CMD_PROFILE_GET`, `CMD_FEED_PULL` | Authenticated user; target profile must exist when specified | 404 |
+| `CMD_STORY_VIEW` | Owner, or permitted followers when private, and not blocked | 404 (Phase 7 scope) |
 | `CMD_ADMIN_ACTION` | Admin | 403 and audit |
 | `CMD_MOD_REPORT` | Authenticated user, rate limited | 429 |
 

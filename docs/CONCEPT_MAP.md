@@ -34,5 +34,12 @@ This map will be updated as concepts appear in implemented classes. Phase 0 demo
 | Reusable custom-painted components | `RoundedPanel`, `AvatarComponent`, `ChatBubblePanel`, `BadgeLabel` |
 | Swing panels, focus, key and document listeners | `AuthPanel`, `ChatListPanel`, `ConversationPanel`, `SettingsPanel` |
 | Timed notification and system tray fallback | `ToastBanner`, `NotificationService` |
+| Header-first image validation, image readers, and RGB conversion | `ImageValidator`, `SocialFeedService` |
+| UUID paths, file APIs, and media metadata | `SocialFeedService`, `MediaAsset`, `WalStorageEngine` |
+| Feed/profile/post model and authorization | `SocialFeedService`, `UserProfile`, `SocialPost`, `PostComment` |
+| Like sets and follow relationships | `InMemoryStorageEngine`, `WalStorageEngine` |
+| Background image selection/upload and Swing rendering | `CampusPulsePanel`, `PostCardPanel`, `ClientController` |
+| Comment observer view and plain text | `PostDetailDialog`, `ClientStateModel` |
+| Opcode-specific large frames | `FrameCodec`, `InboundReceiverThread`, `EmberServer.ConnectionHandler` |
 
 Later concept mappings are added with the phase that implements the corresponding code.

@@ -95,3 +95,19 @@ The scaffold establishes the package root, shared product identity, plain `javac
 1. **Why use a `JTextArea` for each message bubble instead of an HTML label?** `JTextArea` wraps plain text and avoids the HTML-label emoji wrapping issue on scaled displays. It keeps hostile text literal rather than interpreting markup.
 2. **How does theme switching update the interface?** `ThemeManager` changes shared palette tokens, then each workspace panel applies those tokens to its controls and repaints dynamic components. Keeping colors centralized makes dark/light behavior consistent.
 3. **How are notifications shown when the window is not focused?** `NotificationService` uses the desktop tray when supported. If the platform has no tray or refuses the tray icon, `ToastBanner` presents the same message inside the app.
+
+## Phase 6: Campus Pulse core
+
+`SocialFeedService` applies text validation, media ownership checks, and object lookup rules over the `StorageEngine`. `ImageValidator` checks the extension and signature, asks an `ImageReader` for dimensions before decoding, rejects oversized images, then re-encodes a fresh RGB JPEG and thumbnail. The client has feed, profile, post-card, and comment-detail views; file reading and Base64 preparation happen in workers away from the EDT.
+
+**Key classes:** `UserProfile`, `MediaAsset`, `SocialPost`, `PostComment`, `ImageValidator`, `SocialFeedService`, `InMemoryStorageEngine`, `WalStorageEngine`, `CampusPulsePanel`, `ProfilePanel`, `PostCardPanel`, `PostDetailDialog`.
+
+**Trace:** an authenticated user selects a photo → a worker reads it → `CMD_MEDIA_UPLOAD` sends it → the server checks its signature and header dimensions, re-encodes it, and stores UUID-named files → the owner creates a post → another signed-in user pulls the public feed, fetches media linked to that post, and adds a comment → the WAL restores the profile, follow, media metadata, post, like, and comment after restart.
+
+**Concepts:** `ImageReader` and `ImageInputStream`, image header validation, UUID file paths, Base64 protocol fields, WAL record variants, `SwingWorker`, observer notifications, object-level authorization.
+
+### Likely questions
+
+1. **Why check image dimensions before decoding?** Image dimensions come from the encoded file header and are available through `ImageReader` without allocating the full pixel array. Ember rejects either side above 4096 or more than 16 million pixels before calling `read(0)`, which limits image-bomb memory use.
+2. **Why does the server rename uploaded files?** User-provided names are used only for extension validation and are never resolved as paths. The server uses generated UUID names in its media directory, preventing traversal through a crafted upload name.
+3. **How does the server stop a user from changing another profile or fetching arbitrary media?** Profile update requires the submitted profile ID to match the identity bound to the connection. Media lookup requires a real media record linked to a published post; missing or unlinked media and posts return 404, and the TLS integration tests check these cases.
