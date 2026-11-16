@@ -8,6 +8,8 @@ Phase 2 adds an in-memory storage implementation, account registration and login
 
 Phase 3 adds `WalStorageEngine` with CRC32 verification and torn-tail truncation, `AutoSaveThread`, `SecurityAuditLogger`, username lockout, per-user message token buckets, loopback-aware IP throttling, and a semaphore limiting concurrent password hash work to four operations.
 
+Phase 4 extends messaging with client-generated idempotency keys, server-assigned conversation/global sequences, a framed local outbox, token-based resume and sync, authorized history pulls, heartbeat, presence snapshots and updates, rate-limited typing events, group roles/fan-out, and aggregated delivered/read receipts. The client retries connections with bounded exponential backoff and jitter. The test suite exercises offline delivery after session resume, one-copy duplicate resends, WAL recovery of an undelivered message, four-member group receipts, and negative authorization cases for messages, receipts, history, typing, and group membership changes.
+
 | Concept | Class | File |
 |---|---|---|
 | Builder and immutable frame | `WireFrame.Builder`, `WireFrame` | `common/protocol/WireFrame.java` |
