@@ -4,6 +4,10 @@ import edu.ember.common.model.Message;
 import edu.ember.common.model.MessageStatus;
 import edu.ember.common.model.GroupChat;
 import edu.ember.common.model.UserRecord;
+import edu.ember.common.model.UserProfile;
+import edu.ember.common.model.MediaAsset;
+import edu.ember.common.model.SocialPost;
+import edu.ember.common.model.PostComment;
 import edu.ember.common.protocol.FrameFactory;
 import edu.ember.common.protocol.WireOpcodes;
 import edu.ember.common.protocol.WireFrame;
@@ -18,6 +22,12 @@ import java.util.Optional;
 public final class InMemoryStorageEngine implements StorageEngine {
     private final Map<String, UserRecord> users = new HashMap<>();
     private final Map<String, GroupChat> groups = new HashMap<>();
+    private final Map<String, UserProfile> profiles = new HashMap<>();
+    private final Map<String, MediaAsset> media = new HashMap<>();
+    private final Map<String, SocialPost> posts = new HashMap<>();
+    private final Map<String, java.util.Set<String>> postLikes = new HashMap<>();
+    private final Map<String, List<PostComment>> comments = new HashMap<>();
+    private final Map<String, java.util.Set<String>> follows = new HashMap<>();
     private final Map<String, Message> messagesById = new HashMap<>();
     private final Map<String, Long> conversationSequences = new HashMap<>();
     private final List<Message> messages = new ArrayList<>();
@@ -32,6 +42,7 @@ public final class InMemoryStorageEngine implements StorageEngine {
             throw new IOException("Username already exists");
         }
         users.put(key, user);
+        profiles.putIfAbsent(user.userId(), new UserProfile(user.userId(), user.displayName(), "", ""));
     }
 
     @Override
@@ -88,6 +99,83 @@ public final class InMemoryStorageEngine implements StorageEngine {
         GroupChat group = groups.get(groupId);
         return group == null ? Optional.empty() : Optional.of(new GroupChat(group.groupId(),
                 group.name(), group.description(), group.members()));
+    }
+
+    @Override public synchronized void saveProfile(UserProfile profile) {
+        profiles.put(profile.userId(), profile);
+    }
+
+    @Override public synchronized Optional<UserProfile> findProfile(String userId) {
+        return Optional.ofNullable(profiles.get(userId));
+    }
+
+    @Override public synchronized void setFollow(String followerId, String followedId,
+            boolean following) {
+        java.util.Set<String> targets = follows.computeIfAbsent(followerId,
+                ignored -> new java.util.HashSet<>());
+        if (following) { targets.add(followedId); } else { targets.remove(followedId); }
+    }
+
+    @Override public synchronized List<String> followersOf(String userId) {
+        return follows.entrySet().stream().filter(entry -> entry.getValue().contains(userId))
+                .map(Map.Entry::getKey).sorted().toList();
+    }
+
+    @Override public synchronized List<String> followingOf(String userId) {
+        return follows.getOrDefault(userId, java.util.Set.of()).stream().sorted().toList();
+    }
+
+    @Override public synchronized void saveMedia(MediaAsset asset) { media.put(asset.mediaId(), asset); }
+
+    @Override public synchronized Optional<MediaAsset> findMedia(String mediaId) {
+        return Optional.ofNullable(media.get(mediaId));
+    }
+
+    @Override public synchronized void savePost(SocialPost post) {
+        posts.put(post.postId(), new SocialPost(post.postId(), post.ownerUserId(), post.mediaId(),
+                post.caption(), post.createdAtMs(), 0, 0, false));
+        postLikes.put(post.postId(), new java.util.HashSet<>());
+        comments.put(post.postId(), new ArrayList<>());
+    }
+
+    @Override public synchronized Optional<SocialPost> findPost(String postId, String viewerId) {
+        SocialPost post = posts.get(postId);
+        return post == null ? Optional.empty() : Optional.of(viewPost(post, viewerId));
+    }
+
+    @Override public synchronized List<SocialPost> listPosts(String ownerUserId, String viewerId,
+            int limit) {
+        return posts.values().stream().filter(post -> ownerUserId == null
+                || ownerUserId.isBlank() || post.ownerUserId().equals(ownerUserId))
+                .sorted(java.util.Comparator.comparingLong(SocialPost::createdAtMs).reversed())
+                .limit(Math.max(0, limit)).map(post -> viewPost(post, viewerId)).toList();
+    }
+
+    @Override public synchronized void setPostLike(String postId, String userId, boolean liked)
+            throws IOException {
+        if (!posts.containsKey(postId)) { throw new IOException("Post not found"); }
+        java.util.Set<String> users = postLikes.get(postId);
+        if (liked) { users.add(userId); } else { users.remove(userId); }
+    }
+
+    @Override public synchronized List<PostComment> addComment(PostComment comment)
+            throws IOException {
+        List<PostComment> list = comments.get(comment.postId());
+        if (list == null) { throw new IOException("Post not found"); }
+        list.add(comment);
+        return List.copyOf(list);
+    }
+
+    @Override public synchronized List<PostComment> commentsForPost(String postId, int limit) {
+        List<PostComment> list = comments.getOrDefault(postId, List.of());
+        return List.copyOf(list.subList(0, Math.min(Math.max(0, limit), list.size())));
+    }
+
+    private SocialPost viewPost(SocialPost post, String viewerId) {
+        java.util.Set<String> likes = postLikes.getOrDefault(post.postId(), java.util.Set.of());
+        return new SocialPost(post.postId(), post.ownerUserId(), post.mediaId(), post.caption(),
+                post.createdAtMs(), likes.size(), comments.getOrDefault(post.postId(), List.of()).size(),
+                likes.contains(viewerId));
     }
 
     @Override

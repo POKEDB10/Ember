@@ -4,6 +4,10 @@ import edu.ember.common.model.Message;
 import edu.ember.common.model.MessageStatus;
 import edu.ember.common.model.GroupChat;
 import edu.ember.common.model.UserRecord;
+import edu.ember.common.model.UserProfile;
+import edu.ember.common.model.MediaAsset;
+import edu.ember.common.model.SocialPost;
+import edu.ember.common.model.PostComment;
 import edu.ember.common.protocol.KvPayloadCodec;
 import edu.ember.common.protocol.WireFrame;
 import java.io.IOException;
@@ -27,6 +31,12 @@ public final class WalStorageEngine implements StorageEngine {
     private static final byte MESSAGE_APPEND = 2;
     private static final byte MESSAGE_STATUS = 3;
     private static final byte GROUP_SAVE = 4;
+    private static final byte PROFILE_SAVE = 5;
+    private static final byte FOLLOW_SET = 6;
+    private static final byte MEDIA_SAVE = 7;
+    private static final byte POST_SAVE = 8;
+    private static final byte POST_LIKE = 9;
+    private static final byte POST_COMMENT = 10;
     private final Path walPath;
     private final boolean strictDurability;
     private final InMemoryStorageEngine state = new InMemoryStorageEngine();
@@ -117,6 +127,77 @@ public final class WalStorageEngine implements StorageEngine {
     public synchronized Optional<GroupChat> findGroup(String groupId) throws IOException {
         return state.findGroup(groupId);
     }
+
+    @Override public synchronized void saveProfile(UserProfile profile) throws IOException {
+        Map<String, String> fields = new HashMap<>();
+        fields.put("userId", profile.userId()); fields.put("displayName", profile.displayName());
+        fields.put("bio", profile.bio()); fields.put("avatarMediaId", profile.avatarMediaId());
+        appendRecord(PROFILE_SAVE, fields); state.saveProfile(profile);
+    }
+
+    @Override public synchronized Optional<UserProfile> findProfile(String userId) throws IOException {
+        return state.findProfile(userId);
+    }
+
+    @Override public synchronized void setFollow(String followerId, String followedId,
+            boolean following) throws IOException {
+        Map<String, String> fields = new HashMap<>();
+        fields.put("follower", followerId); fields.put("followed", followedId);
+        fields.put("following", Boolean.toString(following));
+        appendRecord(FOLLOW_SET, fields); state.setFollow(followerId, followedId, following);
+    }
+
+    @Override public synchronized List<String> followersOf(String userId) throws IOException {
+        return state.followersOf(userId);
+    }
+
+    @Override public synchronized List<String> followingOf(String userId) throws IOException {
+        return state.followingOf(userId);
+    }
+
+    @Override public synchronized void saveMedia(MediaAsset asset) throws IOException {
+        Map<String, String> fields = new HashMap<>();
+        fields.put("mediaId", asset.mediaId()); fields.put("owner", asset.ownerUserId());
+        fields.put("fileName", asset.fileName()); fields.put("thumbnail", asset.thumbnailFileName());
+        fields.put("width", Integer.toString(asset.width())); fields.put("height", Integer.toString(asset.height()));
+        fields.put("created", Long.toString(asset.createdAtMs()));
+        appendRecord(MEDIA_SAVE, fields); state.saveMedia(asset);
+    }
+
+    @Override public synchronized Optional<MediaAsset> findMedia(String mediaId) throws IOException {
+        return state.findMedia(mediaId);
+    }
+
+    @Override public synchronized void savePost(SocialPost post) throws IOException {
+        Map<String, String> fields = new HashMap<>();
+        fields.put("postId", post.postId()); fields.put("owner", post.ownerUserId());
+        fields.put("mediaId", post.mediaId()); fields.put("caption", post.caption());
+        fields.put("created", Long.toString(post.createdAtMs()));
+        appendRecord(POST_SAVE, fields); state.savePost(post);
+    }
+
+    @Override public synchronized Optional<SocialPost> findPost(String postId, String viewerId)
+            throws IOException { return state.findPost(postId, viewerId); }
+
+    @Override public synchronized List<SocialPost> listPosts(String ownerUserId, String viewerId,
+            int limit) throws IOException { return state.listPosts(ownerUserId, viewerId, limit); }
+
+    @Override public synchronized void setPostLike(String postId, String userId, boolean liked)
+            throws IOException {
+        Map<String, String> fields = new HashMap<>(); fields.put("postId", postId);
+        fields.put("userId", userId); fields.put("liked", Boolean.toString(liked));
+        appendRecord(POST_LIKE, fields); state.setPostLike(postId, userId, liked);
+    }
+
+    @Override public synchronized List<PostComment> addComment(PostComment comment) throws IOException {
+        Map<String, String> fields = new HashMap<>(); fields.put("commentId", comment.commentId());
+        fields.put("postId", comment.postId()); fields.put("author", comment.authorUserId());
+        fields.put("text", comment.text()); fields.put("created", Long.toString(comment.createdAtMs()));
+        appendRecord(POST_COMMENT, fields); return state.addComment(comment);
+    }
+
+    @Override public synchronized List<PostComment> commentsForPost(String postId, int limit)
+            throws IOException { return state.commentsForPost(postId, limit); }
 
     @Override
     public synchronized List<WireFrame> getDeltaFramesSince(String userId, long sinceGlobalSeq)
@@ -212,6 +293,27 @@ public final class WalStorageEngine implements StorageEngine {
                     MessageStatus.valueOf(fields.get("status")));
         } else if (record.type() == GROUP_SAVE) {
             state.saveGroup(groupFrom(fields));
+        } else if (record.type() == PROFILE_SAVE) {
+            state.saveProfile(new UserProfile(fields.get("userId"), fields.get("displayName"),
+                    fields.get("bio"), fields.get("avatarMediaId")));
+        } else if (record.type() == FOLLOW_SET) {
+            state.setFollow(fields.get("follower"), fields.get("followed"),
+                    Boolean.parseBoolean(fields.get("following")));
+        } else if (record.type() == MEDIA_SAVE) {
+            state.saveMedia(new MediaAsset(fields.get("mediaId"), fields.get("owner"),
+                    fields.get("fileName"), fields.get("thumbnail"),
+                    Integer.parseInt(fields.get("width")), Integer.parseInt(fields.get("height")),
+                    Long.parseLong(fields.get("created"))));
+        } else if (record.type() == POST_SAVE) {
+            state.savePost(new SocialPost(fields.get("postId"), fields.get("owner"),
+                    fields.get("mediaId"), fields.get("caption"),
+                    Long.parseLong(fields.get("created")), 0, 0, false));
+        } else if (record.type() == POST_LIKE) {
+            state.setPostLike(fields.get("postId"), fields.get("userId"),
+                    Boolean.parseBoolean(fields.get("liked")));
+        } else if (record.type() == POST_COMMENT) {
+            state.addComment(new PostComment(fields.get("commentId"), fields.get("postId"),
+                    fields.get("author"), fields.get("text"), Long.parseLong(fields.get("created"))));
         } else {
             throw new IOException("Unknown WAL record type");
         }
