@@ -66,8 +66,8 @@ public final class ClientController implements AutoCloseable {
         socket = TlsSocketFactory.createClientSocket(trustStore, password, host, port);
         socket.setSoTimeout(45_000);
         socket.startHandshake();
-        outbound = new OutboundSenderThread(socket.getOutputStream());
-        inbound = new InboundReceiverThread(socket.getInputStream(), this);
+        outbound = new OutboundSenderThread(new java.io.BufferedOutputStream(socket.getOutputStream()));
+        inbound = new InboundReceiverThread(new java.io.BufferedInputStream(socket.getInputStream()), this);
         outbound.start();
         inbound.start();
         heartbeat.scheduleAtFixedRate(() -> {
