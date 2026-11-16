@@ -1,5 +1,6 @@
 /build/
 /config/ember-server.p12
+/config/ember-client-trust.p12
 /config/secrets.properties
 /server_data/
 /client_data/
