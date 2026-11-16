@@ -127,3 +127,19 @@ Phase 7 extends chat and Campus Pulse with TTL expiry, replies/reactions, edit/d
 1. **Why does a private follow use PENDING instead of immediately adding the follower?** The server stores a request state separately from ACCEPTED so feed, profile, and story authorization can consistently require owner approval. Blocking removes both directions of the follow relationship.
 2. **How does snapshot compaction avoid losing records if the process stops at the wrong time?** The compressed snapshot is fully written and atomically moved into place before WAL rotation. It records the covered WAL length and checksum, allowing restart to skip a still-present prefix if the process stopped between snapshot replacement and truncation.
 3. **Why does forwarding construct a new `Message`?** A forwarded message has a new ID, sender, destination, and timestamp, and does not inherit mutable reactions, reply state, expiry, or sequence values. Editing the copy therefore cannot change the source message.
+
+## Phase 8: proof, demo, and packaging
+
+`AttackSimulator` demonstrates protocol and authorization behavior over real TLS connections; `ConcurrencyStressHarness` drives the client/server path with concurrent headless clients and checks server history. `DemoSeeder` provides an idempotent local fixture, and the scripts build runnable JARs and `jpackage` app-images.
+
+**Key classes:** `AttackSimulator`, `ConcurrencyStressHarness`, `DemoSeeder`, `EmberServer.main`, `ClientController`, `StorageEngine`, `WalStorageEngine`.
+
+**Trace:** the stress harness authenticates ten `ClientController` instances, creates a group and adds members, starts ten sender threads, reads the persisted conversation history, and asserts 500 distinct IDs, increasing conversation sequence numbers, and increasing per-sender indices. Cleanup closes every client and the ephemeral-port server in `finally`.
+
+**Concepts:** TLS integration tests, threads and shared ordering, fixture idempotency, JAR manifests, bundled runtimes, shell/batch automation, and UML.
+
+### Likely questions
+
+1. **How does the stress harness distinguish message loss from duplicate delivery?** It waits for 500 persisted history entries, then checks all 500 client message IDs are unique and that each sender's numbered messages remain ordered. It also checks every conversation sequence is strictly increasing.
+2. **Why does the attack tool use raw frames as well as the normal client controller?** Raw frames can deliberately include malformed headers or forged fields a conforming client would not send. Both paths still communicate with the real local TLS server.
+3. **What does `jpackage --type app-image` provide, and what does it not provide?** It creates a runnable application folder with a bundled Java runtime, so launching the packaged client does not need a JDK on `PATH`. It does not eliminate the JDK 21 build requirement or supply Ember's local truststore and server key configuration.

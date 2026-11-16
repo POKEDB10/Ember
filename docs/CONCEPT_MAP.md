@@ -55,3 +55,8 @@ Later concept mappings are added with the phase that implements the correspondin
 | 2D vote matrix and per-member poll updates | `PollData`, `CMD_POLL_CREATE`, `CMD_POLL_VOTE` |
 | Deep-copy message forwarding | `Message(Message source, ...)`, `ClientController.forwardMessage` |
 | GZIP snapshot rotation and recovery | `WalStorageEngine.compact`, CRC-protected snapshot and covered-prefix check |
+| Integration attack simulation over TLS | `edu.ember.tools.AttackSimulator`, `TlsSocketFactory`, `FrameCodec` |
+| Concurrent clients, exactly-once IDs, server sequence order | `edu.ember.tools.ConcurrencyStressHarness`, `ClientController`, `StorageEngine.getHistory` |
+| Idempotent demo fixtures and generated media | `edu.ember.tools.DemoSeeder`, `WalStorageEngine`, `MediaAsset` |
+| Command-line demo mode and runtime packaging | `EmberServer --demo-seed`, `scripts/package-demo`, `jpackage` |
+| UML use case, class, sequence, state, and activity diagrams | `docs/uml/*.puml` based on implemented source packages |
