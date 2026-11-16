@@ -19,6 +19,11 @@ public final class FrameCodec {
 
     public static WireFrame readFrame(InputStream input, int maxPayloadBytes)
             throws IOException, EmberException {
+        return readFrame(input, maxPayloadBytes, -1, maxPayloadBytes);
+    }
+
+    public static WireFrame readFrame(InputStream input, int maxPayloadBytes,
+            int largeOpcode, int largePayloadBytes) throws IOException, EmberException {
         DataInputStream data = input instanceof DataInputStream stream
                 ? stream : new DataInputStream(input);
         int magic = data.readInt();
@@ -32,7 +37,8 @@ public final class FrameCodec {
         int opcode = data.readUnsignedByte();
         long correlationId = data.readLong();
         int length = data.readInt();
-        if (length < 0 || length > maxPayloadBytes) {
+        int limit = opcode == largeOpcode ? largePayloadBytes : maxPayloadBytes;
+        if (length < 0 || length > limit) {
             throw new ProtocolFrameException("Frame length exceeds the allowed limit");
         }
         byte[] payload = new byte[length];
