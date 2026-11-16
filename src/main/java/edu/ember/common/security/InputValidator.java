@@ -32,12 +32,13 @@ public final class InputValidator {
         StringBuilder clean = new StringBuilder(body.length());
         for (int index = 0; index < body.length(); index++) {
             char character = body.charAt(index);
-            if (!Character.isISOControl(character)) {
+            // Newlines and tabs are kept so multi-line messages survive; other controls are dropped.
+            if (!Character.isISOControl(character) || character == '\n' || character == '\t') {
                 clean.append(character);
             }
         }
-        if (clean.length() < 1 || clean.length() > 2000) {
-            throw new ValidationException("Message body must be 1–2000 characters");
+        if (clean.length() < 1) {
+            throw new ValidationException("Message body is required");
         }
         return clean.toString();
     }

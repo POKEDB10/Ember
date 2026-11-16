@@ -21,6 +21,12 @@ public final class TlsSocketFactory {
 
     public static SSLServerSocket createServerSocket(Path keyStorePath, char[] password, int port)
             throws IOException, GeneralSecurityException {
+        return createServerSocket(keyStorePath, password, port, "127.0.0.1");
+    }
+
+    /** bindAddress "0.0.0.0" accepts other machines; "127.0.0.1" keeps it local-only. */
+    public static SSLServerSocket createServerSocket(Path keyStorePath, char[] password, int port,
+            String bindAddress) throws IOException, GeneralSecurityException {
         KeyStore keyStore = loadKeyStore(keyStorePath, password);
         KeyManagerFactory keyManagers = KeyManagerFactory.getInstance(
                 KeyManagerFactory.getDefaultAlgorithm());
@@ -28,7 +34,7 @@ public final class TlsSocketFactory {
         SSLContext context = SSLContext.getInstance(TLS_PROTOCOL);
         context.init(keyManagers.getKeyManagers(), null, null);
         SSLServerSocket socket = (SSLServerSocket) context.getServerSocketFactory()
-                .createServerSocket(port, 50, java.net.InetAddress.getByName("127.0.0.1"));
+                .createServerSocket(port, 50, java.net.InetAddress.getByName(bindAddress));
         socket.setEnabledProtocols(new String[] {TLS_PROTOCOL});
         return socket;
     }

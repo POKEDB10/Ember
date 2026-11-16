@@ -14,7 +14,6 @@ import javax.imageio.stream.ImageInputStream;
 
 /** Checks image signatures and dimensions before decode, then writes fresh RGB JPEG data. @concept ImageIO, validation */
 public final class ImageValidator {
-    public static final int MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
     public static final int MAX_SIDE = 4096;
     public static final long MAX_PIXELS = 16_000_000L;
     public static final int THUMBNAIL_SIDE = 300;
@@ -31,8 +30,8 @@ public final class ImageValidator {
     }
 
     private void checkInput(byte[] bytes, String suppliedName) throws MediaValidationException {
-        if (bytes == null || bytes.length == 0 || bytes.length > MAX_UPLOAD_BYTES) {
-            throw new MediaValidationException("Image upload exceeds the 5 MB limit");
+        if (bytes == null || bytes.length == 0) {
+            throw new MediaValidationException("Image upload is empty");
         }
         String name = suppliedName == null ? "" : suppliedName.toLowerCase(java.util.Locale.ROOT);
         if (!(name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg"))) {
