@@ -8,6 +8,10 @@ import edu.ember.common.model.UserProfile;
 import edu.ember.common.model.MediaAsset;
 import edu.ember.common.model.SocialPost;
 import edu.ember.common.model.PostComment;
+import edu.ember.common.model.FollowStatus;
+import edu.ember.common.model.ModerationReport;
+import edu.ember.common.model.StoryItem;
+import edu.ember.common.model.PollData;
 import edu.ember.common.protocol.FrameFactory;
 import edu.ember.common.protocol.WireOpcodes;
 import edu.ember.common.protocol.WireFrame;
@@ -27,7 +31,11 @@ public final class InMemoryStorageEngine implements StorageEngine {
     private final Map<String, SocialPost> posts = new HashMap<>();
     private final Map<String, java.util.Set<String>> postLikes = new HashMap<>();
     private final Map<String, List<PostComment>> comments = new HashMap<>();
-    private final Map<String, java.util.Set<String>> follows = new HashMap<>();
+    private final Map<String, Map<String, FollowStatus>> follows = new HashMap<>();
+    private final Map<String, java.util.Set<String>> blocks = new HashMap<>();
+    private final List<ModerationReport> reports = new ArrayList<>();
+    private final Map<String, StoryItem> stories = new HashMap<>();
+    private final Map<String, PollData> polls = new HashMap<>();
     private final Map<String, Message> messagesById = new HashMap<>();
     private final Map<String, Long> conversationSequences = new HashMap<>();
     private final List<Message> messages = new ArrayList<>();
@@ -76,6 +84,38 @@ public final class InMemoryStorageEngine implements StorageEngine {
         }
     }
 
+    @Override public synchronized void setMessageReaction(String clientMsgId, String userId,
+            String emoji, boolean selected) throws IOException {
+        Message message = findByClientMsgId(clientMsgId).orElseThrow(
+                () -> new IOException("Message not found"));
+        message.setReaction(userId, emoji, selected);
+    }
+
+    @Override public synchronized void editMessage(String clientMsgId, String newBody)
+            throws IOException {
+        Message message = findByClientMsgId(clientMsgId).orElseThrow(
+                () -> new IOException("Message not found"));
+        message.editBody(newBody);
+    }
+
+    @Override public synchronized void deleteMessage(String clientMsgId) throws IOException {
+        Message message = findByClientMsgId(clientMsgId).orElseThrow(
+                () -> new IOException("Message not found"));
+        messages.remove(message);
+    }
+
+    @Override public synchronized void setMessagePinned(String clientMsgId, boolean pinned)
+            throws IOException {
+        findByClientMsgId(clientMsgId).orElseThrow(() -> new IOException("Message not found"))
+                .setPinned(pinned);
+    }
+
+    @Override public synchronized void setMessageStarred(String clientMsgId, String userId,
+            boolean starred) throws IOException {
+        findByClientMsgId(clientMsgId).orElseThrow(() -> new IOException("Message not found"))
+                .setStarred(userId, starred);
+    }
+
     @Override
     public synchronized Optional<Message> findBySenderAndClientMsgId(String senderUserId,
             String clientMsgId) {
@@ -111,18 +151,97 @@ public final class InMemoryStorageEngine implements StorageEngine {
 
     @Override public synchronized void setFollow(String followerId, String followedId,
             boolean following) {
-        java.util.Set<String> targets = follows.computeIfAbsent(followerId,
-                ignored -> new java.util.HashSet<>());
-        if (following) { targets.add(followedId); } else { targets.remove(followedId); }
+        setFollowStatus(followerId, followedId, following ? FollowStatus.ACCEPTED : null);
+    }
+
+    @Override public synchronized void setFollowStatus(String followerId, String followedId,
+            FollowStatus status) {
+        Map<String, FollowStatus> targets = follows.computeIfAbsent(followerId,
+                ignored -> new HashMap<>());
+        if (status == null) { targets.remove(followedId); }
+        else { targets.put(followedId, status); }
+        if (targets.isEmpty()) { follows.remove(followerId); }
+    }
+
+    @Override public synchronized Optional<FollowStatus> followStatus(String followerId,
+            String followedId) {
+        return Optional.ofNullable(follows.getOrDefault(followerId, Map.of()).get(followedId));
+    }
+
+    @Override public synchronized List<String> pendingFollowersOf(String userId) {
+        return follows.entrySet().stream().filter(entry ->
+                entry.getValue().get(userId) == FollowStatus.PENDING)
+                .map(Map.Entry::getKey).sorted().toList();
     }
 
     @Override public synchronized List<String> followersOf(String userId) {
-        return follows.entrySet().stream().filter(entry -> entry.getValue().contains(userId))
+        return follows.entrySet().stream().filter(entry ->
+                entry.getValue().get(userId) == FollowStatus.ACCEPTED)
                 .map(Map.Entry::getKey).sorted().toList();
     }
 
     @Override public synchronized List<String> followingOf(String userId) {
-        return follows.getOrDefault(userId, java.util.Set.of()).stream().sorted().toList();
+        return follows.getOrDefault(userId, Map.of()).entrySet().stream()
+                .filter(entry -> entry.getValue() == FollowStatus.ACCEPTED)
+                .map(Map.Entry::getKey).sorted().toList();
+    }
+
+    @Override public synchronized void setBlocked(String blockerId, String blockedId, boolean blocked) {
+        java.util.Set<String> targets = blocks.computeIfAbsent(blockerId,
+                ignored -> new java.util.HashSet<>());
+        if (blocked) { targets.add(blockedId); } else { targets.remove(blockedId); }
+        if (targets.isEmpty()) { blocks.remove(blockerId); }
+        if (blocked) {
+            setFollow(blockerId, blockedId, false);
+            setFollow(blockedId, blockerId, false);
+        }
+    }
+
+    @Override public synchronized boolean isBlockedEitherDirection(String firstUserId, String secondUserId) {
+        return blocks.getOrDefault(firstUserId, java.util.Set.of()).contains(secondUserId)
+                || blocks.getOrDefault(secondUserId, java.util.Set.of()).contains(firstUserId);
+    }
+
+    @Override public synchronized void saveReport(ModerationReport report) {
+        reports.add(report);
+    }
+
+    @Override public synchronized List<ModerationReport> listReports() {
+        return List.copyOf(reports);
+    }
+
+    @Override public synchronized void saveStory(StoryItem story) {
+        stories.put(story.storyId(), story);
+    }
+
+    @Override public synchronized Optional<StoryItem> findStory(String storyId) {
+        return Optional.ofNullable(stories.get(storyId));
+    }
+
+    @Override public synchronized List<StoryItem> listStories() {
+        return stories.values().stream().sorted(java.util.Comparator
+                .comparingLong(StoryItem::createdAtMs).reversed()).toList();
+    }
+
+    @Override public synchronized void savePoll(PollData poll) { polls.put(poll.pollId(), poll); }
+
+    @Override public synchronized Optional<PollData> findPoll(String pollId) {
+        return Optional.ofNullable(polls.get(pollId));
+    }
+
+    @Override public synchronized List<PollData> pollsForGroup(String groupId) {
+        return polls.values().stream().filter(poll -> poll.groupId().equals(groupId)).toList();
+    }
+
+    @Override public synchronized void votePoll(String pollId, String userId, int optionIndex)
+            throws IOException {
+        PollData poll = polls.get(pollId);
+        if (poll == null) { throw new IOException("Poll not found"); }
+        try {
+            poll.vote(userId, optionIndex);
+        } catch (IllegalArgumentException exception) {
+            throw new IOException("Poll vote is invalid", exception);
+        }
     }
 
     @Override public synchronized void saveMedia(MediaAsset asset) { media.put(asset.mediaId(), asset); }
@@ -205,7 +324,26 @@ public final class InMemoryStorageEngine implements StorageEngine {
         return List.copyOf(result.subList(start, result.size()));
     }
 
-    @Override public int purgeExpiredRecords(long nowMs) { return 0; }
+    @Override public synchronized List<Message> expiredMessages(long nowMs) {
+        return messages.stream().filter(message -> message.expiresAtMs() > 0
+                && message.expiresAtMs() <= nowMs).toList();
+    }
+
+    @Override public synchronized int purgeExpiredRecords(long nowMs) {
+        int removed = 0;
+        java.util.Iterator<Message> iterator = messages.iterator();
+        while (iterator.hasNext()) {
+            Message message = iterator.next();
+            if (message.expiresAtMs() > 0 && message.expiresAtMs() <= nowMs) {
+                iterator.remove();
+                removed++;
+            }
+        }
+        int beforeStories = stories.size();
+        stories.values().removeIf(story -> story.expiresAtMs() <= nowMs);
+        removed += beforeStories - stories.size();
+        return removed;
+    }
     @Override public void flush() { }
     @Override public void close() { }
 
@@ -218,6 +356,18 @@ public final class InMemoryStorageEngine implements StorageEngine {
         fields.put("convSeq", Long.toString(message.conversationSequence()));
         fields.put("globalSeq", Long.toString(message.globalSequence()));
         fields.put("serverTs", Long.toString(message.createdAtMs()));
+        fields.put("ttlSec", Integer.toString(message.ttlSec()));
+        fields.put("expiresAtMs", Long.toString(message.expiresAtMs()));
+        fields.put("replyToId", message.replyToId());
+        fields.put("replyPreview", message.replyPreview());
+        Map<String, Integer> reactions = message.reactionCounts();
+        fields.put("reaction.n", Integer.toString(reactions.size()));
+        int index = 0;
+        for (Map.Entry<String, Integer> reaction : reactions.entrySet()) {
+            fields.put("reaction.emoji." + index, reaction.getKey());
+            fields.put("reaction.count." + index, Integer.toString(reaction.getValue()));
+            index++;
+        }
         return fields;
     }
 
