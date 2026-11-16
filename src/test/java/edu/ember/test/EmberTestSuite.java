@@ -2,17 +2,23 @@ package edu.ember.test;
 
 import edu.ember.common.exceptions.EmberException;
 import edu.ember.common.protocol.FrameCodec;
+import edu.ember.common.protocol.FrameFactory;
 import edu.ember.common.protocol.KvPayloadCodec;
 import edu.ember.common.protocol.ProtocolFrameException;
 import edu.ember.common.protocol.WireFrame;
+import edu.ember.common.protocol.WireOpcodes;
 import edu.ember.common.security.InputValidator;
 import edu.ember.common.security.Pbkdf2PasswordHasher;
 import edu.ember.common.security.PasswordHasher;
 import edu.ember.common.security.TlsSocketFactory;
 import edu.ember.client.ClientController;
 import edu.ember.client.ClientStateModel;
+import edu.ember.client.LocalOutbox;
+import edu.ember.client.ReconnectManager;
 import edu.ember.common.model.MessageStatus;
 import edu.ember.common.model.Message;
+import edu.ember.common.model.GroupChat;
+import edu.ember.common.model.UserRole;
 import edu.ember.common.model.UserRecord;
 import edu.ember.server.EmberServer;
 import edu.ember.server.AuthRateLimiter;
@@ -71,6 +77,7 @@ public final class EmberTestSuite {
         runTest("WAL restart recovers Arabic and emoji records and trims torn tail",
                 this::testWalTornTailRecovery);
         runTest("WAL CRC failure truncates invalid tail", this::testWalCrcRecovery);
+        runTest("WAL restart restores group members and roles", this::testWalGroupRecovery);
         runTest("server restart restores accounts and messages from WAL",
                 this::testWalServerRestart);
         runTest("five bad logins lock account and audit stays one JSON line",
@@ -78,6 +85,12 @@ public final class EmberTestSuite {
         runTest("concurrent password hashing is capped at four", this::testHashConcurrencyLimit);
         runTest("message flood receives 429", this::testMessageFlood);
         runTest("loopback IP limiter remains disabled", this::testLoopbackRateLimit);
+        runTest("local outbox persists framed commands and reconnect delay is bounded",
+                this::testLocalOutbox);
+        runTest("resume syncs offline messages once and history, typing, presence, and ping work",
+                this::testReconnectHistoryAndPresence);
+        runTest("group fan-out aggregates receipts and denies unauthorized object access",
+                this::testGroupMessagingAndAuthorization);
         System.out.println("Ember tests: " + passed + " passed, " + failed + " failed.");
         if (failed != 0) {
             throw new AssertionError("Test suite failed");
@@ -312,6 +325,7 @@ public final class EmberTestSuite {
         ClientController bob = null;
         EmberServer restartedServer = null;
         ClientController restartedAlice = null;
+        ClientController restartedBob = null;
         try {
             firstServer.start();
             alice = new ClientController("127.0.0.1", firstServer.port(),
@@ -319,30 +333,30 @@ public final class EmberTestSuite {
             bob = new ClientController("127.0.0.1", firstServer.port(),
                     config.resolve("ember-client-trust.p12"), password);
             CountDownLatch firstAuth = new CountDownLatch(2);
-            CountDownLatch delivered = new CountDownLatch(1);
+            CountDownLatch sent = new CountDownLatch(1);
             alice.addListener((model, event, message) -> {
                 if (event.equals("AUTH_OK")) {
                     firstAuth.countDown();
+                }
+                if (event.equals("MESSAGE_STATUS") && message != null
+                        && message.status() == MessageStatus.SENT) {
+                    sent.countDown();
                 }
             });
             bob.addListener((model, event, message) -> {
                 if (event.equals("AUTH_OK")) {
                     firstAuth.countDown();
                 }
-                if (event.equals("MESSAGE") && message != null
-                        && message.body().equals("persist me 🌋")) {
-                    delivered.countDown();
-                }
             });
             alice.register("alice", "alice-pass-42".toCharArray(), "Alice");
             bob.register("bob", "bob-pass-42".toCharArray(), "Bob");
             assertTrue(firstAuth.await(30, TimeUnit.SECONDS), "Initial users did not authenticate");
-            alice.sendMessage("dm:alice:bob", "persist me 🌋");
-            assertTrue(delivered.await(30, TimeUnit.SECONDS), "Persisted message was not delivered");
-            alice.close();
             bob.close();
-            alice = null;
             bob = null;
+            alice.sendMessage("dm:alice:bob", "persist me 🌋");
+            assertTrue(sent.await(30, TimeUnit.SECONDS), "Server did not ACK the WAL-backed message");
+            alice.close();
+            alice = null;
             firstServer.close();
             restartedServer = new EmberServer(config.resolve("ember-server.p12"), password, 0,
                     new WalStorageEngine(root, true), new SecurityAuditLogger(auditPath));
@@ -357,6 +371,25 @@ public final class EmberTestSuite {
             });
             restartedAlice.login("alice", "alice-pass-42".toCharArray());
             assertTrue(login.await(30, TimeUnit.SECONDS), "Persisted account could not log in after restart");
+            restartedBob = new ClientController("127.0.0.1", restartedServer.port(),
+                    config.resolve("ember-client-trust.p12"), password);
+            CountDownLatch bobLogin = new CountDownLatch(1);
+            CountDownLatch recoveredDelivery = new CountDownLatch(1);
+            AtomicInteger recoveredCopies = new AtomicInteger();
+            restartedBob.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) bobLogin.countDown();
+                if (event.equals("MESSAGE") && message != null
+                        && message.body().equals("persist me 🌋")) {
+                    recoveredCopies.incrementAndGet();
+                    recoveredDelivery.countDown();
+                }
+            });
+            restartedBob.login("bob", "bob-pass-42".toCharArray());
+            assertTrue(bobLogin.await(30, TimeUnit.SECONDS), "Bob could not log in after restart");
+            assertTrue(recoveredDelivery.await(20, TimeUnit.SECONDS),
+                    "Bob did not recover the undelivered WAL message");
+            Thread.sleep(300);
+            assertEquals(1, recoveredCopies.get(), "WAL recovery delivered the message more than once");
             try (WalStorageEngine reopened = new WalStorageEngine(root, true)) {
                 reopened.init();
                 assertTrue(reopened.findUser("bob").isPresent(), "Bob's account was lost on restart");
@@ -368,9 +401,28 @@ public final class EmberTestSuite {
             if (alice != null) { alice.close(); }
             if (bob != null) { bob.close(); }
             if (restartedAlice != null) { restartedAlice.close(); }
+            if (restartedBob != null) { restartedBob.close(); }
             firstServer.close();
             if (restartedServer != null) { restartedServer.close(); }
             Files.deleteIfExists(auditPath);
+            deleteTree(root);
+        }
+    }
+
+    private void testWalGroupRecovery() throws Exception {
+        Path root = Path.of("build", "test-data", "group-wal");
+        deleteTree(root);
+        GroupChat original = new GroupChat("group-wal-id", "Study", "Review group",
+                Map.of("alice", UserRole.MODERATOR, "bob", UserRole.STUDENT));
+        try (WalStorageEngine storage = new WalStorageEngine(root, true)) {
+            storage.init();
+            storage.saveGroup(original);
+        }
+        try (WalStorageEngine recovered = new WalStorageEngine(root, true)) {
+            recovered.init();
+            GroupChat group = recovered.findGroup("group-wal-id").orElseThrow();
+            assertEquals(original.members(), group.members(), "Group roles changed after WAL replay");
+        } finally {
             deleteTree(root);
         }
     }
@@ -436,6 +488,267 @@ public final class EmberTestSuite {
                 Files.deleteIfExists(path);
             }
         }
+    }
+
+    private void testLocalOutbox() throws Exception {
+        Path root = Path.of("build", "test-data", "outbox");
+        deleteTree(root);
+        Path file = root.resolve("outbox.dat");
+        WireFrame first = FrameFactory.command(WireOpcodes.CMD_MSG_SEND, 1,
+                Map.of("clientMsgId", "first", "body", "مرحبا 🌋"));
+        WireFrame second = FrameFactory.command(WireOpcodes.CMD_MSG_SEND, 2,
+                Map.of("clientMsgId", "second", "body", "second"));
+        LocalOutbox outbox = new LocalOutbox(file);
+        outbox.enqueue(first);
+        outbox.enqueue(second);
+        LocalOutbox recovered = new LocalOutbox(file);
+        assertEquals(2, recovered.size(), "Outbox entries were lost after reopen");
+        assertEquals(1L, recovered.peek().correlationId(), "Outbox FIFO order changed");
+        recovered.removeFirst();
+        LocalOutbox remaining = new LocalOutbox(file);
+        assertEquals(1, remaining.size(), "Acknowledged outbox entry was not removed");
+        assertEquals("second", KvPayloadCodec.decode(remaining.peek().payload()).get("clientMsgId"),
+                "Remaining outbox frame changed");
+        for (int attempt = 0; attempt < 12; attempt++) {
+            long delay = ReconnectManager.nextDelayMillis(attempt);
+            assertTrue(delay >= 500 && delay <= 15_250, "Reconnect delay exceeded its bounds");
+        }
+        deleteTree(root);
+    }
+
+    private void testGroupMessagingAndAuthorization() throws Exception {
+        Path config = Path.of("config");
+        char[] storePassword = readStorePassword(config.resolve("secrets.properties"));
+        Path dataRoot = Path.of("build", "test-data", "group-clients");
+        Path auditPath = Path.of("build", "test-data", "group-audit.json");
+        deleteTree(dataRoot);
+        Files.deleteIfExists(auditPath);
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), storePassword, 0,
+                new InMemoryStorageEngine(), new SecurityAuditLogger(auditPath));
+        Map<String, ClientController> clients = new java.util.LinkedHashMap<>();
+        try {
+            server.start();
+            String[] users = {"alice", "bob", "charlie", "dana", "eve"};
+            CountDownLatch authenticated = new CountDownLatch(users.length);
+            CountDownLatch groupCreated = new CountDownLatch(1);
+            CountDownLatch groupReady = new CountDownLatch(1);
+            CountDownLatch groupMessages = new CountDownLatch(3);
+            CountDownLatch groupRead = new CountDownLatch(1);
+            CountDownLatch bobMemberDenied = new CountDownLatch(1);
+            CountDownLatch eveSendDenied = new CountDownLatch(4);
+            CountDownLatch eveReceiptDenied = new CountDownLatch(1);
+            CountDownLatch senderReceiptDenied = new CountDownLatch(1);
+            AtomicReference<Boolean> expectEveReceiptError = new AtomicReference<>(false);
+            AtomicReference<String> groupId = new AtomicReference<>();
+            for (String user : users) {
+                ClientController client = new ClientController("127.0.0.1", server.port(),
+                        config.resolve("ember-client-trust.p12"), storePassword, dataRoot);
+                clients.put(user, client);
+                client.addListener((model, event, message) -> {
+                    if (event.equals("AUTH_OK")) {
+                        authenticated.countDown();
+                    }
+                    if (event.equals("GROUP_UPDATE") && user.equals("alice")) {
+                        String foundGroup = model.groupIds().stream().findFirst().orElse(null);
+                        if (foundGroup != null) {
+                            groupId.set(foundGroup);
+                            if (model.groupMemberCount(foundGroup) == 1) {
+                                groupCreated.countDown();
+                            } else if (model.groupMemberCount(foundGroup) == 4) {
+                                groupReady.countDown();
+                            }
+                        }
+                    }
+                    if (event.equals("MESSAGE") && message != null
+                            && message.conversationId().equals("grp:" + groupId.get())) {
+                        groupMessages.countDown();
+                    }
+                    if (event.equals("RECEIPT") && message != null
+                            && message.conversationId().equals("grp:" + groupId.get())) {
+                        ClientStateModel.ReceiptSummary receipt = model.receiptSummary(message.clientMsgId());
+                        if (receipt != null && receipt.delivered() == 3 && receipt.total() == 3) {
+                            groupReady.countDown();
+                        }
+                        if (receipt != null && receipt.read() == 3 && receipt.total() == 3) {
+                            groupRead.countDown();
+                        }
+                    }
+                    if (event.equals("ERROR") && "403".equals(model.errorCode())) {
+                        if (user.equals("bob")) {
+                            bobMemberDenied.countDown();
+                        } else if (user.equals("eve")) {
+                            eveSendDenied.countDown();
+                            if (expectEveReceiptError.get()) {
+                                eveReceiptDenied.countDown();
+                            }
+                        } else if (user.equals("alice")) {
+                            senderReceiptDenied.countDown();
+                        }
+                    }
+                });
+            }
+            for (String user : users) {
+                clients.get(user).register(user, (user + "-pass-42").toCharArray(), user);
+            }
+            assertTrue(authenticated.await(30, TimeUnit.SECONDS), "Group test users did not authenticate");
+            clients.get("alice").createGroup("Study", "Study group");
+            assertTrue(groupCreated.await(10, TimeUnit.SECONDS), "Group creation was not returned");
+            String group = groupId.get();
+            clients.get("alice").changeGroupMember(group, "bob", "ADD");
+            clients.get("alice").changeGroupMember(group, "charlie", "ADD");
+            clients.get("alice").changeGroupMember(group, "dana", "ADD");
+            assertTrue(groupReady.await(10, TimeUnit.SECONDS), "Group did not reach four members");
+            clients.get("bob").changeGroupMember(group, "eve", "ADD");
+            assertTrue(bobMemberDenied.await(10, TimeUnit.SECONDS), "Non-moderator member change was allowed");
+            clients.get("eve").sendMessage("grp:" + group, "forbidden group send");
+            clients.get("eve").sendMessage("dm:alice:bob", "forbidden direct send");
+            clients.get("eve").requestHistory("grp:" + group, Long.MAX_VALUE, 10);
+            clients.get("eve").setTyping("grp:" + group, true);
+            assertTrue(eveSendDenied.await(10, TimeUnit.SECONDS), "Non-participant message send was allowed");
+            String messageId = clients.get("alice").sendMessage("grp:" + group, "Group hello 🌋");
+            assertTrue(groupMessages.await(20, TimeUnit.SECONDS), "Group members did not receive fan-out");
+            assertTrue(awaitReceipt(clients.get("alice").model(), messageId, 3, 20_000),
+                    "Group delivered receipt did not aggregate to 3/3");
+            clients.get("bob").markRead("grp:" + group, messageId);
+            clients.get("charlie").markRead("grp:" + group, messageId);
+            clients.get("dana").markRead("grp:" + group, messageId);
+            assertTrue(groupRead.await(15, TimeUnit.SECONDS), "Group read receipts did not aggregate to 3/3");
+            expectEveReceiptError.set(true);
+            clients.get("alice").markRead("grp:" + group, messageId);
+            clients.get("eve").markRead("grp:" + group, messageId);
+            assertTrue(eveReceiptDenied.await(10, TimeUnit.SECONDS), "Outsider receipt was accepted");
+            assertTrue(senderReceiptDenied.await(10, TimeUnit.SECONDS), "Sender receipt was accepted");
+            ClientStateModel.ReceiptSummary summary = clients.get("alice").model()
+                    .receiptSummary(messageId);
+            assertEquals(3, summary.delivered(), "Group delivered count was incorrect");
+            assertEquals(3, summary.total(), "Group receipt total was incorrect");
+            assertEquals(3, summary.read(), "Group read count was incorrect");
+            assertEquals(MessageStatus.READ, clients.get("alice").model().messages("grp:" + group)
+                    .stream().filter(message -> message.clientMsgId().equals(messageId))
+                    .findFirst().orElseThrow().status(), "Group message did not reach READ");
+        } finally {
+            for (ClientController client : clients.values()) {
+                client.close();
+            }
+            server.close();
+            Files.deleteIfExists(auditPath);
+            deleteTree(dataRoot);
+        }
+    }
+
+    private void testReconnectHistoryAndPresence() throws Exception {
+        Path config = Path.of("config");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        Path dataRoot = Path.of("build", "test-data", "resume-clients");
+        deleteTree(dataRoot);
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0);
+        ClientController alice = null;
+        ClientController bob = null;
+        ClientController resumedBob = null;
+        try {
+            server.start();
+            alice = new ClientController("127.0.0.1", server.port(),
+                    config.resolve("ember-client-trust.p12"), password, dataRoot);
+            bob = new ClientController("127.0.0.1", server.port(),
+                    config.resolve("ember-client-trust.p12"), password, dataRoot);
+            CountDownLatch authenticated = new CountDownLatch(2);
+            CountDownLatch pong = new CountDownLatch(1);
+            CountDownLatch typing = new CountDownLatch(1);
+            AtomicInteger offlineCopies = new AtomicInteger();
+            AtomicInteger historyCopies = new AtomicInteger();
+            CountDownLatch offlineMessages = new CountDownLatch(2);
+            CountDownLatch historyMessages = new CountDownLatch(2);
+            AtomicInteger presenceEvents = new AtomicInteger();
+            alice.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("PONG")) pong.countDown();
+                if (event.equals("PRESENCE")) presenceEvents.incrementAndGet();
+                if (event.equals("HISTORY_MESSAGE")) historyMessages.countDown();
+            });
+            bob.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) authenticated.countDown();
+                if (event.equals("TYPING") && "alice".equals(model.typingUser("dm:alice:bob"))) {
+                    typing.countDown();
+                }
+            });
+            alice.register("alice", "alice-pass-42".toCharArray(), "Alice");
+            bob.register("bob", "bob-pass-42".toCharArray(), "Bob");
+            assertTrue(authenticated.await(30, TimeUnit.SECONDS), "Resume users did not authenticate");
+            assertTrue(awaitPresence(alice.model(), "bob", true, 10_000),
+                    "Online presence was not broadcast (events=" + presenceEvents.get()
+                            + ", lastError=" + alice.model().errorMessage() + ")");
+            alice.ping();
+            assertTrue(pong.await(10, TimeUnit.SECONDS), "Heartbeat ping did not receive a pong");
+            alice.setTyping("dm:alice:bob", true);
+            assertTrue(typing.await(10, TimeUnit.SECONDS), "Typing event was not delivered");
+            String duplicateId = "duplicate-resend-1";
+            alice.sendMessageWithId("dm:alice:bob", "Idempotent 🌋", duplicateId);
+            alice.sendMessageWithId("dm:alice:bob", "Idempotent 🌋", duplicateId);
+            Thread.sleep(500);
+            assertEquals(1, bob.model().messages("dm:alice:bob").size(),
+                    "Duplicate resend created more than one message");
+            String savedToken = bob.sessionToken();
+            bob.close();
+            bob = null;
+            String offlineId = alice.sendMessage("dm:alice:bob", "While you were away مرحبا");
+            Thread.sleep(500);
+            assertEquals(null, alice.model().receiptSummary(offlineId),
+                    "Offline recipient unexpectedly acknowledged delivery");
+            resumedBob = new ClientController("127.0.0.1", server.port(),
+                    config.resolve("ember-client-trust.p12"), password, dataRoot);
+            CountDownLatch resumed = new CountDownLatch(1);
+            resumedBob.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) resumed.countDown();
+                if (event.equals("MESSAGE") && message != null) {
+                    if (message.body().equals("While you were away مرحبا")) {
+                        offlineCopies.incrementAndGet();
+                    }
+                    offlineMessages.countDown();
+                }
+            });
+            assertEquals(savedToken, Files.readString(dataRoot.resolve("bob/session.token")),
+                    "Saved session token did not persist");
+            resumedBob.resumeStoredSession("bob");
+            assertTrue(resumed.await(15, TimeUnit.SECONDS), "Session token did not resume");
+            assertTrue(offlineMessages.await(15, TimeUnit.SECONDS), "Sync did not restore both messages");
+            Thread.sleep(500);
+            assertEquals(1, offlineCopies.get(), "Offline message arrived more than once");
+            alice.requestHistory("dm:alice:bob", Long.MAX_VALUE, 10);
+            assertTrue(historyMessages.await(15, TimeUnit.SECONDS), "History pull returned no messages");
+            historyCopies.set(alice.model().messages("dm:alice:bob").size());
+            assertEquals(2, historyCopies.get(), "History/model did not retain exactly two messages");
+        } finally {
+            if (resumedBob != null) resumedBob.close();
+            if (bob != null) bob.close();
+            if (alice != null) alice.close();
+            server.close();
+            deleteTree(dataRoot);
+        }
+    }
+
+    private boolean awaitReceipt(ClientStateModel model, String messageId, int total, long timeoutMs)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (System.nanoTime() < deadline) {
+            ClientStateModel.ReceiptSummary receipt = model.receiptSummary(messageId);
+            if (receipt != null && receipt.delivered() == total && receipt.total() == total) {
+                return true;
+            }
+            Thread.sleep(20);
+        }
+        return false;
+    }
+
+    private boolean awaitPresence(ClientStateModel model, String userId, boolean expected,
+            long timeoutMs) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (System.nanoTime() < deadline) {
+            if (model.isOnline(userId) == expected) {
+                return true;
+            }
+            Thread.sleep(20);
+        }
+        return false;
     }
 
     private void testWalkingSkeleton() throws Exception {
