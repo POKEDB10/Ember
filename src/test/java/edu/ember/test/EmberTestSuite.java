@@ -89,6 +89,8 @@ public final class EmberTestSuite {
         runTest("input validation", this::testInputValidation);
         runTest("TLS 1.3 loopback frame round trip", this::testTlsRoundTrip);
         runTest("headless registration, message, and delivery", this::testWalkingSkeleton);
+        runTest("two devices on one account, web socket client, and long messages",
+                this::testMultiDeviceAndWeb);
         runTest("theme palettes, wrapped message bodies, and EDT notifications",
                 this::testUiBasics);
         runTest("WAL restart recovers Arabic and emoji records and trims torn tail",
@@ -192,6 +194,8 @@ public final class EmberTestSuite {
         assertThrows(EmberException.class, () -> InputValidator.validateUsername("bad name"));
         assertEquals("helloworld", InputValidator.validateMessageBody("hello\u0000world"),
                 "Control character was not stripped");
+        assertEquals("line one\nline two", InputValidator.validateMessageBody("line one\nline two"),
+                "Newline was not kept");
     }
 
     private void testTlsRoundTrip() throws Exception {
@@ -949,12 +953,142 @@ public final class EmberTestSuite {
         }
     }
 
+    private void testMultiDeviceAndWeb() throws Exception {
+        Path config = Path.of("config");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        Path trust = config.resolve("ember-client-trust.p12");
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0);
+        ClientController laptop = null;
+        ClientController phone = null;
+        try {
+            server.start();
+            try (SSLSocket web = TlsSocketFactory.createClientSocket(trust, password, "127.0.0.1",
+                    server.port())) {
+                web.setSoTimeout(20_000);
+                web.getOutputStream().write("GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n"
+                        .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                String head = new String(web.getInputStream().readNBytes(15),
+                        java.nio.charset.StandardCharsets.US_ASCII);
+                assertEquals("HTTP/1.1 200 OK", head, "Web app file was not served on the TLS port");
+            }
+            laptop = new ClientController("127.0.0.1", server.port(), trust, password);
+            phone = new ClientController("127.0.0.1", server.port(), trust, password);
+            String longBody = "x".repeat(5_000);
+            CountDownLatch laptopAuth = new CountDownLatch(1);
+            CountDownLatch phoneAuth = new CountDownLatch(1);
+            CountDownLatch laptopGotLong = new CountDownLatch(1);
+            CountDownLatch phoneGotLong = new CountDownLatch(1);
+            CountDownLatch phoneGotOwn = new CountDownLatch(1);
+            laptop.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) { laptopAuth.countDown(); }
+                if (event.equals("MESSAGE") && message != null && message.body().equals(longBody)) {
+                    laptopGotLong.countDown();
+                }
+            });
+            phone.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) { phoneAuth.countDown(); }
+                if (event.equals("MESSAGE") && message != null && message.body().equals(longBody)) {
+                    phoneGotLong.countDown();
+                }
+                if (event.equals("MESSAGE") && message != null && message.body().equals("from laptop")) {
+                    phoneGotOwn.countDown();
+                }
+            });
+            laptop.register("alice", "alice-pass-42".toCharArray(), "Alice");
+            assertTrue(laptopAuth.await(30, TimeUnit.SECONDS), "Laptop did not authenticate");
+            phone.login("alice", "alice-pass-42".toCharArray());
+            assertTrue(phoneAuth.await(30, TimeUnit.SECONDS), "Second device did not authenticate");
+            try (SSLSocket bob = TlsSocketFactory.createClientSocket(trust, password, "127.0.0.1",
+                    server.port())) {
+                bob.setSoTimeout(20_000);
+                var in = new java.io.BufferedInputStream(bob.getInputStream());
+                var out = bob.getOutputStream();
+                out.write(("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                        + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+                        .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                StringBuilder response = new StringBuilder();
+                while (!response.toString().endsWith("\r\n\r\n")) {
+                    response.append((char) in.read());
+                }
+                assertTrue(response.toString().contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+                        "WebSocket accept key is wrong: " + response);
+                wsSend(out, FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                        Map.of("user", "bob", "pass", "bob-pass-42", "displayName", "Bob")));
+                assertEquals(WireOpcodes.EVT_AUTH_OK, wsRead(in, WireOpcodes.EVT_AUTH_OK).opcode(),
+                        "Web user did not authenticate");
+                wsSend(out, FrameFactory.command(WireOpcodes.CMD_MSG_SEND, 2, Map.of(
+                        "clientMsgId", "web-long-1", "convId", "dm:alice:bob", "body", longBody)));
+                assertEquals(WireOpcodes.EVT_MSG_ACK, wsRead(in, WireOpcodes.EVT_MSG_ACK).opcode(),
+                        "5,000-character web message was not accepted");
+                assertTrue(laptopGotLong.await(20, TimeUnit.SECONDS), "First device missed the message");
+                assertTrue(phoneGotLong.await(20, TimeUnit.SECONDS), "Second device missed the message");
+                laptop.sendMessage("dm:alice:bob", "from laptop");
+                assertTrue(phoneGotOwn.await(20, TimeUnit.SECONDS),
+                        "Sender's other device did not receive the sent message");
+                WireFrame delivered = wsRead(in, WireOpcodes.EVT_MSG_DELIVER);
+                assertEquals("from laptop", KvPayloadCodec.decode(delivered.payload()).get("body"),
+                        "Web user did not receive the desktop message");
+            }
+        } finally {
+            if (laptop != null) { laptop.close(); }
+            if (phone != null) { phone.close(); }
+            server.close();
+        }
+    }
+
+    /** Sends one masked client WebSocket frame, as a browser would. */
+    private static void wsSend(java.io.OutputStream out, WireFrame frame) throws IOException {
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        FrameCodec.writeFrame(body, frame);
+        byte[] payload = body.toByteArray();
+        byte[] mask = {0x11, 0x22, 0x33, 0x44};
+        ByteArrayOutputStream ws = new ByteArrayOutputStream();
+        ws.write(0x82);
+        if (payload.length < 126) {
+            ws.write(0x80 | payload.length);
+        } else {
+            ws.write(0x80 | 126);
+            ws.write(payload.length >>> 8);
+            ws.write(payload.length);
+        }
+        ws.write(mask);
+        for (int index = 0; index < payload.length; index++) {
+            ws.write(payload[index] ^ mask[index & 3]);
+        }
+        out.write(ws.toByteArray());
+        out.flush();
+    }
+
+    /** Reads server WebSocket messages until one carries the wanted Ember opcode. */
+    private static WireFrame wsRead(java.io.InputStream in, int opcode) throws Exception {
+        while (true) {
+            int first = in.read();
+            long length = in.read() & 0x7F;
+            if (first < 0) {
+                throw new IOException("WebSocket closed");
+            }
+            if (length == 126) {
+                length = (in.read() << 8) | in.read();
+            } else if (length == 127) {
+                length = 0;
+                for (int index = 0; index < 8; index++) {
+                    length = (length << 8) | in.read();
+                }
+            }
+            WireFrame frame = FrameCodec.readFrame(
+                    new ByteArrayInputStream(in.readNBytes((int) length)), Integer.MAX_VALUE);
+            if (frame.opcode() == opcode) {
+                return frame;
+            }
+        }
+    }
+
     private void testUiBasics() throws Exception {
         javax.swing.SwingUtilities.invokeAndWait(() -> {
             ThemeManager.apply(ThemeManager.Theme.DARK);
-            assertEquals(new java.awt.Color(0x0F172A), ThemeManager.current().background(),
+            assertEquals(new java.awt.Color(0x120B06), ThemeManager.current().background(),
                     "Dark theme background token changed");
-            assertEquals(new java.awt.Color(0x0F172A), ThemeManager.Theme.LIGHT.text(),
+            assertEquals(new java.awt.Color(0x2B1D10), ThemeManager.Theme.LIGHT.text(),
                     "Light theme text token changed");
             assertTrue(FontResolver.resolve() != null, "Font resolver returned null");
             Message message = new Message("ui-test", "alice", "dm:alice:bob",
