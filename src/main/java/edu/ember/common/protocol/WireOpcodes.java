@@ -23,6 +23,8 @@ public final class WireOpcodes {
     public static final int CMD_GROUP_MEMBER = 0x21;
     public static final int CMD_USER_SEARCH = 0x22;
     public static final int CMD_GROUP_INFO = 0x23;
+    public static final int CMD_STATUS_SET = 0x24;
+    public static final int CMD_PUSH_SUBSCRIBE = 0x25;
     public static final int CMD_PROFILE_UPDATE = 0x30;
     public static final int CMD_FOLLOW_ACTION = 0x31;
     public static final int CMD_MEDIA_UPLOAD = 0x32;
