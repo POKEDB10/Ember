@@ -60,3 +60,15 @@ Later concept mappings are added with the phase that implements the correspondin
 | Idempotent demo fixtures and generated media | `edu.ember.tools.DemoSeeder`, `WalStorageEngine`, `MediaAsset` |
 | Command-line demo mode and runtime packaging | `EmberServer --demo-seed`, `scripts/package-demo`, `jpackage` |
 | UML use case, class, sequence, state, and activity diagrams | `docs/uml/*.puml` based on implemented source packages |
+| Interfaces and polymorphism for transports | `client.ServerLink` (`TlsLink`, `WebSocketLink`), `ClientController` |
+| Adapter pattern for browsers | `server.WebGateway` (HTTP files, `/health`, `/media`, WebSocket framing) |
+| Stream compression with Deflater/Inflater | `WebGateway.WsOutput`, `WebGateway.WsInput` |
+| Strategy pattern for storage replicas | `StorageReplica`, `BlobStore`, `BlobStoreReplica`, `RootzBlobStore` |
+| AES-256-GCM encryption and GZIP | `BlobStoreReplica.seal` / `open` |
+| Scheduled executor and batching thread | `BlobStoreReplica` uploader |
+| REST over the JDK HTTP client, exception translation | `RootzBlobStore` |
+| Recursive-descent parsing | `common.util.MiniJson` |
+| Functional interfaces and lambdas | `BlobStoreReplica.RemoteCall`, `WebGateway.MediaSource` |
+| Records | `WebGateway.Upgrade`, `WebGateway.Asset` |
+| Concurrent maps and atomic compute for multi-device presence | `EmberServer.online`, `sendToUser`, `removeOnline` |
+| Integration check against a live service | `edu.ember.tools.ReplicaCheck` |
