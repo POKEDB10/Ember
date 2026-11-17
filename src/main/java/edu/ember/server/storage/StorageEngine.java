@@ -68,6 +68,11 @@ public interface StorageEngine extends AutoCloseable {
     List<Message> expiredMessages(long nowMs) throws IOException;
     int purgeExpiredRecords(long nowMs) throws IOException;
     void flush() throws IOException;
+    /** Copies a stored media file off-server, when the engine has a replica. */
+    default void mirrorMedia(String name, byte[] bytes) { }
+    /** Media file from the off-server replica, or null. */
+    default byte[] fetchMirroredMedia(String name) throws IOException { return null; }
+    default boolean isMediaMirrored(String name) { return true; }
     default void compact() throws IOException { flush(); }
     @Override
     void close() throws IOException;

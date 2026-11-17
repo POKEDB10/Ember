@@ -36,7 +36,9 @@ import java.util.zip.CRC32;
 /** Replays and appends CRC-protected records, truncating an invalid or torn tail. @concept DAO, file channels, WAL */
 public final class WalStorageEngine implements StorageEngine {
     private static final int RECORD_HEADER_BYTES = Integer.BYTES + Long.BYTES;
-    private static final int MAX_RECORD_BYTES = 6 * 1024 * 1024;
+    private static final int MAX_RECORD_BYTES = 64 * 1024 * 1024;
+    /** With a remote replica, snapshot only after this much new WAL, to save upload bandwidth. */
+    private static final long REPLICA_COMPACT_BYTES = 1024 * 1024;
     private static final int SNAPSHOT_MAGIC = 0x454D4252;
     private static final int MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024;
     private static final byte USER_SAVE = 1;
@@ -62,6 +64,7 @@ public final class WalStorageEngine implements StorageEngine {
     private final Path walPath;
     private final Path snapshotPath;
     private final boolean strictDurability;
+    private final StorageReplica replica;
     private final InMemoryStorageEngine state = new InMemoryStorageEngine();
     private final Map<String, Long> conversationSequences = new HashMap<>();
     private FileChannel channel;
@@ -70,13 +73,20 @@ public final class WalStorageEngine implements StorageEngine {
     private long snapshotCoveredCrc;
 
     public WalStorageEngine(Path dataDirectory, boolean strictDurability) {
+        this(dataDirectory, strictDurability, null);
+    }
+
+    /** replica may be null; when set, the local folder is only a cache of the remote copy. */
+    public WalStorageEngine(Path dataDirectory, boolean strictDurability, StorageReplica replica) {
         walPath = dataDirectory.resolve("wal").resolve("events.wal");
         snapshotPath = dataDirectory.resolve("snapshots").resolve("state.snap");
         this.strictDurability = strictDurability;
+        this.replica = replica;
     }
 
     @Override
     public synchronized void init() throws IOException {
+        boolean restored = replica != null && replica.restore(snapshotPath, walPath);
         Files.createDirectories(walPath.getParent());
         channel = FileChannel.open(walPath, StandardOpenOption.CREATE,
                 StandardOpenOption.READ, StandardOpenOption.WRITE);
@@ -85,6 +95,32 @@ public final class WalStorageEngine implements StorageEngine {
         replay();
         state.purgeExpiredRecords(System.currentTimeMillis());
         channel.position(channel.size());
+        if (replica != null && !restored) {
+            seedReplica();
+        }
+    }
+
+    /** First run against an empty replica: upload the local data as its first snapshot. */
+    private void seedReplica() throws IOException {
+        if (channel.size() > 0) {
+            compactNow();
+        } else if (Files.exists(snapshotPath)) {
+            replica.replaceSnapshot(Files.readAllBytes(snapshotPath));
+        }
+    }
+
+    @Override public void mirrorMedia(String name, byte[] bytes) {
+        if (replica != null) {
+            replica.putMedia(name, bytes);
+        }
+    }
+
+    @Override public byte[] fetchMirroredMedia(String name) throws IOException {
+        return replica == null ? null : replica.getMedia(name);
+    }
+
+    @Override public boolean isMediaMirrored(String name) {
+        return replica == null || replica.hasMedia(name);
     }
 
     @Override
@@ -398,6 +434,11 @@ public final class WalStorageEngine implements StorageEngine {
     @Override
     public synchronized void compact() throws IOException {
         if (channel == null || !channel.isOpen() || channel.size() == 0) { return; }
+        if (replica != null && channel.size() < REPLICA_COMPACT_BYTES) { return; }
+        compactNow();
+    }
+
+    private void compactNow() throws IOException {
         if (strictDurability) { channel.force(false); }
         byte[] previous = readSnapshot();
         byte[] wal = Files.readAllBytes(walPath);
@@ -429,6 +470,9 @@ public final class WalStorageEngine implements StorageEngine {
         channel.truncate(0);
         channel.position(0);
         if (strictDurability) { channel.force(false); }
+        if (replica != null) {
+            replica.replaceSnapshot(Files.readAllBytes(snapshotPath));
+        }
     }
 
     @Override
@@ -438,6 +482,9 @@ public final class WalStorageEngine implements StorageEngine {
                 channel.force(false);
             }
             channel.close();
+        }
+        if (replica != null) {
+            replica.close();
         }
     }
 
@@ -649,6 +696,9 @@ public final class WalStorageEngine implements StorageEngine {
         }
         if (strictDurability) {
             channel.force(false);
+        }
+        if (replica != null) {
+            replica.appendLog(record.array());
         }
     }
 
