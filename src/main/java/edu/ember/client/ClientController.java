@@ -11,7 +11,6 @@ import edu.ember.common.protocol.FrameFactory;
 import edu.ember.common.protocol.KvPayloadCodec;
 import edu.ember.common.protocol.WireFrame;
 import edu.ember.common.protocol.WireOpcodes;
-import edu.ember.common.security.TlsSocketFactory;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
@@ -24,11 +23,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import javax.net.ssl.SSLSocket;
 
 /** Facade for client authentication, messaging, and model observation. @concept Facade, MVC */
 public final class ClientController implements AutoCloseable {
-    private final SSLSocket socket;
+    private final ServerLink socket;
     private final ClientStateModel model = new ClientStateModel();
     private final OutboundSenderThread outbound;
     private final InboundReceiverThread inbound;
@@ -62,12 +60,15 @@ public final class ClientController implements AutoCloseable {
 
     public ClientController(String host, int port, Path trustStore, char[] password,
             Path clientDataRoot) throws Exception {
+        this(ServerLink.tls(host, port, trustStore, password), clientDataRoot);
+    }
+
+    /** Works over any link: a direct TLS socket or the website's WebSocket. */
+    public ClientController(ServerLink link, Path clientDataRoot) throws IOException {
         this.clientDataRoot = clientDataRoot;
-        socket = TlsSocketFactory.createClientSocket(trustStore, password, host, port);
-        socket.setSoTimeout(45_000);
-        socket.startHandshake();
-        outbound = new OutboundSenderThread(new java.io.BufferedOutputStream(socket.getOutputStream()));
-        inbound = new InboundReceiverThread(new java.io.BufferedInputStream(socket.getInputStream()), this);
+        socket = link;
+        outbound = new OutboundSenderThread(link.output());
+        inbound = new InboundReceiverThread(link.input(), this);
         outbound.start();
         inbound.start();
         heartbeat.scheduleAtFixedRate(() -> {
@@ -179,6 +180,7 @@ public final class ClientController implements AutoCloseable {
     }
 
     public String sessionToken() { return sessionToken; }
+    public String transport() { return socket.describe(); }
     public boolean readReceiptsEnabled() { return readReceiptsEnabled; }
     public void setReadReceiptsEnabled(boolean enabled) { readReceiptsEnabled = enabled; }
 

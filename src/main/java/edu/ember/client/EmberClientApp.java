@@ -36,6 +36,8 @@ public final class EmberClientApp {
     private final JLabel status = new JLabel("Connecting…");
     private final String host;
     private final int port;
+    /** Website address (e.g. https://ember.pokedb.site); null means a direct TLS connection. */
+    private final String webAddress;
     private final Path trustStore;
     private final char[] storePassword;
     private final AuthPanel authPanel;
@@ -43,8 +45,9 @@ public final class EmberClientApp {
     private ChatWorkspacePanel workspace;
     private ReconnectManager reconnectManager;
 
-    private EmberClientApp(String host, int port, String profile, Path trustStore,
-            char[] storePassword) {
+    private EmberClientApp(String host, int port, String webAddress, String profile,
+            Path trustStore, char[] storePassword) {
+        this.webAddress = webAddress;
         this.host = host;
         this.port = port;
         this.trustStore = trustStore;
@@ -75,9 +78,12 @@ public final class EmberClientApp {
         ThemeManager.apply(ThemeManager.Theme.DARK);
         String host = "127.0.0.1";
         String profile = "";
+        String webAddress = null;
         int port = 7443;
         for (int index = 0; index + 1 < args.length; index++) {
-            if (args[index].equals("--host")) {
+            if (args[index].equals("--url")) {
+                webAddress = args[++index];
+            } else if (args[index].equals("--host")) {
                 host = args[++index];
             } else if (args[index].equals("--port")) {
                 port = Integer.parseInt(args[++index]);
@@ -86,12 +92,15 @@ public final class EmberClientApp {
             }
         }
         Path config = Path.of("config");
-        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        // A website address uses the system's trusted certificates, so no local truststore is needed.
+        char[] password = webAddress != null ? new char[0]
+                : readStorePassword(config.resolve("secrets.properties"));
         String targetHost = host;
         String targetProfile = profile;
+        String targetWeb = webAddress;
         int targetPort = port;
-        SwingUtilities.invokeLater(() -> new EmberClientApp(targetHost, targetPort, targetProfile,
-                config.resolve("ember-client-trust.p12"), password));
+        SwingUtilities.invokeLater(() -> new EmberClientApp(targetHost, targetPort, targetWeb,
+                targetProfile, config.resolve("ember-client-trust.p12"), password));
     }
 
     private static char[] readStorePassword(Path path) throws Exception {
@@ -129,18 +138,18 @@ public final class EmberClientApp {
     }
 
     private void connect() {
-        status.setText("Connecting to " + host + ":" + port + "…");
+        status.setText("Connecting to " + (webAddress != null ? webAddress : host + ":" + port) + "…");
         new SwingWorker<ClientController, Void>() {
             @Override
             protected ClientController doInBackground() throws Exception {
-                return new ClientController(host, port, trustStore, storePassword);
+                return newController();
             }
 
             @Override
             protected void done() {
                 try {
                     attachController(get(), null);
-                    status.setText("Connected with TLS 1.3");
+                    status.setText("Connected · " + controller.transport());
                 } catch (InterruptedException exception) {
                     Thread.currentThread().interrupt();
                     status.setText("Connection cancelled");
@@ -150,6 +159,12 @@ public final class EmberClientApp {
                 }
             }
         }.execute();
+    }
+
+    private ClientController newController() throws Exception {
+        return webAddress != null
+                ? new ClientController(ServerLink.webSocket(webAddress), Path.of("client_data"))
+                : new ClientController(host, port, trustStore, storePassword);
     }
 
     private void attachController(ClientController replacement, String conversationId) {
@@ -196,7 +211,7 @@ public final class EmberClientApp {
         if (eventType.equals("AUTH_OK")) {
             cards.show(root, "MAIN");
             frame.setTitle(AppInfo.NAME + " — " + model.userId());
-            status.setText("Connected · TLS 1.3");
+            status.setText("Connected · " + controller.transport());
             bindShortcuts();
         } else if (eventType.equals("MESSAGE") && message != null) {
             if (!frame.isFocused() && workspace != null) {
@@ -221,7 +236,7 @@ public final class EmberClientApp {
         }
         status.setText("Connection lost · reconnecting…");
         reconnectManager = new ReconnectManager(
-                () -> new ClientController(host, port, trustStore, storePassword),
+                this::newController,
                 new ReconnectManager.ReconnectListener() {
                     @Override
                     public void onReconnected(ClientController replacement) {
