@@ -10,7 +10,7 @@ if [ -z "${EMBER_KEYSTORE_PASS:-}" ]; then
   printf 'EMBER_KEYSTORE_PASS=%s\n' "$EMBER_KEYSTORE_PASS" > config/secrets.properties
 fi
 export EMBER_KEYSTORE_PASS
-keytool -genkeypair -alias ember-server -keyalg RSA -keysize 2048 -validity 3650 -dname 'CN=localhost, OU=Ember, O=Ember, L=Local, ST=Local, C=AE' -ext 'SAN=dns:localhost,ip:127.0.0.1' -storetype PKCS12 -keystore config/ember-server.p12 -storepass "$EMBER_KEYSTORE_PASS" -keypass "$EMBER_KEYSTORE_PASS"
+keytool -genkeypair -alias ember-server -keyalg RSA -keysize 2048 -validity 3650 -dname 'CN=localhost, OU=Ember, O=Ember, L=Local, ST=Local, C=AE' -ext "SAN=dns:localhost,ip:127.0.0.1${EMBER_HOSTS:+,$EMBER_HOSTS}" -storetype PKCS12 -keystore config/ember-server.p12 -storepass "$EMBER_KEYSTORE_PASS" -keypass "$EMBER_KEYSTORE_PASS"
 keytool -exportcert -alias ember-server -keystore config/ember-server.p12 -storepass "$EMBER_KEYSTORE_PASS" -file config/ember-server.cer
 mkdir -p build
 trust_tmp="build/ember-client-trust-$$.p12"
