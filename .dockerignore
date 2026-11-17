@@ -1,0 +1,10 @@
+.git
+build
+server_data
+client_data
+logs
+config
+docs
+scripts
+cloudflared.exe
+*.md

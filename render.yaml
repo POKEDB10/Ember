@@ -1,0 +1,21 @@
+# Render Blueprint: one free Docker web service. Secrets are entered in the Render dashboard
+# when the Blueprint is first applied (sync: false keeps them out of this file).
+services:
+  - type: web
+    name: ember
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    # Lets the server finish uploading pending messages to rootz before it stops.
+    maxShutdownDelaySeconds: 120
+    envVars:
+      - key: ROOTZ_API_KEY
+        sync: false
+      - key: EMBER_STORAGE_KEY
+        sync: false
+      - key: ROOTZ_FOLDER_ID
+        sync: false
+      - key: EMBER_ARGS
+        sync: false
