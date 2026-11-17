@@ -91,6 +91,10 @@ public final class EmberTestSuite {
         runTest("headless registration, message, and delivery", this::testWalkingSkeleton);
         runTest("two devices on one account, web socket client, and long messages",
                 this::testMultiDeviceAndWeb);
+        runTest("web-only server mode, health endpoint, and Swing client over WebSocket",
+                this::testWebOnlyModeAndDesktopOverWebSocket);
+        runTest("compressed WebSocket both ways and cached image download over HTTP",
+                this::testCompressedWebSocketAndMediaHttp);
         runTest("theme palettes, wrapped message bodies, and EDT notifications",
                 this::testUiBasics);
         runTest("WAL restart recovers Arabic and emoji records and trims torn tail",
@@ -100,6 +104,8 @@ public final class EmberTestSuite {
         runTest("WAL restart restores group members and roles", this::testWalGroupRecovery);
         runTest("server restart restores accounts and messages from WAL",
                 this::testWalServerRestart);
+        runTest("encrypted off-server replica restores a wiped server and rejects a wrong key",
+                this::testBlobStoreReplica);
         runTest("five bad logins lock account and audit stays one JSON line",
                 this::testLockoutAndAudit);
         runTest("concurrent password hashing is capped at four", this::testHashConcurrencyLimit);
@@ -267,6 +273,96 @@ public final class EmberTestSuite {
         }
         assertEquals(0L, Files.size(walFile), "Invalid CRC tail was not truncated");
         deleteTree(root);
+    }
+
+    /** In-memory stand-in for rootz.so, so the replica logic is tested without the network. */
+    private static final class FakeBlobStore implements edu.ember.server.storage.BlobStore {
+        private final Map<String, byte[]> files = new java.util.concurrent.ConcurrentHashMap<>();
+        private final Map<String, String> names = new java.util.concurrent.ConcurrentHashMap<>();
+
+        @Override public Map<String, String> list(String prefix) {
+            Map<String, String> result = new java.util.HashMap<>();
+            names.forEach((id, name) -> { if (name.startsWith(prefix)) { result.put(name, id); } });
+            return result;
+        }
+
+        @Override public String put(String name, byte[] data) {
+            String id = java.util.UUID.randomUUID().toString();
+            files.put(id, data.clone());
+            names.put(id, name);
+            return id;
+        }
+
+        @Override public byte[] get(String id) throws IOException {
+            byte[] data = files.get(id);
+            if (data == null) { throw new IOException("missing " + id); }
+            return data.clone();
+        }
+
+        @Override public void delete(String id) {
+            files.remove(id);
+            names.remove(id);
+        }
+    }
+
+    private void testBlobStoreReplica() throws Exception {
+        FakeBlobStore store = new FakeBlobStore();
+        byte[] keyBytes = new byte[32];
+        new java.security.SecureRandom().nextBytes(keyBytes);
+        javax.crypto.SecretKey key = new javax.crypto.spec.SecretKeySpec(keyBytes, "AES");
+        Path first = Files.createTempDirectory("ember-replica-a");
+        WalStorageEngine writer = new WalStorageEngine(first, false,
+                new edu.ember.server.storage.BlobStoreReplica(store, key, 50));
+        writer.init();
+        writer.saveUser(new UserRecord("rep-alice", "rep-alice", "Alice", "hash"));
+        writer.appendMessage(new Message("rep-1", "rep-alice", "dm:bob:rep-alice",
+                "secret-body before snapshot", System.currentTimeMillis()));
+        // Over 1 MB of WAL triggers a snapshot upload when the replica is on.
+        writer.appendMessage(new Message("rep-big", "rep-alice", "dm:bob:rep-alice",
+                "x".repeat(1_100_000), System.currentTimeMillis()));
+        writer.compact();
+        writer.appendMessage(new Message("rep-2", "rep-alice", "dm:bob:rep-alice",
+                "secret-body after snapshot 🌋", System.currentTimeMillis()));
+        writer.mirrorMedia("photo.jpg", new byte[] {1, 2, 3, 4});
+        writer.close();
+        for (String id : store.names.keySet()) {
+            String content = new String(store.get(id), java.nio.charset.StandardCharsets.ISO_8859_1);
+            assertFalse(content.contains("secret-body"), "Plaintext reached the remote store");
+        }
+        assertTrue(store.names.values().stream().anyMatch(name -> name.startsWith("ember-snap-1")),
+                "Snapshot was not uploaded");
+        assertFalse(store.names.values().stream().anyMatch(name -> name.startsWith("ember-log-0-")),
+                "Logs covered by the snapshot were not deleted");
+
+        Path fresh = Files.createTempDirectory("ember-replica-b");
+        WalStorageEngine reader = new WalStorageEngine(fresh, false,
+                new edu.ember.server.storage.BlobStoreReplica(store, key, 50));
+        reader.init();
+        assertEquals("Alice", reader.findUser("rep-alice").orElseThrow().displayName(),
+                "Account was not restored from the replica");
+        assertEquals("secret-body before snapshot", reader.findByClientMsgId("rep-1").orElseThrow()
+                .body(), "Snapshot message was not restored");
+        assertEquals("secret-body after snapshot 🌋", reader.findByClientMsgId("rep-2").orElseThrow()
+                .body(), "Post-snapshot message was not restored");
+        assertTrue(java.util.Arrays.equals(new byte[] {1, 2, 3, 4},
+                reader.fetchMirroredMedia("photo.jpg")), "Media was not restored");
+        reader.appendMessage(new Message("rep-3", "rep-alice", "dm:bob:rep-alice",
+                "third", System.currentTimeMillis()));
+        reader.close();
+
+        WalStorageEngine again = new WalStorageEngine(Files.createTempDirectory("ember-replica-c"),
+                false, new edu.ember.server.storage.BlobStoreReplica(store, key, 50));
+        again.init();
+        assertEquals(4, again.getHistory("dm:bob:rep-alice", Long.MAX_VALUE, 100).size(),
+                "Second restart lost messages written after the first restore");
+        again.close();
+
+        byte[] otherKey = keyBytes.clone();
+        otherKey[0] ^= 1;
+        WalStorageEngine wrongKey = new WalStorageEngine(Files.createTempDirectory("ember-replica-d"),
+                false, new edu.ember.server.storage.BlobStoreReplica(store,
+                        new javax.crypto.spec.SecretKeySpec(otherKey, "AES"), 50));
+        assertThrows(IOException.class, wrongKey::init);
     }
 
     private void testWalSnapshotCompaction() throws Exception {
@@ -1033,6 +1129,189 @@ public final class EmberTestSuite {
             if (laptop != null) { laptop.close(); }
             if (phone != null) { phone.close(); }
             server.close();
+        }
+    }
+
+    /** Render-style deployment: no TLS listener, plain HTTP behind the host's HTTPS proxy. */
+    private void testWebOnlyModeAndDesktopOverWebSocket() throws Exception {
+        Path temporary = Files.createTempDirectory("ember-web-only");
+        EmberServer server = new EmberServer(null, null, 0, new InMemoryStorageEngine(),
+                new SecurityAuditLogger(temporary.resolve("audit.json")), temporary.resolve("media"),
+                86_400, java.util.Set.of(), "127.0.0.1");
+        ClientController desktop = null;
+        try {
+            server.start();
+            int httpPort = server.startHttp(0);
+            assertEquals(-1, server.port(), "Web-only mode still opened a TLS port");
+            try (java.net.Socket probe = new java.net.Socket("127.0.0.1", httpPort)) {
+                probe.setSoTimeout(10_000);
+                probe.getOutputStream().write("GET /health HTTP/1.1\r\nHost: x\r\n\r\n"
+                        .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                String reply = new String(probe.getInputStream().readAllBytes(),
+                        java.nio.charset.StandardCharsets.US_ASCII);
+                assertTrue(reply.startsWith("HTTP/1.1 200") && reply.endsWith("ok"),
+                        "Health endpoint did not answer: " + reply);
+            }
+            desktop = new ClientController(
+                    edu.ember.client.ServerLink.webSocket("http://127.0.0.1:" + httpPort),
+                    temporary.resolve("client"));
+            CountDownLatch auth = new CountDownLatch(1);
+            CountDownLatch sent = new CountDownLatch(1);
+            desktop.addListener((model, event, message) -> {
+                if (event.equals("AUTH_OK")) { auth.countDown(); }
+                if (event.equals("MESSAGE_STATUS") && message != null
+                        && message.status() == MessageStatus.SENT) { sent.countDown(); }
+            });
+            desktop.register("carol", "carol-pass-42".toCharArray(), "Carol");
+            assertTrue(auth.await(30, TimeUnit.SECONDS), "Swing client could not log in over WebSocket");
+            desktop.sendMessage("dm:carol:dave", "hello over websocket");
+            assertTrue(sent.await(20, TimeUnit.SECONDS), "Swing client message was not acknowledged");
+            assertTrue(desktop.transport().startsWith("WebSocket"), "Transport label is wrong");
+        } finally {
+            if (desktop != null) { desktop.close(); }
+            server.close();
+        }
+    }
+
+    /** Browser-like client: compressed WebSocket both ways, then an image fetched over HTTP. */
+    private void testCompressedWebSocketAndMediaHttp() throws Exception {
+        Path temporary = Files.createTempDirectory("ember-deflate-media");
+        EmberServer server = new EmberServer(null, null, 0, new InMemoryStorageEngine(),
+                new SecurityAuditLogger(temporary.resolve("audit.json")), temporary.resolve("media"),
+                86_400, java.util.Set.of(), "127.0.0.1");
+        java.util.zip.Deflater deflater = new java.util.zip.Deflater(6, true);
+        java.util.zip.Inflater inflater = new java.util.zip.Inflater(true);
+        try {
+            server.start();
+            int port = server.startHttp(0);
+            String token;
+            String mediaId;
+            try (java.net.Socket socket = new java.net.Socket("127.0.0.1", port)) {
+                socket.setSoTimeout(20_000);
+                var in = new java.io.BufferedInputStream(socket.getInputStream());
+                var out = socket.getOutputStream();
+                out.write(("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                        + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+                        + "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n")
+                        .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                StringBuilder response = new StringBuilder();
+                while (!response.toString().endsWith("\r\n\r\n")) {
+                    response.append((char) in.read());
+                }
+                assertTrue(response.toString().contains("permessage-deflate"),
+                        "Server did not accept WebSocket compression");
+                AtomicBoolean sawCompressed = new AtomicBoolean();
+                wsSendCompressed(out, FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                        Map.of("user", "erin", "pass", "erin-pass-42", "displayName", "Erin")), deflater);
+                token = KvPayloadCodec.decode(wsReadInflating(in, WireOpcodes.EVT_AUTH_OK, inflater,
+                        sawCompressed).payload()).get("token");
+                java.awt.image.BufferedImage image = new java.awt.image.BufferedImage(40, 30,
+                        java.awt.image.BufferedImage.TYPE_INT_RGB);
+                ByteArrayOutputStream jpeg = new ByteArrayOutputStream();
+                javax.imageio.ImageIO.write(image, "jpeg", jpeg);
+                wsSendCompressed(out, FrameFactory.command(WireOpcodes.CMD_MEDIA_UPLOAD, 2,
+                        Map.of("fileName", "photo.jpg",
+                                "data", java.util.Base64.getEncoder().encodeToString(jpeg.toByteArray()))),
+                        deflater);
+                mediaId = KvPayloadCodec.decode(wsReadInflating(in, WireOpcodes.EVT_MEDIA_OK, inflater,
+                        sawCompressed).payload()).get("mediaId");
+                wsSendCompressed(out, FrameFactory.command(WireOpcodes.CMD_POST_CREATE, 3,
+                        Map.of("mediaId", mediaId, "caption", "compressed hello")), deflater);
+                wsReadInflating(in, WireOpcodes.EVT_FEED_PAGE, inflater, sawCompressed);
+                assertTrue(sawCompressed.get(), "No server message arrived compressed");
+            }
+            String withToken = httpGet(port, "/media/" + mediaId, "Bearer " + token);
+            assertTrue(withToken.startsWith("HTTP/1.1 200") && withToken.contains("image/jpeg")
+                    && withToken.contains("immutable"), "Image was not served with caching headers");
+            assertTrue(httpGet(port, "/media/" + mediaId, "").startsWith("HTTP/1.1 404"),
+                    "Image was served without a session token");
+        } finally {
+            deflater.end();
+            inflater.end();
+            server.close();
+        }
+    }
+
+    private static String httpGet(int port, String path, String authorization) throws IOException {
+        try (java.net.Socket socket = new java.net.Socket("127.0.0.1", port)) {
+            socket.setSoTimeout(10_000);
+            socket.getOutputStream().write(("GET " + path + " HTTP/1.1\r\nHost: x\r\n"
+                    + (authorization.isEmpty() ? "" : "Authorization: " + authorization + "\r\n")
+                    + "\r\n").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            return new String(socket.getInputStream().readAllBytes(),
+                    java.nio.charset.StandardCharsets.ISO_8859_1);
+        }
+    }
+
+    /** Sends a compressed, masked frame the way a browser does with permessage-deflate. */
+    private static void wsSendCompressed(java.io.OutputStream out, WireFrame frame,
+            java.util.zip.Deflater deflater) throws IOException {
+        ByteArrayOutputStream plain = new ByteArrayOutputStream();
+        FrameCodec.writeFrame(plain, frame);
+        deflater.setInput(plain.toByteArray());
+        ByteArrayOutputStream packed = new ByteArrayOutputStream();
+        byte[] chunk = new byte[65_536];
+        int count;
+        do {
+            count = deflater.deflate(chunk, 0, chunk.length, java.util.zip.Deflater.SYNC_FLUSH);
+            packed.write(chunk, 0, count);
+        } while (count == chunk.length);
+        byte[] payload = java.util.Arrays.copyOf(packed.toByteArray(), packed.size() - 4);
+        byte[] mask = {0x21, 0x32, 0x43, 0x54};
+        ByteArrayOutputStream ws = new ByteArrayOutputStream();
+        ws.write(0xC2);
+        if (payload.length < 126) {
+            ws.write(0x80 | payload.length);
+        } else {
+            ws.write(0x80 | 126);
+            ws.write(payload.length >>> 8);
+            ws.write(payload.length);
+        }
+        ws.write(mask);
+        for (int index = 0; index < payload.length; index++) {
+            ws.write(payload[index] ^ mask[index & 3]);
+        }
+        out.write(ws.toByteArray());
+        out.flush();
+    }
+
+    private static WireFrame wsReadInflating(java.io.InputStream in, int opcode,
+            java.util.zip.Inflater inflater, AtomicBoolean sawCompressed) throws Exception {
+        while (true) {
+            int first = in.read();
+            long length = in.read() & 0x7F;
+            if (first < 0) {
+                throw new IOException("WebSocket closed");
+            }
+            if (length == 126) {
+                length = (in.read() << 8) | in.read();
+            } else if (length == 127) {
+                length = 0;
+                for (int index = 0; index < 8; index++) {
+                    length = (length << 8) | in.read();
+                }
+            }
+            byte[] payload = in.readNBytes((int) length);
+            if ((first & 0x40) != 0) {
+                sawCompressed.set(true);
+                ByteArrayOutputStream joined = new ByteArrayOutputStream();
+                joined.write(payload);
+                joined.write(new byte[] {0, 0, (byte) 0xFF, (byte) 0xFF});
+                inflater.setInput(joined.toByteArray());
+                ByteArrayOutputStream plain = new ByteArrayOutputStream();
+                byte[] chunk = new byte[65_536];
+                while (!inflater.needsInput()) {
+                    plain.write(chunk, 0, inflater.inflate(chunk));
+                }
+                payload = plain.toByteArray();
+            }
+            WireFrame frame = FrameCodec.readFrame(new ByteArrayInputStream(payload), Integer.MAX_VALUE);
+            if (frame.opcode() == WireOpcodes.EVT_ERROR) {
+                throw new AssertionError("Server error: " + KvPayloadCodec.decode(frame.payload()));
+            }
+            if (frame.opcode() == opcode) {
+                return frame;
+            }
         }
     }
 
