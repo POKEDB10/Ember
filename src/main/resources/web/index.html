@@ -21,7 +21,7 @@
     <p class="dim">say it · spark it · let it fade</p>
     <label>USERNAME<input id="user" autocomplete="username" required minlength="3" maxlength="20" pattern="[A-Za-z0-9_]+"></label>
     <label>PASSWORD<input id="pass" type="password" autocomplete="current-password" required minlength="8"></label>
-    <label id="nameRow" hidden>DISPLAY NAME<input id="displayName" autocomplete="nickname"></label>
+    <label id="nameRow" hidden>DISPLAY NAME<input id="displayName" autocomplete="nickname" maxlength="40"></label>
     <p id="loginError" class="error" role="alert"></p>
     <button id="loginBtn" type="submit">&gt; LOG IN</button>
     <button id="modeBtn" type="button" class="link">New here? Create an account</button>
@@ -30,37 +30,60 @@
 
 <div id="app" hidden>
   <aside class="window side">
-    <header class="titlebar"><span id="me">▣ CHATS</span>
+    <header class="titlebar"><span id="me">▣ EMBER</span>
       <span class="tools">
         <button id="themeBtn" class="icon" title="Change theme" aria-label="Change theme">◐</button>
         <button id="logoutBtn" class="icon" title="Log out" aria-label="Log out">⏻</button>
       </span></header>
-    <div class="row pad">
-      <input id="filter" type="search" placeholder="search…" aria-label="Search chats">
-    </div>
-    <div class="row pad gap">
-      <button id="newDm">+ DM</button><button id="newGroup">+ GROUP</button>
-    </div>
-    <ul id="chats" class="chats" aria-label="Conversations"></ul>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="chats" aria-selected="true">CHATS</button>
+      <button role="tab" data-tab="pulse" aria-selected="false">PULSE</button>
+      <button role="tab" data-tab="me" aria-selected="false">ME</button>
+    </nav>
+    <section id="tab-chats" class="tabpane">
+      <div class="row pad"><input id="filter" type="search" placeholder="search chats…" aria-label="Search chats"></div>
+      <div class="row pad gap"><button id="newDm">+ DM</button><button id="newGroup">+ GROUP</button></div>
+      <ul id="chats" class="list" aria-label="Conversations"></ul>
+    </section>
+    <section id="tab-pulse" class="tabpane" hidden>
+      <div class="row pad gap"><button id="newPost">+ POST</button><button id="newStory">+ STORY</button></div>
+      <p class="pad dim small">STORIES · 24 H</p>
+      <ul id="stories" class="list" aria-label="Stories"></ul>
+    </section>
+    <section id="tab-me" class="tabpane pad stack-s" hidden>
+      <div id="meCard"></div>
+      <button id="notifyBtn">🔔 DESKTOP ALERTS: OFF</button>
+    </section>
     <footer id="status" class="status dim">offline</footer>
   </aside>
 
   <section class="window chat">
     <header class="titlebar">
-      <span><button id="back" class="icon back" aria-label="Back to chats">◄</button>
-        <span id="chatTitle">▣ NO CHAT OPEN</span> <span id="chatSub" class="dim"></span></span>
-      <span class="tools"><button id="addMember" class="icon" title="Add member" aria-label="Add member" hidden>+👤</button></span>
+      <span class="ellipsis"><button id="back" class="icon back" aria-label="Back">◄</button>
+        <button id="chatTitle" class="title-btn">▣ EMBER</button> <span id="chatSub" class="dim"></span></span>
+      <span class="tools">
+        <button id="searchBtn" class="icon" title="Search this chat" aria-label="Search this chat" hidden>🔍</button>
+        <button id="pollBtn" class="icon" title="New poll" aria-label="New poll" hidden>📊</button>
+        <button id="addMember" class="icon" title="Add member" aria-label="Add member" hidden>+👤</button>
+      </span>
     </header>
-    <div id="messages" class="messages" aria-live="polite"></div>
+    <div id="searchBar" class="row pad" hidden><input id="search" type="search" placeholder="find in chat…" aria-label="Find in chat"></div>
+    <div id="polls" class="polls"></div>
+    <div id="content" class="content" aria-live="polite"></div>
     <div id="typing" class="typing dim"></div>
     <div id="replyBar" class="replybar" hidden><span id="replyText"></span><button id="replyCancel" class="icon" aria-label="Cancel reply">×</button></div>
-    <form id="composer" class="composer">
+    <form id="composer" class="composer" hidden>
       <button id="ttlBtn" type="button" class="icon" title="Disappear after 15 s" aria-pressed="false">⏱</button>
-      <textarea id="input" rows="1" placeholder="type a message_" aria-label="Message" disabled></textarea>
-      <button id="sendBtn" type="submit" disabled>SEND</button>
+      <textarea id="input" rows="1" placeholder="type a message_" aria-label="Message"></textarea>
+      <button id="sendBtn" type="submit">SEND</button>
     </form>
   </section>
 </div>
+<div id="overlay" class="overlay" hidden role="dialog" aria-modal="true" aria-label="Image viewer">
+  <figure><img id="overlayImg" alt=""><figcaption id="overlayCap"></figcaption></figure>
+  <button id="overlayClose" class="icon" aria-label="Close">×</button>
+</div>
+<input id="filePick" type="file" accept="image/png,image/jpeg,image/webp,image/heic" hidden>
 <div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>

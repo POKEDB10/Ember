@@ -1,5 +1,5 @@
 // Offline app shell: answer from cache instantly, refresh it in the background (ETag keeps that tiny).
-const CACHE = 'ember-v1';
+const CACHE = 'ember-v2';
 const SHELL = ['/', '/app.js', '/app.css', '/manifest.json', '/icon.svg'];
 self.addEventListener('install', (e) => e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener('activate', (e) => e.waitUntil(caches.keys()
