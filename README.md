@@ -2,7 +2,7 @@
 
 **Say it. Spark it. Let it fade.**
 
-Ember is a Java desktop messenger and campus social feed.
+Ember is a Java desktop and web messenger and campus social feed.
 
 The current build provides TLS 1.3 transport, a bounded wire protocol, registration/login, a themed Swing chat workspace, live 1:1 and group messaging, receipts, offline resume, private profiles with follow approval, block/report, disappearing messages, replies, reactions, edit/delete, pins/stars/search, 24-hour stories, group polls, and message forwarding. Campus Pulse supports validated image posts, likes, comments, and profile/story views. The server uses CRC-protected WAL storage with GZIP snapshot rotation, username lockout, rate limits, and audit events.
 
@@ -26,6 +26,17 @@ java -cp build\classes edu.ember.tools.ConcurrencyStressHarness
 ```
 
 On Unix-like systems, use the matching `scripts/build.sh`, `scripts/run.sh`, `scripts/run-tests.sh`, `scripts/run-server.sh`, and `scripts/run-client.sh` scripts.
+
+## Web app and multiple devices
+
+All messages live on the server, so an account can sign in on any number of machines at once (desktop app, browser, phone) and every device sees the full history plus live messages, including ones the same account sent from another device.
+
+- **Server address.** The server now listens on all network interfaces (`0.0.0.0`). Use `--bind 127.0.0.1` to keep it local-only.
+- **Web app.** The same port serves the web app: open `https://<server-host>:7443/`. It speaks the same binary protocol over a WebSocket, so every server rule applies unchanged. The page is about 30 KB, sent gzipped and revalidated by ETag, and a service worker caches it. Browsers can install it as an app ("Install app" / "Add to Home screen").
+- **Certificates.** `gen-keys` creates a self-signed certificate valid for `localhost` and `127.0.0.1` only. To reach the server from other machines, delete `config/ember-server.p12`, set the extra names, and regenerate, for example `set EMBER_HOSTS=ip:192.168.1.20,dns:mypc` then `scripts\gen-keys.bat`. Then copy the new `config/ember-client-trust.p12` to each desktop-client machine. Browsers show a warning for a self-signed certificate, which the user must accept once.
+- **Public website.** For a browser-trusted certificate, run a TLS reverse proxy (Caddy, nginx) in front of the web listener: `scripts/run-server.bat --http-port 8080`. This plain-HTTP listener binds to `127.0.0.1` only and serves the web app alone (no desktop frames), for example with Caddy: `chat.example.com { reverse_proxy 127.0.0.1:8080 }`. Behind a proxy, all clients appear to come from loopback, so the per-IP login limiter does not apply, but per-account lockout still does.
+
+**Limits.** Message length and image file size are unlimited. Kept on purpose: frames before login are capped at 4 KB, images over 4096 px per side or 16 MP are rejected (they decode to huge in-memory bitmaps), and the per-user flood limiter still applies.
 
 ## Local demo
 
