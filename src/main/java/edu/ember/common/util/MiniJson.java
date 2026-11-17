@@ -27,6 +27,28 @@ public final class MiniJson {
         return value;
     }
 
+    /** Writes a JSON string literal, escaping quotes, backslashes and control characters. */
+    public static String quote(String value) {
+        StringBuilder out = new StringBuilder(value.length() + 2).append('"');
+        for (char character : value.toCharArray()) {
+            switch (character) {
+                case '"' -> out.append("\\\"");
+                case '\\' -> out.append("\\\\");
+                case '\n' -> out.append("\\n");
+                case '\r' -> out.append("\\r");
+                case '\t' -> out.append("\\t");
+                default -> {
+                    if (character < 0x20) {
+                        out.append(String.format("\\u%04x", (int) character));
+                    } else {
+                        out.append(character);
+                    }
+                }
+            }
+        }
+        return out.append('"').toString();
+    }
+
     /** Follows a path of object keys, e.g. path(json, "data", "id"); null when any step is missing. */
     public static Object path(Object node, String... keys) {
         for (String key : keys) {
