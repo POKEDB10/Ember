@@ -4,7 +4,10 @@ import edu.ember.common.model.GroupChat;
 import edu.ember.common.security.PasswordHasher;
 import edu.ember.common.security.Pbkdf2PasswordHasher;
 import edu.ember.common.security.TlsSocketFactory;
+import edu.ember.server.storage.BlobStoreReplica;
 import edu.ember.server.storage.InMemoryStorageEngine;
+import edu.ember.server.storage.RootzBlobStore;
+import edu.ember.server.storage.StorageReplica;
 import edu.ember.server.storage.WalStorageEngine;
 import edu.ember.server.storage.StorageEngine;
 import java.io.IOException;
@@ -20,6 +23,7 @@ import javax.net.ssl.SSLServerSocket;
 public final class EmberServer implements AutoCloseable {
     private final SSLServerSocket serverSocket;
     private volatile java.net.ServerSocket httpSocket;
+    private volatile int maxFrameBytes = 25 * 1024 * 1024;
     private final StorageEngine storage;
     private final AuthService authService;
     private final GroupService groupService;
@@ -80,7 +84,9 @@ public final class EmberServer implements AutoCloseable {
     public EmberServer(Path keyStore, char[] password, int port, StorageEngine storage,
             SecurityAuditLogger auditLogger, Path mediaDirectory, int storyTtlSec,
             java.util.Set<String> adminUsernames, String bindAddress) throws Exception {
-        serverSocket = TlsSocketFactory.createServerSocket(keyStore, password, port, bindAddress);
+        // No keystore means web-only mode: a hosting proxy (Render, Caddy) terminates HTTPS.
+        serverSocket = keyStore == null ? null
+                : TlsSocketFactory.createServerSocket(keyStore, password, port, bindAddress);
         this.storage = storage;
         this.auditLogger = auditLogger;
         this.adminUsernames = adminUsernames.stream()
@@ -100,30 +106,39 @@ public final class EmberServer implements AutoCloseable {
         Path dataDirectory = Path.of("server_data");
         boolean strictDurability = true;
         boolean demoSeed = false;
+        boolean tls = true;
+        boolean rootz = false;
         int storyTtlSec = 86_400;
         java.util.Set<String> adminUsernames = new java.util.HashSet<>();
         String bindAddress = "0.0.0.0";
+        String httpBind = "127.0.0.1";
         int httpPort = -1;
+        int maxFrameMb = 25;
         for (int index = 0; index < args.length; index++) {
-            if (args[index].equals("--port")) {
-                port = Integer.parseInt(args[++index]);
-            } else if (args[index].equals("--storage")) {
-                dataDirectory = Path.of(args[++index]);
-            } else if (args[index].equals("--durability")) {
-                strictDurability = args[++index].equals("strict");
-            } else if (args[index].equals("--story-ttl-sec")) {
-                storyTtlSec = Integer.parseInt(args[++index]);
-            } else if (args[index].equals("--admin-user")) {
-                adminUsernames.add(args[++index]);
-            } else if (args[index].equals("--http-port")) {
-                httpPort = Integer.parseInt(args[++index]);
-            } else if (args[index].equals("--bind")) {
-                bindAddress = args[++index];
-            } else if (args[index].equals("--demo-seed")) {
-                demoSeed = true;
+            switch (args[index]) {
+                case "--port" -> port = Integer.parseInt(args[++index]);
+                case "--storage" -> dataDirectory = Path.of(args[++index]);
+                case "--durability" -> strictDurability = args[++index].equals("strict");
+                case "--story-ttl-sec" -> storyTtlSec = Integer.parseInt(args[++index]);
+                case "--admin-user" -> adminUsernames.add(args[++index]);
+                case "--http-port" -> httpPort = Integer.parseInt(args[++index]);
+                case "--http-bind" -> httpBind = args[++index];
+                case "--bind" -> bindAddress = args[++index];
+                case "--no-tls" -> tls = false;
+                case "--rootz" -> rootz = true;
+                case "--max-frame-mb" -> maxFrameMb = Integer.parseInt(args[++index]);
+                case "--demo-seed" -> demoSeed = true;
+                case "--new-storage-key" -> {
+                    byte[] key = new byte[32];
+                    new java.security.SecureRandom().nextBytes(key);
+                    System.out.println("EMBER_STORAGE_KEY="
+                            + java.util.Base64.getEncoder().encodeToString(key));
+                    return;
+                }
+                default -> throw new IllegalArgumentException("Unknown option: " + args[index]);
             }
         }
-        Path config = Path.of("config");
+        Path secrets = Path.of("config", "secrets.properties");
         if (demoSeed) {
             if (edu.ember.tools.DemoSeeder.seed(dataDirectory)) {
                 System.out.println("Demo accounts and sample content seeded.");
@@ -132,11 +147,23 @@ public final class EmberServer implements AutoCloseable {
             }
             adminUsernames.add("alice");
         }
-        char[] password = readStorePassword(config.resolve("secrets.properties"));
-        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, port,
-                new WalStorageEngine(dataDirectory, strictDurability),
+        StorageReplica replica = null;
+        if (rootz) {
+            byte[] key = java.util.Base64.getDecoder().decode(readSecret(secrets, "EMBER_STORAGE_KEY"));
+            if (key.length != 32) {
+                throw new IllegalArgumentException("EMBER_STORAGE_KEY must be 32 bytes in Base64");
+            }
+            replica = new BlobStoreReplica(new RootzBlobStore(readSecret(secrets, "ROOTZ_API_KEY"),
+                    readOptionalSecret(secrets, "ROOTZ_FOLDER_ID")),
+                    new javax.crypto.spec.SecretKeySpec(key, "AES"), 2_000);
+        }
+        EmberServer server = new EmberServer(
+                tls ? Path.of("config", "ember-server.p12") : null,
+                tls ? readSecret(secrets, "EMBER_KEYSTORE_PASS").toCharArray() : null, port,
+                new WalStorageEngine(dataDirectory, strictDurability, replica),
                 new SecurityAuditLogger(Path.of("logs", "security-audit.json")),
                 dataDirectory.resolve("media"), storyTtlSec, adminUsernames, bindAddress);
+        server.setMaxFrameBytes(maxFrameMb * 1024 * 1024);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 server.close();
@@ -146,27 +173,49 @@ public final class EmberServer implements AutoCloseable {
             }
         }, "ember-server-shutdown"));
         server.start();
-        System.out.println("Ember server listening on " + bindAddress + ":" + server.port()
-                + " (desktop app, and web app at https://<this-host>:" + server.port() + "/)");
+        if (tls) {
+            System.out.println("Ember server listening on " + bindAddress + ":" + server.port()
+                    + " (desktop app, and web app at https://<this-host>:" + server.port() + "/)");
+        }
         if (httpPort >= 0) {
-            System.out.println("Web app for a local reverse proxy at http://127.0.0.1:"
-                    + server.startHttp(httpPort) + "/");
+            System.out.println("Web app (plain HTTP, for a TLS proxy) on http://" + httpBind + ":"
+                    + server.startHttp(httpPort, httpBind) + "/");
         }
         new java.util.concurrent.CountDownLatch(1).await();
     }
 
-    private static char[] readStorePassword(Path path) throws IOException {
-        for (String line : java.nio.file.Files.readAllLines(path,
-                java.nio.charset.StandardCharsets.UTF_8)) {
-            if (line.startsWith("EMBER_KEYSTORE_PASS=")) {
-                return line.substring("EMBER_KEYSTORE_PASS=".length()).toCharArray();
+    /** Environment variable first (hosting dashboards), then config/secrets.properties. */
+    private static String readSecret(Path secrets, String name) throws IOException {
+        String value = readOptionalSecret(secrets, name);
+        if (value == null) {
+            throw new IOException(name + " is not set (environment or config/secrets.properties)");
+        }
+        return value;
+    }
+
+    private static String readOptionalSecret(Path secrets, String name) throws IOException {
+        String fromEnvironment = System.getenv(name);
+        if (fromEnvironment != null && !fromEnvironment.isBlank()) {
+            return fromEnvironment.strip();
+        }
+        if (java.nio.file.Files.exists(secrets)) {
+            for (String line : java.nio.file.Files.readAllLines(secrets,
+                    java.nio.charset.StandardCharsets.UTF_8)) {
+                if (line.startsWith(name + "=") && !line.substring(name.length() + 1).isBlank()) {
+                    return line.substring(name.length() + 1).strip();
+                }
             }
         }
-        throw new IOException("Keystore password missing from config/secrets.properties");
+        return null;
+    }
+
+    /** Largest frame a signed-in client may send; keeps one huge upload from exhausting memory. */
+    public void setMaxFrameBytes(int bytes) {
+        maxFrameBytes = bytes;
     }
 
     public int port() {
-        return serverSocket.getLocalPort();
+        return serverSocket == null ? -1 : serverSocket.getLocalPort();
     }
 
     private boolean isAdminUser(String username) {
@@ -184,17 +233,24 @@ public final class EmberServer implements AutoCloseable {
     public void start() {
         autoSaveThread.start();
         expiryReaperThread.start();
-        Thread acceptThread = new Thread(() -> acceptLoop(serverSocket), "ember-tls-accept");
-        acceptThread.setDaemon(true);
-        acceptThread.start();
+        if (serverSocket != null) {
+            Thread acceptThread = new Thread(() -> acceptLoop(serverSocket), "ember-tls-accept");
+            acceptThread.setDaemon(true);
+            acceptThread.start();
+        }
+    }
+
+    public int startHttp(int port) throws IOException {
+        return startHttp(port, "127.0.0.1");
     }
 
     /**
-     * Plain-HTTP web app listener on loopback only, for a TLS reverse proxy (Caddy, nginx) that
-     * holds a browser-trusted certificate. Serves web pages and WebSockets, never desktop frames.
+     * Plain-HTTP web listener for a TLS proxy (Render, Caddy, cloudflared) that holds a
+     * browser-trusted certificate. Serves web pages and WebSockets, never raw desktop frames.
+     * Bind 127.0.0.1 when the proxy runs on this machine; 0.0.0.0 only inside a hosting platform.
      */
-    public int startHttp(int port) throws IOException {
-        httpSocket = new java.net.ServerSocket(port, 50, java.net.InetAddress.getLoopbackAddress());
+    public int startHttp(int port, String bindAddress) throws IOException {
+        httpSocket = new java.net.ServerSocket(port, 50, java.net.InetAddress.getByName(bindAddress));
         Thread acceptThread = new Thread(() -> acceptLoop(httpSocket), "ember-http-accept");
         acceptThread.setDaemon(true);
         acceptThread.start();
@@ -206,7 +262,9 @@ public final class EmberServer implements AutoCloseable {
         running.set(false);
         autoSaveThread.interrupt();
         expiryReaperThread.interrupt();
-        serverSocket.close();
+        if (serverSocket != null) {
+            serverSocket.close();
+        }
         if (httpSocket != null) {
             httpSocket.close();
         }
@@ -256,13 +314,35 @@ public final class EmberServer implements AutoCloseable {
         private java.io.OutputStream output;
         private String userId;
         private String token;
+        /** Who the login rate limiter sees: the socket peer, or the proxy-reported client. */
+        private java.net.InetAddress clientAddress;
 
         private ConnectionHandler(java.net.Socket socket) {
             this.socket = socket;
+            this.clientAddress = socket.getInetAddress();
+        }
+
+        /**
+         * Behind the plain-HTTP listener every peer is the proxy, so use the last
+         * X-Forwarded-For entry (the one the proxy itself appended, which a client cannot forge).
+         */
+        private void useForwardedClient(String forwardedFor) {
+            if (forwardedFor == null || socket instanceof javax.net.ssl.SSLSocket) {
+                return;
+            }
+            String last = forwardedFor.substring(forwardedFor.lastIndexOf(',') + 1).strip();
+            if (last.matches("[0-9a-fA-F:.]{2,45}")) { // IP literal only, so no DNS lookup happens
+                try {
+                    clientAddress = java.net.InetAddress.getByName(last);
+                } catch (java.net.UnknownHostException ignored) {
+                    // Keep the socket peer.
+                }
+            }
         }
 
         @Override
         public void run() {
+            WebGateway.Upgrade upgrade = null;
             try (socket) {
                 socket.setSoTimeout(45_000);
                 if (socket instanceof javax.net.ssl.SSLSocket tls) {
@@ -277,18 +357,20 @@ public final class EmberServer implements AutoCloseable {
                     return; // the plain listener is web-only; desktop frames need TLS
                 }
                 if (http) {
-                    WebGateway.Upgrade upgrade = WebGateway.serve(input, output);
+                    upgrade = WebGateway.serve(input, output, EmberServer.this::loadMedia,
+                            () -> edu.ember.common.protocol.FrameCodec.HEADER_BYTES + (userId == null ? 4096 : maxFrameBytes));
                     if (upgrade == null) {
                         return;
                     }
                     input = upgrade.input();
                     output = upgrade.output();
+                    useForwardedClient(upgrade.forwardedFor());
                 }
                 while (running.get() && !socket.isClosed()) {
                     try {
-                        // Before login only small frames; after login there is no size cap.
+                        // Before login only small frames; after login up to --max-frame-mb.
                         var frame = edu.ember.common.protocol.FrameCodec.readFrame(input,
-                                userId == null ? 4096 : Integer.MAX_VALUE);
+                                userId == null ? 4096 : maxFrameBytes);
                         route(frame);
                     } catch (IOException | edu.ember.common.exceptions.EmberException exception) {
                         break;
@@ -299,6 +381,11 @@ public final class EmberServer implements AutoCloseable {
                         .log(Level.FINE, "Client connection ended", exception);
             } finally {
                 disconnect(this);
+                if (upgrade != null) {
+                    synchronized (outputLock) {
+                        upgrade.release();
+                    }
+                }
             }
         }
 
@@ -306,8 +393,8 @@ public final class EmberServer implements AutoCloseable {
             try {
                 if ((frame.opcode() == edu.ember.common.protocol.WireOpcodes.CMD_AUTH_LOGIN
                         || frame.opcode() == edu.ember.common.protocol.WireOpcodes.CMD_AUTH_REGISTER)
-                        && !authRateLimiter.allow(socket.getInetAddress())) {
-                    auditLogger.log("rate_limited", "unknown", socket.getInetAddress().getHostAddress());
+                        && !authRateLimiter.allow(clientAddress)) {
+                    auditLogger.log("rate_limited", "unknown", clientAddress.getHostAddress());
                     sendError(frame.correlationId(), "429", "Too many requests");
                     return;
                 }
@@ -543,6 +630,9 @@ public final class EmberServer implements AutoCloseable {
             send(edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_GROUP_UPDATE,
                     frame.correlationId(), groupFields(group)));
+            for (var poll : storage.pollsForGroup(groupId)) {
+                send(pollEvent(poll)); // so polls survive a page reload or a new device
+            }
         }
 
         private void updateProfile(edu.ember.common.protocol.WireFrame frame) throws IOException,
@@ -780,6 +870,13 @@ public final class EmberServer implements AutoCloseable {
 
         private void sendPollUpdate(edu.ember.common.model.PollData poll) throws IOException,
                 edu.ember.common.exceptions.AuthorizationException {
+            var event = pollEvent(poll);
+            for (String member : groupService.memberIds(poll.groupId())) {
+                sendToUser(member, event, null);
+            }
+        }
+
+        private edu.ember.common.protocol.WireFrame pollEvent(edu.ember.common.model.PollData poll) {
             java.util.Map<String, String> fields = new java.util.HashMap<>();
             fields.put("pollId", poll.pollId()); fields.put("groupId", poll.groupId());
             fields.put("question", poll.question());
@@ -796,11 +893,8 @@ public final class EmberServer implements AutoCloseable {
                     if (row[option] == 1) { fields.put("vote." + index, Integer.toString(option)); }
                 }
             }
-            var event = edu.ember.common.protocol.FrameFactory.event(
+            return edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_POLL_UPDATE, 0, fields);
-            for (String member : groupService.memberIds(poll.groupId())) {
-                sendToUser(member, event, null);
-            }
         }
 
         private void interactPost(edu.ember.common.protocol.WireFrame frame) throws IOException,
@@ -1277,6 +1371,19 @@ public final class EmberServer implements AutoCloseable {
             }
         }
 
+    }
+
+    /** Serves /media/ID to the browser: the session token must belong to a user allowed to see it. */
+    private byte[] loadMedia(String sessionToken, String mediaId, boolean thumbnail) throws IOException {
+        String viewer = sessions.findUserId(sessionToken);
+        if (viewer == null) {
+            return null;
+        }
+        try {
+            return socialFeedService.media(viewer, mediaId, thumbnail);
+        } catch (edu.ember.common.exceptions.EmberException | java.nio.file.NoSuchFileException exception) {
+            return null;
+        }
     }
 
     /** Sends to every device the user is signed in on; one dead device never fails the caller. */

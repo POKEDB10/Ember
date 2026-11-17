@@ -39,6 +39,15 @@ public final class SocialFeedService {
         this.mediaDirectory = mediaDirectory.toAbsolutePath().normalize();
         this.storyTtlSec = storyTtlSec;
         Files.createDirectories(this.mediaDirectory);
+        // Moving an existing server onto a replica: copy local images that are not there yet.
+        try (var files = Files.list(this.mediaDirectory)) {
+            for (Path file : files.toList()) {
+                String name = file.getFileName().toString();
+                if (Files.isRegularFile(file) && !storage.isMediaMirrored(name)) {
+                    storage.mirrorMedia(name, Files.readAllBytes(file));
+                }
+            }
+        }
     }
 
     public StoryItem createStory(String owner, String mediaId, String caption)
@@ -140,6 +149,8 @@ public final class SocialFeedService {
             MediaAsset asset = new MediaAsset(id, owner, fullName, thumbName,
                     checked.width(), checked.height(), System.currentTimeMillis());
             storage.saveMedia(asset);
+            storage.mirrorMedia(fullName, checked.fullJpeg());
+            storage.mirrorMedia(thumbName, checked.thumbnailJpeg());
             return asset;
         } catch (IOException exception) {
             Files.deleteIfExists(fullPath);
@@ -235,7 +246,17 @@ public final class SocialFeedService {
             throw new ResourceNotFoundException("Media not found");
         }
         String fileName = thumbnail ? match.get().thumbnailFileName() : match.get().fileName();
-        return Files.readAllBytes(safePath(fileName));
+        Path local = safePath(fileName);
+        if (!Files.exists(local)) {
+            // Fresh server disk: fetch from the replica once, then serve from the local cache.
+            byte[] remote = storage.fetchMirroredMedia(fileName);
+            if (remote == null) {
+                throw new ResourceNotFoundException("Media not found");
+            }
+            Files.write(local, remote);
+            return remote;
+        }
+        return Files.readAllBytes(local);
     }
 
     public boolean isBlocked(String firstUserId, String secondUserId) throws IOException {

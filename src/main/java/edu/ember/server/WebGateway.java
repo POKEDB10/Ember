@@ -14,15 +14,24 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.IntSupplier;
+import java.util.zip.DataFormatException;
+import java.util.zip.Deflater;
+import java.util.zip.Inflater;
 
 /**
- * Lets browsers use the same TLS port as the desktop app: serves the web app's static files and
- * upgrades to a WebSocket that carries the unchanged binary Ember frames, so every server rule
- * applies to web users too. @concept Adapter pattern, streams
+ * Lets browsers use the same server as the desktop app: serves the web app's static files and
+ * images, and upgrades to a WebSocket that carries the unchanged binary Ember frames, so every
+ * server rule applies to web users too. WebSocket traffic is compressed (permessage-deflate)
+ * when the browser offers it. @concept Adapter pattern, streams, compression
  */
 final class WebGateway {
     private static final String WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private static final int MAX_LINE = 8192;
+    /** Deflate's sync-flush marker: stripped when sending, appended before inflating (RFC 7692). */
+    private static final byte[] DEFLATE_TAIL = {0, 0, (byte) 0xFF, (byte) 0xFF};
+    /** Messages smaller than this are not worth compressing. */
+    private static final int COMPRESS_MIN_BYTES = 96;
     /** Allowlist of served files; anything else is 404, so no path traversal is possible. */
     private static final Map<String, String> FILES = Map.of(
             "/", "index.html", "/index.html", "index.html", "/app.js", "app.js",
@@ -32,9 +41,25 @@ final class WebGateway {
             "html", "text/html; charset=utf-8", "js", "text/javascript; charset=utf-8",
             "css", "text/css; charset=utf-8", "json", "application/manifest+json",
             "svg", "image/svg+xml");
+    private static final String SECURITY_HEADERS = "\r\nX-Content-Type-Options: nosniff"
+            + "\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self';"
+            + " img-src 'self' blob: data:; connect-src 'self'; frame-ancestors 'none'";
     private static final Map<String, Asset> CACHE = new ConcurrentHashMap<>();
 
-    record Upgrade(InputStream input, OutputStream output) { }
+    /** Loads an image for a signed-in viewer, or returns null when it is missing or not visible. */
+    @FunctionalInterface
+    interface MediaSource {
+        byte[] load(String sessionToken, String mediaId, boolean thumbnail) throws IOException;
+    }
+
+    /** forwardedFor is the X-Forwarded-For header, or null. */
+    record Upgrade(WsInput input, WsOutput output, String forwardedFor) {
+        /** Frees the native compression buffers; call once the connection has ended. */
+        void release() {
+            input.end();
+            output.end();
+        }
+    }
 
     private record Asset(byte[] gzip, String etag, String type) { }
 
@@ -45,11 +70,16 @@ final class WebGateway {
         input.mark(4);
         byte[] head = input.readNBytes(4);
         input.reset();
-        return Arrays.equals(head, "GET ".getBytes(StandardCharsets.US_ASCII));
+        return Arrays.equals(head, "GET ".getBytes(StandardCharsets.US_ASCII))
+                || Arrays.equals(head, "HEAD".getBytes(StandardCharsets.US_ASCII));
     }
 
-    /** Answers one HTTP request; returns WebSocket streams on upgrade, or null after a file. */
-    static Upgrade serve(InputStream in, OutputStream out) throws IOException {
+    /**
+     * Answers one HTTP request. Returns WebSocket streams on upgrade, or null after a response.
+     * maxMessage caps one incoming WebSocket message, checked while it arrives.
+     */
+    static Upgrade serve(InputStream in, OutputStream out, MediaSource media, IntSupplier maxMessage)
+            throws IOException {
         String[] request = readLine(in).split(" ");
         Map<String, String> headers = new HashMap<>();
         for (String line = readLine(in); !line.isEmpty(); line = readLine(in)) {
@@ -62,33 +92,73 @@ final class WebGateway {
                 throw new IOException("Too many headers");
             }
         }
-        String path = request.length > 1 ? request[1].split("\\?", 2)[0] : "";
+        String[] target = request.length > 1 ? request[1].split("\\?", 2) : new String[] {""};
+        String path = target[0];
+        String query = target.length > 1 ? target[1] : "";
         String key = headers.get("sec-websocket-key");
         if ("websocket".equalsIgnoreCase(headers.get("upgrade")) && key != null) {
+            boolean deflate = headers.getOrDefault("sec-websocket-extensions", "")
+                    .contains("permessage-deflate");
             write(out, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-                    + "Connection: Upgrade\r\nSec-WebSocket-Accept: " + acceptKey(key) + "\r\n\r\n");
+                    + "Connection: Upgrade\r\nSec-WebSocket-Accept: " + acceptKey(key)
+                    + (deflate ? "\r\nSec-WebSocket-Extensions: permessage-deflate" : "") + "\r\n\r\n");
             out.flush();
-            return new Upgrade(new WsInput(in, out), new WsOutput(out));
+            return new Upgrade(new WsInput(in, out, maxMessage, deflate), new WsOutput(out, deflate),
+                    headers.get("x-forwarded-for"));
         }
-        Asset asset = FILES.containsKey(path) ? asset(FILES.get(path)) : null;
+        boolean head = request[0].equals("HEAD");
+        if (path.equals("/health")) {
+            // Uptime monitors ping this to keep a sleeping free host awake; it touches no data.
+            write(out, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2"
+                    + "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + (head ? "" : "ok"));
+        } else if (path.startsWith("/media/")) {
+            serveMedia(out, media, headers.getOrDefault("authorization", ""),
+                    path.substring("/media/".length()), !query.contains("full=1"), head);
+        } else {
+            serveFile(out, FILES.containsKey(path) ? asset(FILES.get(path)) : null,
+                    headers.get("if-none-match"), head);
+        }
+        out.flush();
+        return null;
+    }
+
+    /** Images never change once uploaded, so the browser may cache them for a year. */
+    private static void serveMedia(OutputStream out, MediaSource media, String authorization,
+            String mediaId, boolean thumbnail, boolean head) throws IOException {
+        byte[] image = null;
+        // The ID is only a lookup key (never a file path); still keep it to safe characters.
+        if (authorization.startsWith("Bearer ") && mediaId.matches("[A-Za-z0-9_-]{1,64}")) {
+            image = media.load(authorization.substring(7).strip(), mediaId, thumbnail);
+        }
+        if (image == null) {
+            write(out, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return;
+        }
+        write(out, "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: " + image.length
+                + "\r\nCache-Control: private, max-age=31536000, immutable" + SECURITY_HEADERS
+                + "\r\nConnection: close\r\n\r\n");
+        if (!head) {
+            out.write(image);
+        }
+    }
+
+    private static void serveFile(OutputStream out, Asset asset, String ifNoneMatch, boolean head)
+            throws IOException {
         if (asset == null) {
             write(out, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        } else if (asset.etag().equals(headers.get("if-none-match"))) {
+        } else if (asset.etag().equals(ifNoneMatch)) {
             write(out, "HTTP/1.1 304 Not Modified\r\nETag: " + asset.etag()
                     + "\r\nConnection: close\r\n\r\n");
         } else {
             // Every browser since 2010 accepts gzip; serving only the compressed copy keeps it simple.
             write(out, "HTTP/1.1 200 OK\r\nContent-Type: " + asset.type()
                     + "\r\nContent-Encoding: gzip\r\nContent-Length: " + asset.gzip().length
-                    + "\r\nETag: " + asset.etag() + "\r\nCache-Control: no-cache"
-                    + "\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer"
-                    + "\r\nContent-Security-Policy: default-src 'self'; img-src 'self' blob: data:;"
-                    + " connect-src 'self'; frame-ancestors 'none'"
+                    + "\r\nETag: " + asset.etag() + "\r\nCache-Control: no-cache" + SECURITY_HEADERS
                     + "\r\nConnection: close\r\n\r\n");
-            out.write(asset.gzip());
+            if (!head) {
+                out.write(asset.gzip());
+            }
         }
-        out.flush();
-        return null;
     }
 
     private static Asset asset(String name) throws IOException {
@@ -147,17 +217,24 @@ final class WebGateway {
         out.write(text.getBytes(StandardCharsets.ISO_8859_1));
     }
 
-    /** Reads WebSocket frames from the browser and exposes their payload bytes as one stream. */
+    /**
+     * Reads whole WebSocket messages from the browser (inflating compressed ones) and exposes
+     * their bytes as one stream. Size is checked while a message arrives, so an oversized or
+     * compression-bomb message is refused before it fills memory.
+     */
     static final class WsInput extends InputStream {
         private final InputStream in;
         private final OutputStream raw;
-        private final byte[] mask = new byte[4];
-        private long remaining;
-        private int maskIndex;
+        private final IntSupplier maxMessage;
+        private final Inflater inflater;
+        private byte[] current = new byte[0];
+        private int position;
 
-        WsInput(InputStream in, OutputStream raw) {
+        WsInput(InputStream in, OutputStream raw, IntSupplier maxMessage, boolean deflate) {
             this.in = in;
             this.raw = raw;
+            this.maxMessage = maxMessage;
+            this.inflater = deflate ? new Inflater(true) : null;
         }
 
         @Override
@@ -171,69 +248,122 @@ final class WebGateway {
             if (length == 0) {
                 return 0;
             }
-            while (remaining == 0) {
-                if (!nextFrame()) {
+            while (position == current.length) {
+                if (!nextMessage()) {
                     return -1;
                 }
             }
-            int count = in.read(buffer, offset, (int) Math.min(length, remaining));
-            if (count < 0) {
-                return -1;
-            }
-            for (int index = offset; index < offset + count; index++) {
-                buffer[index] ^= mask[maskIndex++ & 3];
-            }
-            remaining -= count;
+            int count = Math.min(length, current.length - position);
+            System.arraycopy(current, position, buffer, offset, count);
+            position += count;
             return count;
         }
 
-        /** Reads one frame header; answers pings itself; false means the browser closed. */
-        private boolean nextFrame() throws IOException {
-            int first = in.read();
-            int second = in.read();
-            if (first < 0 || second < 0) {
-                return false;
+        void end() {
+            if (inflater != null) {
+                inflater.end();
             }
-            int opcode = first & 0x0F;
-            long length = second & 0x7F;
-            if (length == 126) {
-                length = (readByte() << 8) | readByte();
-            } else if (length == 127) {
-                length = 0;
-                for (int index = 0; index < 8; index++) {
-                    length = (length << 8) | readByte();
+        }
+
+        /** Reads frames until one message is complete; answers pings; false when closed. */
+        private boolean nextMessage() throws IOException {
+            ByteArrayOutputStream message = new ByteArrayOutputStream();
+            boolean compressed = false;
+            boolean first = true;
+            int limit = maxMessage.getAsInt() + 64;
+            while (true) {
+                int head = in.read();
+                int second = in.read();
+                if (head < 0 || second < 0) {
+                    return false;
                 }
-            }
-            if ((second & 0x80) == 0 || length < 0) {
-                throw new IOException("Browser frames must be masked");
-            }
-            for (int index = 0; index < 4; index++) {
-                mask[index] = (byte) readByte();
-            }
-            maskIndex = 0;
-            if (opcode == 0x8) {
-                return false;
-            }
-            if (opcode >= 0x8) {
-                if (length > 125) {
-                    throw new IOException("Control frame too long");
-                }
-                byte[] payload = in.readNBytes((int) length);
-                for (int index = 0; index < payload.length; index++) {
-                    payload[index] ^= mask[index & 3];
-                }
-                if (opcode == 0x9) {
-                    synchronized (raw) {
-                        raw.write(0x8A);
-                        raw.write(payload.length);
-                        raw.write(payload);
-                        raw.flush();
+                int opcode = head & 0x0F;
+                long length = second & 0x7F;
+                if (length == 126) {
+                    length = (readByte() << 8) | readByte();
+                } else if (length == 127) {
+                    length = 0;
+                    for (int index = 0; index < 8; index++) {
+                        length = (length << 8) | readByte();
                     }
                 }
-                return true;
+                if ((second & 0x80) == 0 || length < 0) {
+                    throw new IOException("Browser frames must be masked");
+                }
+                byte[] mask = in.readNBytes(4);
+                if (opcode >= 0x8) {
+                    if (length > 125) {
+                        throw new IOException("Control frame too long");
+                    }
+                    byte[] payload = unmask(in.readNBytes((int) length), mask);
+                    if (opcode == 0x8) {
+                        return false;
+                    }
+                    if (opcode == 0x9) {
+                        synchronized (raw) {
+                            raw.write(0x8A);
+                            raw.write(payload.length);
+                            raw.write(payload);
+                            raw.flush();
+                        }
+                    }
+                    continue;
+                }
+                if (first) {
+                    compressed = (head & 0x40) != 0;
+                    first = false;
+                }
+                if (message.size() + length > limit) {
+                    throw new IOException("WebSocket message too large");
+                }
+                byte[] payload = in.readNBytes((int) length);
+                if (payload.length != length) {
+                    throw new EOFException("WebSocket frame ended early");
+                }
+                message.writeBytes(unmask(payload, mask));
+                if ((head & 0x80) != 0) {
+                    break;
+                }
             }
-            remaining = length;
+            current = compressed ? inflate(message, limit) : message.toByteArray();
+            position = 0;
             return true;
+        }
+
+        private byte[] inflate(ByteArrayOutputStream compressed, int limit) throws IOException {
+            if (inflater == null) {
+                throw new IOException("Compressed message without negotiated compression");
+            }
+            compressed.writeBytes(DEFLATE_TAIL);
+            inflater.setInput(compressed.toByteArray());
+            ByteArrayOutputStream plain = new ByteArrayOutputStream();
+            byte[] chunk = new byte[16_384];
+            try {
+                while (!inflater.needsInput()) {
+                    if (inflater.finished()) {
+                        inflater.reset(); // the client ended its stream: next message starts fresh
+                        break;
+                    }
+                    int count = inflater.inflate(chunk);
+                    plain.write(chunk, 0, count);
+                    if (plain.size() > limit) {
+                        throw new IOException("WebSocket message too large");
+                    }
+                    if (count == 0 && inflater.needsDictionary()) {
+                        throw new IOException("Unexpected deflate dictionary");
+                    }
+                }
+            } catch (DataFormatException exception) {
+                throw new IOException("Corrupt compressed message", exception);
+            }
+            return plain.toByteArray();
+        }
+
+        private static byte[] unmask(byte[] payload, byte[] mask) {
+            for (int index = 0; index < payload.length; index++) {
+                payload[index] ^= mask[index & 3];
+            }
+            return payload;
         }
 
         private int readByte() throws IOException {
@@ -249,9 +379,12 @@ final class WebGateway {
     static final class WsOutput extends OutputStream {
         private final OutputStream raw;
         private final ByteArrayOutputStream pending = new ByteArrayOutputStream();
+        /** Keeps its window between messages, so repeated field names compress to almost nothing. */
+        private final Deflater deflater;
 
-        WsOutput(OutputStream raw) {
+        WsOutput(OutputStream raw, boolean deflate) {
             this.raw = raw;
+            this.deflater = deflate ? new Deflater(Deflater.DEFAULT_COMPRESSION, true) : null;
         }
 
         @Override
@@ -269,9 +402,15 @@ final class WebGateway {
             if (pending.size() == 0) {
                 return;
             }
-            int size = pending.size();
+            byte[] payload = pending.toByteArray();
+            pending.reset();
+            boolean compress = deflater != null && payload.length >= COMPRESS_MIN_BYTES;
+            if (compress) {
+                payload = deflate(payload);
+            }
             synchronized (raw) {
-                raw.write(0x82);
+                raw.write(compress ? 0xC2 : 0x82); // FIN + binary, RSV1 marks compression
+                int size = payload.length;
                 if (size < 126) {
                     raw.write(size);
                 } else if (size < 65_536) {
@@ -284,10 +423,28 @@ final class WebGateway {
                         raw.write((int) ((long) size >>> shift));
                     }
                 }
-                pending.writeTo(raw);
+                raw.write(payload);
                 raw.flush();
             }
-            pending.reset();
+        }
+
+        void end() {
+            if (deflater != null) {
+                deflater.end();
+            }
+        }
+
+        private byte[] deflate(byte[] plain) {
+            deflater.setInput(plain);
+            ByteArrayOutputStream packed = new ByteArrayOutputStream(plain.length / 2 + 16);
+            byte[] chunk = new byte[16_384];
+            int count;
+            do {
+                count = deflater.deflate(chunk, 0, chunk.length, Deflater.SYNC_FLUSH);
+                packed.write(chunk, 0, count);
+            } while (count == chunk.length);
+            byte[] result = packed.toByteArray();
+            return Arrays.copyOf(result, result.length - DEFLATE_TAIL.length);
         }
     }
 }
