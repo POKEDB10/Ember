@@ -4,7 +4,7 @@
 
 Ember is a Java desktop and web messenger and campus social feed.
 
-The current build provides TLS 1.3 transport, a bounded wire protocol, registration/login, a themed Swing chat workspace, live 1:1 and group messaging, receipts, offline resume, private profiles with follow approval, block/report, disappearing messages, replies, reactions, edit/delete, pins/stars/search, 24-hour stories, group polls, and message forwarding. Campus Pulse supports validated image posts, likes, comments, and profile/story views. The server uses CRC-protected WAL storage with GZIP snapshot rotation, username lockout, rate limits, and audit events.
+The current build provides a website (installable as an app) and a Swing desktop app that share one server and work across any number of devices per account, TLS 1.3 transport, a bounded wire protocol, registration/login, a themed Swing chat workspace, live 1:1 and group messaging, receipts, offline resume, private profiles with follow approval, block/report, disappearing messages, replies, reactions, edit/delete, pins/stars/search, 24-hour stories, group polls, and message forwarding. Campus Pulse supports validated image posts, likes, comments, and profile/story views. The server uses CRC-protected WAL storage with GZIP snapshot rotation (optionally mirrored, encrypted, to rootz.so), username lockout, rate limits, and audit events.
 
 ## Requirements
 
@@ -27,16 +27,38 @@ java -cp build\classes edu.ember.tools.ConcurrencyStressHarness
 
 On Unix-like systems, use the matching `scripts/build.sh`, `scripts/run.sh`, `scripts/run-tests.sh`, `scripts/run-server.sh`, and `scripts/run-client.sh` scripts.
 
-## Web app and multiple devices
+## Website, app, and multiple devices
 
-All messages live on the server, so an account can sign in on any number of machines at once (desktop app, browser, phone) and every device sees the full history plus live messages, including ones the same account sent from another device.
+All messages live on the server, so an account can sign in on any number of devices at once (website, installed web app, Swing desktop app) and every device sees the full history plus live messages, including ones the same account sent from another device.
 
-- **Server address.** The server now listens on all network interfaces (`0.0.0.0`). Use `--bind 127.0.0.1` to keep it local-only.
-- **Web app.** The same port serves the web app: open `https://<server-host>:7443/`. It speaks the same binary protocol over a WebSocket, so every server rule applies unchanged. The page is about 30 KB, sent gzipped and revalidated by ETag, and a service worker caches it. Browsers can install it as an app ("Install app" / "Add to Home screen").
-- **Certificates.** `gen-keys` creates a self-signed certificate valid for `localhost` and `127.0.0.1` only. To reach the server from other machines, delete `config/ember-server.p12`, set the extra names, and regenerate, for example `set EMBER_HOSTS=ip:192.168.1.20,dns:mypc` then `scripts\gen-keys.bat`. Then copy the new `config/ember-client-trust.p12` to each desktop-client machine. Browsers show a warning for a self-signed certificate, which the user must accept once.
-- **Public website.** For a browser-trusted certificate, run a TLS reverse proxy (Caddy, nginx) in front of the web listener: `scripts/run-server.bat --http-port 8080`. This plain-HTTP listener binds to `127.0.0.1` only and serves the web app alone (no desktop frames), for example with Caddy: `chat.example.com { reverse_proxy 127.0.0.1:8080 }`. Behind a proxy, all clients appear to come from loopback, so the per-IP login limiter does not apply, but per-account lockout still does.
+- **Website.** The server also serves a web client (plain HTML/CSS/JS, about 60 KB, gzipped, ETag-revalidated and cached by a service worker). It speaks the same binary protocol over a compressed WebSocket (`permessage-deflate`), so every server rule applies unchanged. Features: direct and group chat, replies, reactions, edit/delete, disappearing messages, typing and presence, group polls, in-chat search, Campus Pulse photo posts with likes and comments, 24-hour stories, profiles with follow/block/report, three retro themes, and desktop notifications. Photos are shrunk in the browser (max 1600 px JPEG) before upload, and images load over plain HTTP with a one-year private cache, so each one downloads once per device. Browsers can install it as an app ("Install app" / "Add to Home screen").
+- **Desktop app.** `scripts/run-client.bat --url https://ember.example.com` connects the Swing app to a hosted website over the same WebSocket (no local keys needed). Without `--url` it uses the direct TLS socket as before.
+- **Server options.** `--bind` (TLS listener address, default `0.0.0.0`), `--no-tls` (web-only), `--http-port` / `--http-bind` (plain-HTTP web listener for an HTTPS proxy; default bind `127.0.0.1`), `--max-frame-mb` (largest message or upload after login, default 25), `--rootz` (off-server storage, below), `--new-storage-key` (prints a fresh encryption key).
+- **Health check.** `GET /health` returns `ok` without touching data, for uptime monitors.
+- **Self-hosting with TLS.** The TLS port also serves the website at `https://<host>:7443/`. `gen-keys` makes a self-signed certificate for `localhost`/`127.0.0.1`; add names with `EMBER_HOSTS=ip:192.168.1.20,dns:mypc` (delete `config/ember-server.p12` first) and copy the new `config/ember-client-trust.p12` to desktop-client machines.
 
-**Limits.** Message length and image file size are unlimited. Kept on purpose: frames before login are capped at 4 KB, images over 4096 px per side or 16 MP are rejected (they decode to huge in-memory bitmaps), and the per-user flood limiter still applies.
+**Limits.** Message length and upload size are capped only by `--max-frame-mb` (default 25 MB) so one upload cannot exhaust server memory. Frames before login are capped at 4 KB, images over 4096 px per side or 16 MP are rejected, and the per-user flood limiter still applies. Behind a proxy the login limiter uses the client address from `X-Forwarded-For`.
+
+## Free hosting: Render + rootz.so
+
+The server runs on Render's free plan, and all data is kept in your rootz.so account instead of on Render's disk (which is wiped on every restart). Everything sent to rootz is batched, GZIP-compressed and AES-256-GCM encrypted; rootz only ever holds unreadable files named `ember-*`.
+
+How it works: each change is appended to the write-ahead log and uploaded in a batch every 2 seconds. After about 1 MB of changes, a compressed snapshot replaces the older log files. On startup (including every wake-up after Render's free plan sleeps) the server downloads the newest snapshot plus later logs and rebuilds its state. Images are uploaded once and fetched back only when someone views them. Idle memory use is about 40 MB.
+
+1. **Make an encryption key** (keep it secret; without it the data cannot be read):
+   ```text
+   java -cp build\classes edu.ember.server.EmberServer --new-storage-key
+   ```
+2. **rootz.so:** create an API key in dashboard settings. Optionally create a folder for Ember and note its ID.
+3. **Render:** push this repository to GitHub, then in Render choose **New → Blueprint** and pick the repository. `render.yaml` creates one free Docker web service with a `/health` check. Fill in the secrets when asked:
+   - `ROOTZ_API_KEY`: the rootz API key
+   - `EMBER_STORAGE_KEY`: the key from step 1
+   - `ROOTZ_FOLDER_ID`: the folder ID, or leave empty
+   - `EMBER_ARGS`: extra options, for example `--admin-user yourname`, or leave empty
+4. **Custom domain:** in the Render service, **Settings → Custom Domains → Add** `ember.pokedb.site`, then add the CNAME record Render shows at your DNS provider. Render issues the HTTPS certificate.
+5. **Stay awake:** free Render services sleep after about 15 minutes without traffic. Create a free UptimeRobot HTTP monitor for `https://ember.pokedb.site/health` every 5 minutes. A sleeping service still wakes on the first visit (about 30–60 s), and no data is lost either way.
+
+Run only one server against the same rootz files at a time. `java -cp build\classes edu.ember.tools.ReplicaCheck` checks a rootz key end to end with throwaway `embercheck-*` files and deletes them afterwards.
 
 ## Local demo
 
