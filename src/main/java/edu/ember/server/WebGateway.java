@@ -53,7 +53,7 @@ final class WebGateway {
     }
 
     /** forwardedFor is the X-Forwarded-For header, or null. */
-    record Upgrade(WsInput input, WsOutput output, String forwardedFor) {
+    record Upgrade(WsInput input, WsOutput output, String forwardedFor, String host) {
         /** Frees the native compression buffers; call once the connection has ended. */
         void release() {
             input.end();
@@ -104,7 +104,7 @@ final class WebGateway {
                     + (deflate ? "\r\nSec-WebSocket-Extensions: permessage-deflate" : "") + "\r\n\r\n");
             out.flush();
             return new Upgrade(new WsInput(in, out, maxMessage, deflate), new WsOutput(out, deflate),
-                    headers.get("x-forwarded-for"));
+                    headers.get("x-forwarded-for"), headers.get("host"));
         }
         boolean head = request[0].equals("HEAD");
         if (path.equals("/health")) {

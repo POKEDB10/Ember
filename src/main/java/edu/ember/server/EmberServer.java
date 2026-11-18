@@ -24,6 +24,16 @@ public final class EmberServer implements AutoCloseable {
     private final SSLServerSocket serverSocket;
     private volatile java.net.ServerSocket httpSocket;
     private volatile int maxFrameBytes = 25 * 1024 * 1024;
+    /** Off by default: only a server that sits behind a known proxy may believe X-Forwarded-For. */
+    private volatile boolean trustForwardedFor;
+    /** Chosen status per user: away, dnd or invisible (online when absent). Kept while the
+     * server runs; devices send it again after they reconnect. */
+    private final java.util.concurrent.ConcurrentMap<String, String> statuses =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Set<String> STATUSES =
+            java.util.Set.of("online", "idle", "away", "dnd", "invisible");
+    /** Null when push keys could not be set up; everything else still works. */
+    private final WebPush webPush;
     private final StorageEngine storage;
     private final AuthService authService;
     private final GroupService groupService;
@@ -97,6 +107,14 @@ public final class EmberServer implements AutoCloseable {
         authService = new AuthService(storage, hasher, new UserLockManager(), auditLogger);
         groupService = new GroupService(storage);
         socialFeedService = new SocialFeedService(storage, mediaDirectory, storyTtlSec);
+        WebPush push = null;
+        try {
+            push = new WebPush(storage);
+        } catch (java.security.GeneralSecurityException exception) {
+            java.util.logging.Logger.getLogger(EmberServer.class.getName())
+                    .log(Level.WARNING, "Web Push disabled", exception);
+        }
+        webPush = push;
         autoSaveThread = new AutoSaveThread(storage, 30_000);
         expiryReaperThread = new ExpiryReaperThread(storage, this::broadcastExpiredMessage);
     }
@@ -108,6 +126,7 @@ public final class EmberServer implements AutoCloseable {
         boolean demoSeed = false;
         boolean tls = true;
         boolean rootz = false;
+        boolean trustProxy = false;
         int storyTtlSec = 86_400;
         java.util.Set<String> adminUsernames = new java.util.HashSet<>();
         String bindAddress = "0.0.0.0";
@@ -125,6 +144,7 @@ public final class EmberServer implements AutoCloseable {
                 case "--http-bind" -> httpBind = args[++index];
                 case "--bind" -> bindAddress = args[++index];
                 case "--no-tls" -> tls = false;
+                case "--trust-proxy" -> trustProxy = true;
                 case "--rootz" -> rootz = true;
                 case "--max-frame-mb" -> maxFrameMb = Integer.parseInt(args[++index]);
                 case "--demo-seed" -> demoSeed = true;
@@ -153,9 +173,19 @@ public final class EmberServer implements AutoCloseable {
             if (key.length != 32) {
                 throw new IllegalArgumentException("EMBER_STORAGE_KEY must be 32 bytes in Base64");
             }
-            replica = new BlobStoreReplica(new RootzBlobStore(readSecret(secrets, "ROOTZ_API_KEY"),
-                    readOptionalSecret(secrets, "ROOTZ_FOLDER_ID")),
-                    new javax.crypto.spec.SecretKeySpec(key, "AES"), 2_000);
+            String apiKey = readSecret(secrets, "ROOTZ_API_KEY");
+            String folder = readOptionalSecret(secrets, "ROOTZ_FOLDER_ID");
+            // Inside the Ember folder, "data" holds the encrypted log and snapshots, "media" the
+            // images. Missing subfolders fall back to the Ember folder itself.
+            String dataFolder = folder == null ? null : RootzBlobStore.findSubfolder(apiKey, folder, "data");
+            String mediaFolder = folder == null ? null : RootzBlobStore.findSubfolder(apiKey, folder, "media");
+            System.out.println("rootz storage: data in " + (dataFolder != null ? "ember/data"
+                    : folder != null ? "the Ember folder" : "the account root") + ", images in "
+                    + (mediaFolder != null ? "ember/media" : folder != null ? "the Ember folder" : "the account root"));
+            replica = new BlobStoreReplica(
+                    new RootzBlobStore(apiKey, dataFolder != null ? dataFolder : folder),
+                    new RootzBlobStore(apiKey, mediaFolder != null ? mediaFolder : folder),
+                    new javax.crypto.spec.SecretKeySpec(key, "AES"), 2_000, "ember-");
         }
         EmberServer server = new EmberServer(
                 tls ? Path.of("config", "ember-server.p12") : null,
@@ -164,6 +194,7 @@ public final class EmberServer implements AutoCloseable {
                 new SecurityAuditLogger(Path.of("logs", "security-audit.json")),
                 dataDirectory.resolve("media"), storyTtlSec, adminUsernames, bindAddress);
         server.setMaxFrameBytes(maxFrameMb * 1024 * 1024);
+        server.setTrustForwardedFor(trustProxy);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 server.close();
@@ -212,6 +243,18 @@ public final class EmberServer implements AutoCloseable {
     /** Largest frame a signed-in client may send; keeps one huge upload from exhausting memory. */
     public void setMaxFrameBytes(int bytes) {
         maxFrameBytes = bytes;
+    }
+
+    /** Tests deliver push messages to a local endpoint instead of a real push service. */
+    public void setPushEndpointFilter(java.util.function.Predicate<java.net.URI> filter) {
+        if (webPush != null) {
+            webPush.setAllowedEndpoint(filter);
+        }
+    }
+
+    /** Call only when the plain-HTTP listener is reachable solely through your own proxy. */
+    public void setTrustForwardedFor(boolean trust) {
+        trustForwardedFor = trust;
     }
 
     public int port() {
@@ -327,13 +370,18 @@ public final class EmberServer implements AutoCloseable {
          * X-Forwarded-For entry (the one the proxy itself appended, which a client cannot forge).
          */
         private void useForwardedClient(String forwardedFor) {
-            if (forwardedFor == null || socket instanceof javax.net.ssl.SSLSocket) {
+            if (!trustForwardedFor || forwardedFor == null
+                    || socket instanceof javax.net.ssl.SSLSocket) {
                 return;
             }
             String last = forwardedFor.substring(forwardedFor.lastIndexOf(',') + 1).strip();
             if (last.matches("[0-9a-fA-F:.]{2,45}")) { // IP literal only, so no DNS lookup happens
                 try {
-                    clientAddress = java.net.InetAddress.getByName(last);
+                    java.net.InetAddress forwarded = java.net.InetAddress.getByName(last);
+                    // Never accept loopback from a header: loopback is exempt from the login limiter.
+                    if (!forwarded.isLoopbackAddress() && !forwarded.isAnyLocalAddress()) {
+                        clientAddress = forwarded;
+                    }
                 } catch (java.net.UnknownHostException ignored) {
                     // Keep the socket peer.
                 }
@@ -365,6 +413,10 @@ public final class EmberServer implements AutoCloseable {
                     input = upgrade.input();
                     output = upgrade.output();
                     useForwardedClient(upgrade.forwardedFor());
+                    if (webPush != null && upgrade.host() != null
+                            && upgrade.host().matches("[A-Za-z0-9.-]{1,253}(:\\d{1,5})?")) {
+                        webPush.setContact("https://" + upgrade.host());
+                    }
                 }
                 while (running.get() && !socket.isClosed()) {
                     try {
@@ -431,6 +483,8 @@ public final class EmberServer implements AutoCloseable {
                     case edu.ember.common.protocol.WireOpcodes.CMD_FEED_PULL -> pullFeed(frame);
                     case edu.ember.common.protocol.WireOpcodes.CMD_PROFILE_GET -> getProfile(frame);
                     case edu.ember.common.protocol.WireOpcodes.CMD_MEDIA_GET -> getMedia(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_STATUS_SET -> setStatus(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_PUSH_SUBSCRIBE -> subscribePush(frame);
                     default -> sendError(frame.correlationId(), "400", "Unsupported command");
                 }
             } catch (edu.ember.common.exceptions.EmberException exception) {
@@ -464,10 +518,11 @@ public final class EmberServer implements AutoCloseable {
             response.put("role", isAdminUser(user.username()) ? "ADMIN" : "STUDENT");
             response.put("admin", Boolean.toString(isAdminUser(user.username())));
             response.put("globalSeq", "0");
+            String sinceRevision = syncStart(fields, response);
             send(edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_AUTH_OK,
                     frame.correlationId(), response));
-            sendSync(0);
+            sendSync(0, sinceRevision);
             sendPresenceSnapshot(this);
             broadcastPresence(userId, true);
         }
@@ -489,10 +544,11 @@ public final class EmberServer implements AutoCloseable {
             response.put("role", isAdminUserId(userId) ? "ADMIN" : "STUDENT");
             response.put("admin", Boolean.toString(isAdminUserId(userId)));
             response.put("globalSeq", "0");
+            String sinceRevision = syncStart(fields, response);
             send(edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_AUTH_OK,
                     frame.correlationId(), response));
-            sendSync(Long.parseLong(fields.required("lastGlobalSeq")));
+            sendSync(Long.parseLong(fields.required("lastGlobalSeq")), sinceRevision);
             sendPresenceSnapshot(this);
             broadcastPresence(userId, true);
         }
@@ -511,15 +567,80 @@ public final class EmberServer implements AutoCloseable {
             });
         }
 
-        private void sendSync(long sinceGlobalSeq) throws IOException {
+        /**
+         * Adds push key, status and cache instructions to AUTH_OK. A device with a local cache
+         * sends sinceRevision; a revision from a different or reset server means "start over".
+         * Returns the revision to sync from, or null for the classic full/globalSeq sync.
+         */
+        private String syncStart(MapFields fields, java.util.Map<String, String> response)
+                throws IOException {
+            if (webPush != null) {
+                response.put("vapidKey", webPush.publicKey());
+            }
+            response.put("status", statuses.getOrDefault(userId, "online"));
+            String since = fields.values.get("sinceRevision");
+            if (since == null) {
+                return null;
+            }
+            long requested;
+            try {
+                requested = Long.parseLong(since);
+            } catch (NumberFormatException exception) {
+                requested = -1;
+            }
+            boolean reset = requested < 0 || requested > storage.currentRevision();
+            response.put("syncReset", Boolean.toString(reset));
+            return reset ? "0" : Long.toString(requested);
+        }
+
+        private void sendSync(long sinceGlobalSeq, String sinceRevision) throws IOException {
+            long upToRevision = storage.currentRevision();
             long upToGlobalSequence = sinceGlobalSeq;
-            for (var item : storage.getDeltaFramesSince(userId, sinceGlobalSeq)) {
+            var items = sinceRevision != null
+                    ? storage.getChangesSince(userId, Long.parseLong(sinceRevision))
+                    : storage.getDeltaFramesSince(userId, sinceGlobalSeq);
+            for (var item : items) {
                 send(item);
                 upToGlobalSequence = Math.max(upToGlobalSequence, item.correlationId());
             }
             send(edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_SYNC_DONE, 0,
-                    java.util.Map.of("upToGlobalSeq", Long.toString(upToGlobalSequence))));
+                    java.util.Map.of("upToGlobalSeq", Long.toString(upToGlobalSequence),
+                            "upToRevision", Long.toString(upToRevision))));
+        }
+
+        private void setStatus(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            String status = new MapFields(frame.payload()).required("status");
+            if (!STATUSES.contains(status)) {
+                throw new edu.ember.common.exceptions.ValidationException("Unknown status");
+            }
+            if (status.equals("online")) {
+                statuses.remove(userId);
+            } else {
+                statuses.put(userId, status);
+            }
+            broadcastPresence(userId, true);
+        }
+
+        private void subscribePush(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            String endpoint = fields.required("endpoint");
+            String p256dh = fields.required("p256dh");
+            String auth = fields.required("auth");
+            if (webPush == null || !webPush.accepts(endpoint, p256dh, auth)) {
+                throw new edu.ember.common.exceptions.ValidationException(
+                        "This browser's push service is not supported");
+            }
+            storage.savePushSubscription(new edu.ember.common.model.PushSubscription(
+                    userId, endpoint, p256dh, auth),
+                    Boolean.parseBoolean(fields.values.getOrDefault("active", "true")));
+            send(edu.ember.common.protocol.FrameFactory.event(
+                    edu.ember.common.protocol.WireOpcodes.EVT_NOTIFY, frame.correlationId(),
+                    java.util.Map.of("kind", "PUSH_OK")));
         }
 
         private void logout() throws IOException {
@@ -659,10 +780,16 @@ public final class EmberServer implements AutoCloseable {
             String action = fields.values.getOrDefault("action", "FOLLOW");
             boolean following = Boolean.parseBoolean(fields.values.getOrDefault("follow", "true"));
             if (action.equals("APPROVE")) {
-                socialFeedService.approveFollow(userId, target,
-                        Boolean.parseBoolean(fields.values.getOrDefault("approve", "false")));
+                boolean approve = Boolean.parseBoolean(fields.values.getOrDefault("approve", "false"));
+                socialFeedService.approveFollow(userId, target, approve);
+                notifyUser(target, approve ? "FOLLOW_APPROVED" : "FOLLOW_DECLINED", userId);
             } else {
                 socialFeedService.follow(userId, target, following);
+                if (following && storage.followStatus(userId, target).orElse(null)
+                        == edu.ember.common.model.FollowStatus.PENDING) {
+                    notifyUser(target, "FOLLOW_REQUEST", userId);
+                    pushIfAway(target, displayName(userId), "wants to follow you", "", "follow");
+                }
             }
             send(edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_PROFILE_DATA, frame.correlationId(),
@@ -967,6 +1094,13 @@ public final class EmberServer implements AutoCloseable {
             response.put("following", Boolean.toString(storage.followingOf(userId).contains(target)));
             response.put("privateAccount", Boolean.toString(profile.privateAccount()));
             response.put("pendingCount", Integer.toString(storage.pendingFollowersOf(target).size()));
+            if (target.equals(userId)) { // only the owner sees who is waiting
+                java.util.List<String> pending = storage.pendingFollowersOf(userId);
+                response.put("pending.n", Integer.toString(pending.size()));
+                for (int index = 0; index < pending.size(); index++) {
+                    response.put("pending." + index, pending.get(index));
+                }
+            }
             send(edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_PROFILE_DATA,
                     frame.correlationId(), response));
@@ -1090,6 +1224,16 @@ public final class EmberServer implements AutoCloseable {
                 sendToUser(recipient, deliver, null);
             }
             sendToUser(userId, deliver, this); // the sender's other signed-in devices
+            String title = displayName(userId);
+            if (conversationId.startsWith("grp:")) {
+                title += " · " + storage.findGroup(conversationId.substring(4))
+                        .map(edu.ember.common.model.GroupChat::name).orElse("group");
+            }
+            String preview = ttlSec > 0 ? "⏱ disappearing message"
+                    : body.length() > 140 ? body.substring(0, 140) + "…" : body;
+            for (String recipient : recipients) {
+                pushIfAway(recipient, title, preview, conversationId, "message");
+            }
         }
 
         private void reactMessage(edu.ember.common.protocol.WireFrame frame) throws IOException,
@@ -1412,12 +1556,53 @@ public final class EmberServer implements AutoCloseable {
         return wentOffline[0];
     }
 
-    private void broadcastPresence(String userId, boolean isOnline) {
-        var event = edu.ember.common.protocol.FrameFactory.event(
+    private String displayName(String userId) throws IOException {
+        return storage.findProfile(userId).map(edu.ember.common.model.UserProfile::displayName)
+                .filter(name -> !name.isBlank()).orElse(userId);
+    }
+
+    private void notifyUser(String target, String kind, String from) {
+        sendToUser(target, edu.ember.common.protocol.FrameFactory.event(
+                edu.ember.common.protocol.WireOpcodes.EVT_NOTIFY, 0,
+                java.util.Map.of("kind", kind, "from", from)), null);
+    }
+
+    /**
+     * Web Push only when the user has no device connected (an open tab shows its own
+     * notification) and is not on Do Not Disturb.
+     */
+    private void pushIfAway(String target, String title, String body, String conversationId,
+            String kind) throws IOException {
+        java.util.Set<ConnectionHandler> devices = online.get(target);
+        if (webPush == null || (devices != null && !devices.isEmpty())
+                || "dnd".equals(statuses.get(target))) {
+            return;
+        }
+        String payload = "{\"title\":" + edu.ember.common.util.MiniJson.quote(title)
+                + ",\"body\":" + edu.ember.common.util.MiniJson.quote(body)
+                + ",\"conv\":" + edu.ember.common.util.MiniJson.quote(conversationId)
+                + ",\"kind\":" + edu.ember.common.util.MiniJson.quote(kind) + "}";
+        for (var subscription : storage.pushSubscriptions(target)) {
+            webPush.send(subscription, payload);
+        }
+    }
+
+    /** Others never see "invisible" (it looks offline); the user's own devices see the truth. */
+    private edu.ember.common.protocol.WireFrame presenceEvent(String userId, boolean isOnline,
+            boolean forSelf) {
+        String status = statuses.getOrDefault(userId, "online");
+        boolean visible = isOnline && (forSelf || !status.equals("invisible"));
+        return edu.ember.common.protocol.FrameFactory.event(
                 edu.ember.common.protocol.WireOpcodes.EVT_PRESENCE_UPDATE, 0,
-                java.util.Map.of("userId", userId, "online", Boolean.toString(isOnline)));
+                java.util.Map.of("userId", userId, "online", Boolean.toString(visible),
+                        "status", visible ? status : "offline"));
+    }
+
+    private void broadcastPresence(String userId, boolean isOnline) {
+        var everyone = presenceEvent(userId, isOnline, false);
+        var self = presenceEvent(userId, isOnline, true);
         for (String onlineUser : online.keySet()) {
-            sendToUser(onlineUser, event, null);
+            sendToUser(onlineUser, onlineUser.equals(userId) ? self : everyone, null);
         }
     }
 
@@ -1433,9 +1618,10 @@ public final class EmberServer implements AutoCloseable {
 
     private void sendPresenceSnapshot(ConnectionHandler handler) throws IOException {
         for (String onlineUser : online.keySet()) {
-            handler.send(edu.ember.common.protocol.FrameFactory.event(
-                    edu.ember.common.protocol.WireOpcodes.EVT_PRESENCE_UPDATE, 0,
-                    java.util.Map.of("userId", onlineUser, "online", "true")));
+            boolean self = onlineUser.equals(handler.userId);
+            if (self || !"invisible".equals(statuses.get(onlineUser))) {
+                handler.send(presenceEvent(onlineUser, true, self));
+            }
         }
     }
 
