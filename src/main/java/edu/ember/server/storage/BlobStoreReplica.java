@@ -49,7 +49,10 @@ public final class BlobStoreReplica implements StorageReplica {
     private static final java.util.regex.Pattern LOG =
             java.util.regex.Pattern.compile("log-(\\d+)-(\\d+)");
     private final String prefix;
+    /** Log and snapshot files. */
     private final BlobStore store;
+    /** Images; may be the same store, or a separate folder so media stays apart from data. */
+    private final BlobStore mediaStore;
     private final SecretKey key;
     private final SecureRandom random = new SecureRandom();
     /** Remote file name to file ID; the only list call is made at start-up. */
@@ -71,10 +74,16 @@ public final class BlobStoreReplica implements StorageReplica {
 
     /** prefix namespaces the remote files, so a test run can never touch real data. */
     public BlobStoreReplica(BlobStore store, SecretKey key, long flushMillis, String prefix) {
+        this(store, store, key, flushMillis, prefix);
+    }
+
+    public BlobStoreReplica(BlobStore store, BlobStore mediaStore, SecretKey key, long flushMillis,
+            String prefix) {
         this.prefix = prefix;
         this.file = java.util.regex.Pattern.compile(
                 java.util.regex.Pattern.quote(prefix) + ".+\\.(one|p\\d+|n\\d+)");
         this.store = store;
+        this.mediaStore = mediaStore;
         this.key = key;
         uploader.scheduleWithFixedDelay(this::flushLog, flushMillis, flushMillis,
                 TimeUnit.MILLISECONDS);
@@ -82,7 +91,11 @@ public final class BlobStoreReplica implements StorageReplica {
 
     @Override
     public boolean restore(Path snapshotPath, Path walPath) throws IOException {
-        for (Map.Entry<String, String> file : store.list(prefix).entrySet()) {
+        Map<String, String> listed = new java.util.HashMap<>(store.list(prefix));
+        if (mediaStore != store) {
+            listed.putAll(mediaStore.list(prefix));
+        }
+        for (Map.Entry<String, String> file : listed.entrySet()) {
             if (this.file.matcher(file.getKey()).matches()) {
                 remote.put(file.getKey(), file.getValue());
             }
@@ -230,7 +243,7 @@ public final class BlobStoreReplica implements StorageReplica {
                     || (log.matches() && Long.parseLong(log.group(1)) < generation);
             if (old) {
                 try {
-                    store.delete(file.getValue());
+                    store.delete(file.getValue()); // snapshots and logs live in the data store
                     remote.remove(file.getKey());
                 } catch (IOException exception) {
                     LOGGER.log(Level.FINE, "Old replica file not deleted yet", exception);
@@ -262,12 +275,12 @@ public final class BlobStoreReplica implements StorageReplica {
         }
         byte[] sealed;
         if (remote.containsKey(prefix + logical + ".one")) {
-            sealed = retry(() -> store.get(remote.get(prefix + logical + ".one")));
+            sealed = retry(() -> storeFor(logical).get(remote.get(prefix + logical + ".one")));
         } else {
             ByteArrayOutputStream joined = new ByteArrayOutputStream();
             for (int part = 0; part < count; part++) {
                 String id = remote.get(prefix + logical + ".p" + part);
-                joined.writeBytes(retry(() -> store.get(id)));
+                joined.writeBytes(retry(() -> storeFor(logical).get(id)));
             }
             sealed = joined.toByteArray();
         }
@@ -276,7 +289,12 @@ public final class BlobStoreReplica implements StorageReplica {
     }
 
     private void upload(String name, byte[] data) throws IOException {
-        remote.put(name, retry(() -> store.put(name, data)));
+        BlobStore target = storeFor(name.substring(prefix.length()));
+        remote.put(name, retry(() -> target.put(name, data)));
+    }
+
+    private BlobStore storeFor(String logicalOrFile) {
+        return logicalOrFile.startsWith("media-") ? mediaStore : store;
     }
 
     /** Logical names whose upload finished, i.e. a .one file or a complete set of parts. */

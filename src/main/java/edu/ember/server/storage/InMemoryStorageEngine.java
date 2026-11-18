@@ -40,6 +40,21 @@ public final class InMemoryStorageEngine implements StorageEngine {
     private final Map<String, Long> conversationSequences = new HashMap<>();
     private final List<Message> messages = new ArrayList<>();
     private long globalSequence;
+    /** Bumped on every message change; replaying the WAL reproduces the same numbers. */
+    private long revision;
+    private final Map<String, Long> revisions = new HashMap<>();
+    private final List<Tombstone> tombstones = new ArrayList<>();
+    private final Map<String, Map<String, edu.ember.common.model.PushSubscription>> pushSubscriptions =
+            new HashMap<>();
+    private final Map<String, String> settings = new HashMap<>();
+
+    /** Remembers a deleted message so caching devices learn to drop it. */
+    private record Tombstone(String clientMsgId, String senderUserId, String conversationId,
+            long revision) { }
+
+    private void touch(Message message) {
+        revisions.put(message.clientMsgId(), ++revision);
+    }
 
     @Override public void init() { }
 
@@ -72,6 +87,7 @@ public final class InMemoryStorageEngine implements StorageEngine {
         conversationSequences.put(message.conversationId(), nextConversation);
         messagesById.put(idempotencyKey, message);
         messages.add(message);
+        touch(message);
         return nextConversation;
     }
 
@@ -89,6 +105,7 @@ public final class InMemoryStorageEngine implements StorageEngine {
         Message message = findByClientMsgId(clientMsgId).orElseThrow(
                 () -> new IOException("Message not found"));
         message.setReaction(userId, emoji, selected);
+        touch(message);
     }
 
     @Override public synchronized void editMessage(String clientMsgId, String newBody)
@@ -96,24 +113,32 @@ public final class InMemoryStorageEngine implements StorageEngine {
         Message message = findByClientMsgId(clientMsgId).orElseThrow(
                 () -> new IOException("Message not found"));
         message.editBody(newBody);
+        touch(message);
     }
 
     @Override public synchronized void deleteMessage(String clientMsgId) throws IOException {
         Message message = findByClientMsgId(clientMsgId).orElseThrow(
                 () -> new IOException("Message not found"));
         messages.remove(message);
+        revisions.remove(message.clientMsgId());
+        tombstones.add(new Tombstone(message.clientMsgId(), message.senderUserId(),
+                message.conversationId(), ++revision));
     }
 
     @Override public synchronized void setMessagePinned(String clientMsgId, boolean pinned)
             throws IOException {
-        findByClientMsgId(clientMsgId).orElseThrow(() -> new IOException("Message not found"))
-                .setPinned(pinned);
+        Message message = findByClientMsgId(clientMsgId).orElseThrow(
+                () -> new IOException("Message not found"));
+        message.setPinned(pinned);
+        touch(message);
     }
 
     @Override public synchronized void setMessageStarred(String clientMsgId, String userId,
             boolean starred) throws IOException {
-        findByClientMsgId(clientMsgId).orElseThrow(() -> new IOException("Message not found"))
-                .setStarred(userId, starred);
+        Message message = findByClientMsgId(clientMsgId).orElseThrow(
+                () -> new IOException("Message not found"));
+        message.setStarred(userId, starred);
+        touch(message);
     }
 
     @Override
@@ -302,12 +327,68 @@ public final class InMemoryStorageEngine implements StorageEngine {
         List<WireFrame> result = new ArrayList<>();
         for (Message message : messages) {
             if (message.globalSequence() > sinceGlobalSeq && isParticipant(message, userId)) {
-                Map<String, String> fields = messageFields(message);
                 result.add(FrameFactory.event(WireOpcodes.EVT_SYNC_ITEM,
-                        message.globalSequence(), fields));
+                        message.globalSequence(), userFields(message, userId)));
             }
         }
         return List.copyOf(result);
+    }
+
+    @Override
+    public synchronized List<WireFrame> getChangesSince(String userId, long sinceRevision) {
+        List<WireFrame> result = new ArrayList<>();
+        for (Message message : messages) {
+            if (revisions.getOrDefault(message.clientMsgId(), 0L) > sinceRevision
+                    && isParticipant(message, userId)) {
+                result.add(FrameFactory.event(WireOpcodes.EVT_SYNC_ITEM,
+                        message.globalSequence(), userFields(message, userId)));
+            }
+        }
+        for (Tombstone tombstone : tombstones) {
+            if (tombstone.revision() > sinceRevision && isParticipant(tombstone.senderUserId(),
+                    tombstone.conversationId(), userId)) {
+                result.add(FrameFactory.event(WireOpcodes.EVT_SYNC_ITEM, 0, Map.of(
+                        "clientMsgId", tombstone.clientMsgId(), "convId", tombstone.conversationId(),
+                        "deleted", "true")));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    @Override public synchronized long currentRevision() {
+        return revision;
+    }
+
+    @Override public synchronized void savePushSubscription(
+            edu.ember.common.model.PushSubscription subscription, boolean active) {
+        Map<String, edu.ember.common.model.PushSubscription> mine = pushSubscriptions.computeIfAbsent(
+                subscription.userId(), ignored -> new java.util.LinkedHashMap<>());
+        if (active) {
+            mine.put(subscription.endpoint(), subscription);
+        } else {
+            mine.remove(subscription.endpoint());
+        }
+    }
+
+    @Override public synchronized List<edu.ember.common.model.PushSubscription> pushSubscriptions(
+            String userId) {
+        return List.copyOf(pushSubscriptions.getOrDefault(userId, Map.of()).values());
+    }
+
+    @Override public synchronized void saveSetting(String key, String value) {
+        settings.put(key, value);
+    }
+
+    @Override public synchronized Optional<String> setting(String key) {
+        return Optional.ofNullable(settings.get(key));
+    }
+
+    /** Shared fields plus what only this user sees: pin state and their own star. */
+    private static Map<String, String> userFields(Message message, String userId) {
+        Map<String, String> fields = messageFields(message);
+        fields.put("pinned", Boolean.toString(message.pinned()));
+        fields.put("starred", Boolean.toString(message.starredBy(userId)));
+        return fields;
     }
 
     @Override
@@ -372,10 +453,13 @@ public final class InMemoryStorageEngine implements StorageEngine {
     }
 
     private boolean isParticipant(Message message, String userId) {
-        if (message.senderUserId().equals(userId)) {
+        return isParticipant(message.senderUserId(), message.conversationId(), userId);
+    }
+
+    private boolean isParticipant(String senderUserId, String conversation, String userId) {
+        if (senderUserId.equals(userId)) {
             return true;
         }
-        String conversation = message.conversationId();
         if (conversation.startsWith("grp:")) {
             GroupChat group = groups.get(conversation.substring(4));
             return group != null && group.contains(userId);

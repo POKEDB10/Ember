@@ -61,6 +61,8 @@ public final class WalStorageEngine implements StorageEngine {
     private static final byte STORY_SAVE = 18;
     private static final byte POLL_SAVE = 19;
     private static final byte POLL_VOTE = 20;
+    private static final byte PUSH_SUBSCRIPTION = 21;
+    private static final byte SETTING = 22;
     private final Path walPath;
     private final Path snapshotPath;
     private final boolean strictDurability;
@@ -416,6 +418,38 @@ public final class WalStorageEngine implements StorageEngine {
         return state.getHistory(conversationId, beforeSequence, limit);
     }
 
+    @Override public synchronized List<WireFrame> getChangesSince(String userId, long sinceRevision) {
+        return state.getChangesSince(userId, sinceRevision);
+    }
+
+    @Override public synchronized long currentRevision() {
+        return state.currentRevision();
+    }
+
+    @Override public synchronized void savePushSubscription(
+            edu.ember.common.model.PushSubscription subscription, boolean active) throws IOException {
+        Map<String, String> fields = new HashMap<>();
+        fields.put("userId", subscription.userId()); fields.put("endpoint", subscription.endpoint());
+        fields.put("p256dh", subscription.p256dh()); fields.put("auth", subscription.auth());
+        fields.put("active", Boolean.toString(active));
+        appendRecord(PUSH_SUBSCRIPTION, fields);
+        state.savePushSubscription(subscription, active);
+    }
+
+    @Override public synchronized List<edu.ember.common.model.PushSubscription> pushSubscriptions(
+            String userId) {
+        return state.pushSubscriptions(userId);
+    }
+
+    @Override public synchronized void saveSetting(String key, String value) throws IOException {
+        appendRecord(SETTING, Map.of("key", key, "value", value));
+        state.saveSetting(key, value);
+    }
+
+    @Override public synchronized Optional<String> setting(String key) {
+        return state.setting(key);
+    }
+
     @Override public synchronized List<Message> expiredMessages(long nowMs) {
         return state.expiredMessages(nowMs);
     }
@@ -672,6 +706,12 @@ public final class WalStorageEngine implements StorageEngine {
         } else if (record.type() == POLL_VOTE) {
             state.votePoll(fields.get("pollId"), fields.get("userId"),
                     Integer.parseInt(fields.get("option")));
+        } else if (record.type() == PUSH_SUBSCRIPTION) {
+            state.savePushSubscription(new edu.ember.common.model.PushSubscription(fields.get("userId"),
+                    fields.get("endpoint"), fields.get("p256dh"), fields.get("auth")),
+                    Boolean.parseBoolean(fields.get("active")));
+        } else if (record.type() == SETTING) {
+            state.saveSetting(fields.get("key"), fields.get("value"));
         } else {
             throw new IOException("Unknown WAL record type");
         }

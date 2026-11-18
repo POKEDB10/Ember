@@ -40,6 +40,22 @@ public final class RootzBlobStore implements BlobStore {
         this.folderId = folderId == null || folderId.isBlank() ? null : folderId.strip();
     }
 
+    /** ID of the folder named {@code name} directly inside {@code parentId}, or null. */
+    public static String findSubfolder(String apiKey, String parentId, String name) throws IOException {
+        RootzBlobStore probe = new RootzBlobStore(apiKey, parentId);
+        Object folders = MiniJson.path(json(probe.send(probe.authorized(API
+                + "list?includeFolders=true&limit=1&folderId=" + encode(parentId)).GET())), "folders");
+        if (folders instanceof List<?> list) {
+            for (Object folder : list) {
+                if (name.equals(MiniJson.path(folder, "name"))
+                        && MiniJson.path(folder, "id") instanceof String id) {
+                    return id;
+                }
+            }
+        }
+        return null;
+    }
+
     @Override
     public Map<String, String> list(String prefix) throws IOException {
         Map<String, String> files = new HashMap<>();

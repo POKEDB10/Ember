@@ -68,6 +68,22 @@ public interface StorageEngine extends AutoCloseable {
     List<Message> expiredMessages(long nowMs) throws IOException;
     int purgeExpiredRecords(long nowMs) throws IOException;
     void flush() throws IOException;
+    /**
+     * Messages created or changed after {@code sinceRevision}, plus deletion markers, as seen by
+     * one user (pin and per-user star state included). Lets a device with a local cache
+     * download only what changed. @concept change tracking
+     */
+    default List<WireFrame> getChangesSince(String userId, long sinceRevision) throws IOException {
+        return getDeltaFramesSince(userId, 0);
+    }
+    /** Highest revision handed out so far. */
+    default long currentRevision() throws IOException { return 0; }
+    default void savePushSubscription(edu.ember.common.model.PushSubscription subscription,
+            boolean active) throws IOException { }
+    default List<edu.ember.common.model.PushSubscription> pushSubscriptions(String userId)
+            throws IOException { return List.of(); }
+    default void saveSetting(String key, String value) throws IOException { }
+    default Optional<String> setting(String key) throws IOException { return Optional.empty(); }
     /** Copies a stored media file off-server, when the engine has a replica. */
     default void mirrorMedia(String name, byte[] bytes) { }
     /** Media file from the off-server replica, or null. */
