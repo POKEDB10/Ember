@@ -536,6 +536,11 @@ public final class ClientController implements AutoCloseable {
         }
         message.assignSequences(Long.parseLong(fields.get("convSeq")),
                 Long.parseLong(fields.get("globalSeq")));
+        // Sync items carry pin and star state, so a new device shows them without a live event.
+        message.setPinned(Boolean.parseBoolean(fields.getOrDefault("pinned", "false")));
+        if (Boolean.parseBoolean(fields.getOrDefault("starred", "false")) && model.userId() != null) {
+            message.setStarred(model.userId(), true);
+        }
         message.advanceStatus(MessageStatus.DELIVERED);
         return message;
     }

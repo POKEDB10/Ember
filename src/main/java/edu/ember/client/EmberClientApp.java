@@ -276,8 +276,8 @@ public final class EmberClientApp {
         actions.put("toggle-theme", new AbstractAction() {
             @Override
             public void actionPerformed(java.awt.event.ActionEvent event) {
-                ThemeManager.apply(ThemeManager.current() == ThemeManager.Theme.DARK
-                        ? ThemeManager.Theme.LIGHT : ThemeManager.Theme.DARK);
+                ThemeManager.Theme[] themes = ThemeManager.Theme.values(); // Ctrl+D cycles every theme
+                ThemeManager.apply(themes[(ThemeManager.current().ordinal() + 1) % themes.length]);
                 applyTheme();
             }
         });
