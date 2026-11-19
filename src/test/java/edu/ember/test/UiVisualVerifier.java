@@ -122,7 +122,7 @@ public final class UiVisualVerifier {
                 Graphics2D graphics = image.createGraphics();
                 workspace.paint(graphics);
                 graphics.dispose();
-                String themeName = theme == ThemeManager.Theme.DARK ? "dark" : "light";
+                String themeName = theme.name().toLowerCase(java.util.Locale.ROOT);
                 Path file = output.resolve("phase-5-" + themeName + "-" + size[0] + "x"
                         + size[1] + ".png");
                 ImageIO.write(image, "png", file.toFile());

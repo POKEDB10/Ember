@@ -95,6 +95,10 @@ public final class EmberTestSuite {
                 this::testWebOnlyModeAndDesktopOverWebSocket);
         runTest("compressed WebSocket both ways and cached image download over HTTP",
                 this::testCompressedWebSocketAndMediaHttp);
+        runTest("revision sync sends only edits, pins, stars, and deletions since the cursor",
+                this::testRevisionSync);
+        runTest("Web Push: SSRF guard, invisible status, encrypted payload, VAPID signature",
+                this::testWebPush);
         runTest("theme palettes, wrapped message bodies, and EDT notifications",
                 this::testUiBasics);
         runTest("WAL restart recovers Arabic and emoji records and trims torn tail",
@@ -804,6 +808,9 @@ public final class EmberTestSuite {
             assertTrue(groupReady.await(10, TimeUnit.SECONDS), "Group did not reach four members");
             clients.get("alice").createPoll(group, "Study session?", List.of("Today", "Tomorrow"));
             assertTrue(pollCreated.await(15, TimeUnit.SECONDS), "Group poll was not broadcast");
+            // The latch counts any two members; Alice's own copy may still be in flight.
+            waitFor(() -> !clients.get("alice").model().polls(group).isEmpty(),
+                    "Alice did not receive her poll");
             String pollId = clients.get("alice").model().polls(group).get(0).pollId();
             clients.get("bob").votePoll(pollId, 0);
             assertTrue(pollVoted.await(15, TimeUnit.SECONDS), "Poll vote totals did not update");
@@ -1171,6 +1178,209 @@ public final class EmberTestSuite {
             if (desktop != null) { desktop.close(); }
             server.close();
         }
+    }
+
+    /** A caching device asks only for changes; edits, pins, stars and deletions all arrive. */
+    private void testRevisionSync() throws Exception {
+        Path directory = Files.createTempDirectory("ember-revisions");
+        WalStorageEngine first = new WalStorageEngine(directory, false);
+        first.init();
+        first.appendMessage(new Message("rv-1", "alice", "dm:alice:bob", "one", System.currentTimeMillis()));
+        first.appendMessage(new Message("rv-2", "alice", "dm:alice:bob", "two", System.currentTimeMillis()));
+        first.appendMessage(new Message("rv-3", "carol", "dm:carol:dave", "not bob's", System.currentTimeMillis()));
+        long cursor = first.currentRevision();
+        assertTrue(first.getChangesSince("bob", cursor).isEmpty(), "Nothing changed, yet changes came back");
+        first.editMessage("rv-1", "one, edited");
+        first.setMessagePinned("rv-1", true);
+        first.setMessageStarred("rv-1", "bob", true);
+        first.deleteMessage("rv-2");
+        Map<String, Map<String, String>> changes = new java.util.HashMap<>();
+        for (WireFrame frame : first.getChangesSince("bob", cursor)) {
+            Map<String, String> fields = KvPayloadCodec.decode(frame.payload());
+            changes.put(fields.get("clientMsgId"), fields);
+        }
+        assertEquals(java.util.Set.of("rv-1", "rv-2"), changes.keySet(), "Wrong change set (or another chat leaked)");
+        assertEquals("one, edited", changes.get("rv-1").get("body"), "Edit missing from changes");
+        assertEquals("true", changes.get("rv-1").get("pinned"), "Pin missing from changes");
+        assertEquals("true", changes.get("rv-1").get("starred"), "Bob's star missing from changes");
+        assertEquals("true", changes.get("rv-2").get("deleted"), "Deletion marker missing");
+        long revision = first.currentRevision();
+        first.close();
+        WalStorageEngine replayed = new WalStorageEngine(directory, false);
+        replayed.init();
+        assertEquals(revision, replayed.currentRevision(), "Revisions changed after a restart");
+        assertTrue(replayed.getChangesSince("bob", revision).isEmpty(), "Restart re-sent old changes");
+        replayed.close();
+    }
+
+    /** The test plays a browser push service: it decrypts what the server sends (RFC 8291). */
+    private void testWebPush() throws Exception {
+        Path temporary = Files.createTempDirectory("ember-push");
+        EmberServer server = new EmberServer(null, null, 0, new InMemoryStorageEngine(),
+                new SecurityAuditLogger(temporary.resolve("audit.json")), temporary.resolve("media"),
+                86_400, java.util.Set.of(), "127.0.0.1");
+        java.util.concurrent.LinkedBlockingQueue<Object[]> pushes = new java.util.concurrent.LinkedBlockingQueue<>();
+        com.sun.net.httpserver.HttpServer pushService = com.sun.net.httpserver.HttpServer.create(
+                new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        pushService.createContext("/push", exchange -> {
+            pushes.add(new Object[] {exchange.getRequestHeaders().getFirst("Authorization"),
+                    exchange.getRequestHeaders().getFirst("Content-Encoding"),
+                    exchange.getRequestBody().readAllBytes()});
+            exchange.sendResponseHeaders(201, -1);
+            exchange.close();
+        });
+        pushService.start();
+        try {
+            server.start();
+            int port = server.startHttp(0);
+            java.security.KeyPairGenerator generator = java.security.KeyPairGenerator.getInstance("EC");
+            generator.initialize(new java.security.spec.ECGenParameterSpec("secp256r1"));
+            java.security.KeyPair browser = generator.generateKeyPair();
+            byte[] authSecret = new byte[16];
+            new java.security.SecureRandom().nextBytes(authSecret);
+            var b64 = java.util.Base64.getUrlEncoder().withoutPadding();
+            Map<String, String> subscription = Map.of("endpoint",
+                    "http://127.0.0.1:" + pushService.getAddress().getPort() + "/push/pam",
+                    "p256dh", b64.encodeToString(rawPoint((java.security.interfaces.ECPublicKey) browser.getPublic())),
+                    "auth", b64.encodeToString(authSecret));
+            String vapidKey;
+            java.net.Socket pam = webSocket(port); // closed mid-test to take pam offline
+            try (java.net.Socket quin = webSocket(port)) {
+                var pamIn = new java.io.BufferedInputStream(pam.getInputStream());
+                var quinIn = new java.io.BufferedInputStream(quin.getInputStream());
+                wsSend(pam.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                        Map.of("user", "pam", "pass", "pam-pass-42", "displayName", "Pam")));
+                vapidKey = KvPayloadCodec.decode(wsRead(pamIn, WireOpcodes.EVT_AUTH_OK).payload()).get("vapidKey");
+                wsSend(pam.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_PUSH_SUBSCRIBE, 2, subscription));
+                wsRead(pamIn, WireOpcodes.EVT_ERROR); // plain http to a local address: refused (SSRF guard)
+                server.setPushEndpointFilter(uri -> true);
+                wsSend(pam.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_PUSH_SUBSCRIBE, 3, subscription));
+                wsRead(pamIn, WireOpcodes.EVT_NOTIFY);
+                wsSend(quin.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                        Map.of("user", "quin", "pass", "quin-pass-42", "displayName", "Quin")));
+                wsRead(quinIn, WireOpcodes.EVT_AUTH_OK);
+                wsSend(pam.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_STATUS_SET, 4,
+                        Map.of("status", "invisible")));
+                Map<String, String> seen;
+                do {
+                    seen = KvPayloadCodec.decode(wsRead(quinIn, WireOpcodes.EVT_PRESENCE_UPDATE).payload());
+                } while (!"pam".equals(seen.get("userId")) || !"offline".equals(seen.get("status")));
+                assertEquals("false", seen.get("online"), "Invisible user still looked online");
+                wsSend(quin.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_MSG_SEND, 2, Map.of(
+                        "clientMsgId", "push-0", "convId", "dm:pam:quin", "body", "pam is online, no push")));
+                wsRead(quinIn, WireOpcodes.EVT_MSG_ACK);
+                assertTrue(pushes.poll(1, TimeUnit.SECONDS) == null, "Pushed although a device was connected");
+                pam.close();
+                Thread.sleep(300); // let the server notice pam's device left
+                wsSend(quin.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_MSG_SEND, 3, Map.of(
+                        "clientMsgId", "push-1", "convId", "dm:pam:quin", "body", "push hello 🌋")));
+                wsRead(quinIn, WireOpcodes.EVT_MSG_ACK);
+                Object[] push = pushes.poll(10, TimeUnit.SECONDS);
+                assertTrue(push != null, "No push was delivered to the offline user");
+                assertEquals("aes128gcm", push[1], "Wrong push content encoding");
+                String json = new String(decryptPush((byte[]) push[2], browser, authSecret),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                assertTrue(json.contains("push hello 🌋") && json.contains("\"title\":\"Quin\"")
+                        && json.contains("dm:pam:quin"), "Push payload is wrong: " + json);
+                verifyVapid((String) push[0], vapidKey);
+            } finally {
+                pam.close();
+            }
+        } finally {
+            pushService.stop(0);
+            server.close();
+        }
+    }
+
+    private static java.net.Socket webSocket(int port) throws IOException {
+        java.net.Socket socket = new java.net.Socket("127.0.0.1", port);
+        socket.setSoTimeout(20_000);
+        socket.getOutputStream().write(("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+                + "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                + "Sec-WebSocket-Version: 13\r\n\r\n").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        var in = socket.getInputStream();
+        int matched = 0;
+        while (matched < 4) { // skip the 101 response headers byte by byte (no read-ahead)
+            int value = in.read();
+            if (value < 0) { throw new IOException("Upgrade failed"); }
+            matched = value == "\r\n\r\n".charAt(matched) ? matched + 1 : (value == '\r' ? 1 : 0);
+        }
+        return socket;
+    }
+
+    private static byte[] rawPoint(java.security.interfaces.ECPublicKey key) {
+        byte[] result = new byte[65];
+        result[0] = 4;
+        copyFixed(key.getW().getAffineX(), result, 1);
+        copyFixed(key.getW().getAffineY(), result, 33);
+        return result;
+    }
+
+    private static void copyFixed(java.math.BigInteger value, byte[] target, int offset) {
+        byte[] bytes = value.toByteArray();
+        int copy = Math.min(32, bytes.length);
+        System.arraycopy(bytes, bytes.length - copy, target, offset + 32 - copy, copy);
+    }
+
+    /** What the browser does with a push: ECDH + HKDF (RFC 8291), then AES-128-GCM. */
+    private static byte[] decryptPush(byte[] body, java.security.KeyPair browser, byte[] authSecret)
+            throws Exception {
+        java.nio.ByteBuffer header = java.nio.ByteBuffer.wrap(body);
+        byte[] salt = new byte[16];
+        header.get(salt);
+        header.getInt(); // record size
+        byte[] serverKey = new byte[header.get()];
+        header.get(serverKey);
+        var curve = ((java.security.interfaces.ECPublicKey) browser.getPublic()).getParams();
+        var point = new java.security.spec.ECPoint(new java.math.BigInteger(1, java.util.Arrays.copyOfRange(serverKey, 1, 33)),
+                new java.math.BigInteger(1, java.util.Arrays.copyOfRange(serverKey, 33, 65)));
+        var agreement = javax.crypto.KeyAgreement.getInstance("ECDH");
+        agreement.init(browser.getPrivate());
+        agreement.doPhase(java.security.KeyFactory.getInstance("EC").generatePublic(
+                new java.security.spec.ECPublicKeySpec(point, curve)), true);
+        byte[] browserKey = rawPoint((java.security.interfaces.ECPublicKey) browser.getPublic());
+        ByteArrayOutputStream info = new ByteArrayOutputStream();
+        info.write("WebPush: info\0".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        info.write(browserKey);
+        info.write(serverKey);
+        info.write(1);
+        byte[] ikm = java.util.Arrays.copyOf(hmac(hmac(authSecret, agreement.generateSecret()), info.toByteArray()), 32);
+        byte[] prk = hmac(salt, ikm);
+        byte[] cek = java.util.Arrays.copyOf(hmac(prk, "Content-Encoding: aes128gcm\0\1".getBytes(
+                java.nio.charset.StandardCharsets.US_ASCII)), 16);
+        byte[] nonce = java.util.Arrays.copyOf(hmac(prk, "Content-Encoding: nonce\0\1".getBytes(
+                java.nio.charset.StandardCharsets.US_ASCII)), 12);
+        javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(javax.crypto.Cipher.DECRYPT_MODE, new javax.crypto.spec.SecretKeySpec(cek, "AES"),
+                new javax.crypto.spec.GCMParameterSpec(128, nonce));
+        byte[] plain = cipher.doFinal(body, header.position(), body.length - header.position());
+        assertEquals(2, (int) plain[plain.length - 1], "Missing last-record delimiter");
+        return java.util.Arrays.copyOf(plain, plain.length - 1);
+    }
+
+    private static byte[] hmac(byte[] key, byte[] data) throws Exception {
+        javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+        mac.init(new javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"));
+        return mac.doFinal(data);
+    }
+
+    /** The push service checks this: an ES256 JWT signed by the server's VAPID key. */
+    private static void verifyVapid(String authorization, String vapidKey) throws Exception {
+        assertTrue(authorization.startsWith("vapid t=") && authorization.endsWith(", k=" + vapidKey),
+                "Bad VAPID header: " + authorization);
+        String[] jwt = authorization.substring(8, authorization.indexOf(',')).split("\\.");
+        byte[] key = java.util.Base64.getUrlDecoder().decode(vapidKey);
+        var curve = java.security.AlgorithmParameters.getInstance("EC");
+        curve.init(new java.security.spec.ECGenParameterSpec("secp256r1"));
+        var point = new java.security.spec.ECPoint(new java.math.BigInteger(1, java.util.Arrays.copyOfRange(key, 1, 33)),
+                new java.math.BigInteger(1, java.util.Arrays.copyOfRange(key, 33, 65)));
+        var verifier = java.security.Signature.getInstance("SHA256withECDSAinP1363Format");
+        verifier.initVerify(java.security.KeyFactory.getInstance("EC").generatePublic(new java.security.spec.ECPublicKeySpec(
+                point, curve.getParameterSpec(java.security.spec.ECParameterSpec.class))));
+        verifier.update((jwt[0] + "." + jwt[1]).getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        assertTrue(verifier.verify(java.util.Base64.getUrlDecoder().decode(jwt[2])), "VAPID signature invalid");
+        String claims = new String(java.util.Base64.getUrlDecoder().decode(jwt[1]), java.nio.charset.StandardCharsets.UTF_8);
+        assertTrue(claims.contains("\"aud\":\"http://127.0.0.1:"), "VAPID audience wrong: " + claims);
     }
 
     /** Browser-like client: compressed WebSocket both ways, then an image fetched over HTTP. */
