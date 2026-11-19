@@ -1,12 +1,11 @@
 package edu.ember.client.ui;
 
 import java.awt.GridLayout;
-import javax.swing.ButtonGroup;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
+import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
-import javax.swing.JRadioButton;
 import javax.swing.border.EmptyBorder;
 
 /** Provides theme selection and a developer-only connection-drop control. @concept Swing listeners */
@@ -19,25 +18,15 @@ public final class SettingsPanel extends JPanel {
         JLabel title = new JLabel("Settings");
         title.setForeground(ThemeManager.current().text());
         add(title);
-        JRadioButton dark = new JRadioButton("Ember Night", true);
-        JRadioButton light = new JRadioButton("Campus Daylight");
-        dark.setOpaque(false);
-        light.setOpaque(false);
-        dark.setForeground(ThemeManager.current().text());
-        light.setForeground(ThemeManager.current().text());
-        ButtonGroup themes = new ButtonGroup();
-        themes.add(dark);
-        themes.add(light);
-        dark.addActionListener(event -> {
-            ThemeManager.apply(ThemeManager.Theme.DARK);
+        JComboBox<ThemeManager.Theme> themes = new JComboBox<>(ThemeManager.Theme.values());
+        themes.setSelectedItem(ThemeManager.current());
+        themes.getAccessibleContext().setAccessibleName("Theme");
+        themes.addActionListener(event -> {
+            ThemeManager.apply((ThemeManager.Theme) themes.getSelectedItem());
             themeChanged.run();
         });
-        light.addActionListener(event -> {
-            ThemeManager.apply(ThemeManager.Theme.LIGHT);
-            themeChanged.run();
-        });
-        add(dark);
-        add(light);
+        add(new JLabel("Theme"));
+        add(themes);
         JCheckBox receipts = new JCheckBox("Send read receipts", true);
         receipts.setOpaque(false);
         receipts.setForeground(ThemeManager.current().text());

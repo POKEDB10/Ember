@@ -47,9 +47,10 @@ public final class ThemeManager {
     public static void applyToTree(java.awt.Component component) {
         if (component instanceof javax.swing.JComponent swing) {
             swing.setForeground(current.text());
-            if (component instanceof javax.swing.JComboBox<?>) {
+            if (component instanceof javax.swing.JComboBox<?> combo) {
                 // Nimbus paints combos with a light face in every palette, so they need dark ink.
                 swing.setForeground(Theme.LIGHT.text());
+                useDarkInkWhenClosed(combo);
             } else if (component instanceof javax.swing.JTextArea
                     || component instanceof javax.swing.JTextField
                     || component instanceof javax.swing.JPasswordField) {
@@ -70,15 +71,46 @@ public final class ThemeManager {
         }
     }
 
+    /** The closed box is painted by the renderer (index -1), which ignores setForeground. */
+    @SuppressWarnings("unchecked")
+    private static void useDarkInkWhenClosed(javax.swing.JComboBox<?> combo) {
+        ((javax.swing.JComboBox<Object>) combo).setRenderer(new javax.swing.DefaultListCellRenderer() {
+            @Override
+            public java.awt.Component getListCellRendererComponent(javax.swing.JList<?> list,
+                    Object value, int index, boolean selected, boolean focused) {
+                java.awt.Component cell = super.getListCellRendererComponent(list, value, index,
+                        selected, focused);
+                if (index < 0) {
+                    setOpaque(false); // keep the Nimbus face behind the text
+                    cell.setForeground(Theme.LIGHT.text());
+                }
+                return cell;
+            }
+        });
+    }
+
     public enum Theme {
-        // Same tokens as the web app's amber and paper themes (src/main/resources/web/app.css).
-        DARK(new Color(0x120B06), new Color(0x1B1109), new Color(0x28190C),
+        // Same tokens as the web app's themes (src/main/resources/web/app.css).
+        DARK("Amber terminal", new Color(0x120B06), new Color(0x1B1109), new Color(0x28190C),
                 new Color(0x7A2E0A), new Color(0xFF6A1A), new Color(0xFFB347),
                 new Color(0xB5813F), new Color(0xA6E86F), new Color(0xFFE08A)),
-        LIGHT(new Color(0xE9DFC8), new Color(0xF6EFDF), new Color(0xFFFAF0),
+        LIGHT("Paper", new Color(0xE9DFC8), new Color(0xF6EFDF), new Color(0xFFFAF0),
                 new Color(0xF3D2A8), new Color(0xB8430B), new Color(0x2B1D10),
-                new Color(0x6E5536), new Color(0x2F7A1F), new Color(0xB8430B));
+                new Color(0x6E5536), new Color(0x2F7A1F), new Color(0xB8430B)),
+        C64("C64 blue", new Color(0x352879), new Color(0x40318D), new Color(0x4B3BA3),
+                new Color(0x5A4AB8), new Color(0xE8E3FF), new Color(0xD4CEFF),
+                new Color(0x8E84D8), new Color(0x9BE29B), new Color(0xE8E3FF)),
+        SYNTH("Synthwave", new Color(0x13051F), new Color(0x1D0A2E), new Color(0x2A0F42),
+                new Color(0x4A1670), new Color(0x31E7FF), new Color(0xFF7AD9),
+                new Color(0xB45FA0), new Color(0x31E7FF), new Color(0x31E7FF)),
+        POCKET("Pocket handheld", new Color(0x9BBC0F), new Color(0x8BAC0F), new Color(0xA7C81E),
+                new Color(0xB8D43A), new Color(0x0F380F), new Color(0x0F380F),
+                new Color(0x306230), new Color(0x0F380F), new Color(0x306230)),
+        MONO("Mono CRT", new Color(0x0B0B0B), new Color(0x141414), new Color(0x1F1F1F),
+                new Color(0x333333), new Color(0xFFFFFF), new Color(0xE8E8E8),
+                new Color(0x9A9A9A), new Color(0xD0D0D0), new Color(0xFFFFFF));
 
+        private final String label;
         private final Color background;
         private final Color surface;
         private final Color elevated;
@@ -89,8 +121,9 @@ public final class ThemeManager {
         private final Color online;
         private final Color read;
 
-        Theme(Color background, Color surface, Color elevated, Color accent, Color social,
-                Color text, Color muted, Color online, Color read) {
+        Theme(String label, Color background, Color surface, Color elevated, Color accent,
+                Color social, Color text, Color muted, Color online, Color read) {
+            this.label = label;
             this.background = background;
             this.surface = surface;
             this.elevated = elevated;
@@ -102,6 +135,8 @@ public final class ThemeManager {
             this.read = read;
         }
 
+        /** Shown in the settings dropdown. */
+        @Override public String toString() { return label; }
         public Color background() { return background; }
         public Color surface() { return surface; }
         public Color elevated() { return elevated; }

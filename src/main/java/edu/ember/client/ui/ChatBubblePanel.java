@@ -79,8 +79,18 @@ public final class ChatBubblePanel extends JPanel {
         timer.start();
     }
 
+    /** Long messages show one short segment first (same limits as the website). */
+    private static final int READ_MORE_CHARS = 600;
+    private static final int READ_MORE_LINES = 12;
+
     private void addMessageBody(Message message, boolean outgoing) {
-        JTextArea body = new JTextArea(message.body());
+        String full = message.body();
+        String[] lines = full.split("\n", -1);
+        boolean longMessage = full.length() > READ_MORE_CHARS || lines.length > READ_MORE_LINES;
+        String shortText = String.join("\n", java.util.Arrays.copyOf(lines,
+                Math.min(lines.length, READ_MORE_LINES)));
+        shortText = shortText.substring(0, Math.min(shortText.length(), READ_MORE_CHARS)) + "…";
+        JTextArea body = new JTextArea(longMessage ? shortText : full);
         body.setLineWrap(true);
         body.setWrapStyleWord(true);
         body.setColumns(34);
@@ -91,7 +101,23 @@ public final class ChatBubblePanel extends JPanel {
         body.setBorder(null);
         body.setForeground(ThemeManager.current().text());
         body.setMargin(new Insets(0, 0, 0, 0));
-        bubble.add(body, BorderLayout.CENTER);
+        if (!longMessage) {
+            bubble.add(body, BorderLayout.CENTER);
+            return;
+        }
+        javax.swing.JButton readMore = new javax.swing.JButton("Read more");
+        readMore.setToolTipText("Show the whole message");
+        readMore.addActionListener(event -> {
+            body.setText(full);
+            body.setRows(Math.min(40, Math.max(1, (full.length() / 42) + 1)));
+            readMore.setVisible(false);
+            bubble.revalidate();
+        });
+        JPanel holder = new JPanel(new BorderLayout(0, 4));
+        holder.setOpaque(false);
+        holder.add(body, BorderLayout.CENTER);
+        holder.add(readMore, BorderLayout.SOUTH);
+        bubble.add(holder, BorderLayout.CENTER);
     }
 
     private JPanel createFooter(Message message, boolean outgoing,
