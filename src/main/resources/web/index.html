@@ -30,15 +30,16 @@
 
 <div id="app" hidden>
   <aside class="window side">
-    <header class="titlebar"><span id="me">▣ EMBER</span>
+    <header class="titlebar">
+      <button id="statusBtn" class="title-btn ellipsis" aria-haspopup="menu" title="Set your status"><span id="myDot" class="sdot online" aria-hidden="true"></span> <span id="me">EMBER</span> ▾</button>
       <span class="tools">
-        <button id="themeBtn" class="icon" title="Change theme" aria-label="Change theme">◐</button>
+        <button id="themeBtn" class="icon" title="Themes" aria-label="Themes" aria-haspopup="menu">◐</button>
         <button id="logoutBtn" class="icon" title="Log out" aria-label="Log out">⏻</button>
       </span></header>
     <nav class="tabs" role="tablist">
       <button role="tab" data-tab="chats" aria-selected="true">CHATS</button>
       <button role="tab" data-tab="pulse" aria-selected="false">PULSE</button>
-      <button role="tab" data-tab="me" aria-selected="false">ME</button>
+      <button role="tab" data-tab="me" aria-selected="false">ME <span id="meBadge" class="badge" hidden></span></button>
     </nav>
     <section id="tab-chats" class="tabpane">
       <div class="row pad"><input id="filter" type="search" placeholder="search chats…" aria-label="Search chats"></div>
@@ -52,7 +53,9 @@
     </section>
     <section id="tab-me" class="tabpane pad stack-s" hidden>
       <div id="meCard"></div>
-      <button id="notifyBtn">🔔 DESKTOP ALERTS: OFF</button>
+      <div id="requests"></div>
+      <button id="notifyBtn">🔔 NOTIFICATIONS: OFF</button>
+      <p class="dim small">Notifications reach this device even when Ember is closed. Do&nbsp;not&nbsp;disturb silences them.</p>
     </section>
     <footer id="status" class="status dim">offline</footer>
   </aside>
@@ -62,12 +65,14 @@
       <span class="ellipsis"><button id="back" class="icon back" aria-label="Back">◄</button>
         <button id="chatTitle" class="title-btn">▣ EMBER</button> <span id="chatSub" class="dim"></span></span>
       <span class="tools">
+        <button id="starBtn" class="icon" title="Show starred messages" aria-label="Show starred messages" aria-pressed="false" hidden>★</button>
         <button id="searchBtn" class="icon" title="Search this chat" aria-label="Search this chat" hidden>🔍</button>
         <button id="pollBtn" class="icon" title="New poll" aria-label="New poll" hidden>📊</button>
         <button id="addMember" class="icon" title="Add member" aria-label="Add member" hidden>+👤</button>
       </span>
     </header>
     <div id="searchBar" class="row pad" hidden><input id="search" type="search" placeholder="find in chat…" aria-label="Find in chat"></div>
+    <button id="pinBar" class="pinbar" hidden></button>
     <div id="polls" class="polls"></div>
     <div id="content" class="content" aria-live="polite"></div>
     <div id="typing" class="typing dim"></div>
@@ -83,6 +88,7 @@
   <figure><img id="overlayImg" alt=""><figcaption id="overlayCap"></figcaption></figure>
   <button id="overlayClose" class="icon" aria-label="Close">×</button>
 </div>
+<div id="notices" class="notices" aria-live="polite"></div>
 <input id="filePick" type="file" accept="image/png,image/jpeg,image/webp,image/heic" hidden>
 <div id="toast" class="toast" role="status" hidden></div>
 </body>
