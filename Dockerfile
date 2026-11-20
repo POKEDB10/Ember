@@ -16,5 +16,5 @@ COPY --from=build /src/classes ./classes
 # Tuned for Render's free 512 MB instance: small heap, serial GC, C1-only JIT (less CPU and RAM).
 ENV JAVA_TOOL_OPTIONS="-Xmx320m -Xss512k -XX:+UseSerialGC -XX:MaxMetaspaceSize=96m -XX:TieredStopAtLevel=1"
 EXPOSE 10000
-# PORT is set by Render. EMBER_ARGS adds options, e.g. "--admin-user yourname".
-CMD ["sh", "-c", "exec java -cp classes edu.ember.server.EmberServer --no-tls --rootz --http-bind 0.0.0.0 --http-port ${PORT:-10000} --storage /app/data --durability relaxed ${EMBER_ARGS:-}"]
+# PORT is set by Render. --trust-proxy: only Render's proxy can reach this container. EMBER_ARGS adds options, e.g. "--admin-user yourname".
+CMD ["sh", "-c", "exec java -cp classes edu.ember.server.EmberServer --no-tls --rootz --trust-proxy --http-bind 0.0.0.0 --http-port ${PORT:-10000} --storage /app/data --durability relaxed ${EMBER_ARGS:-}"]
