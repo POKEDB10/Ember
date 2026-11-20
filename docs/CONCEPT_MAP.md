@@ -72,3 +72,6 @@ Later concept mappings are added with the phase that implements the correspondin
 | Records | `WebGateway.Upgrade`, `WebGateway.Asset` |
 | Concurrent maps and atomic compute for multi-device presence | `EmberServer.online`, `sendToUser`, `removeOnline` |
 | Integration check against a live service | `edu.ember.tools.ReplicaCheck` |
+| Elliptic-curve key agreement, HKDF, AES-GCM, ES256 signatures (Web Push) | `server.WebPush` |
+| Change tracking with revisions and deletion markers | `InMemoryStorageEngine.getChangesSince`, `StorageEngine.currentRevision` |
+| Enum with constructor fields and `toString()` | `ThemeManager.Theme` (six themes, settings dropdown) |
