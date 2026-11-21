@@ -31,13 +31,13 @@ On Unix-like systems, use the matching `scripts/build.sh`, `scripts/run.sh`, `sc
 
 All messages live on the server, so an account can sign in on any number of devices at once (website, installed web app, Swing desktop app) and every device sees the full history plus live messages, including ones the same account sent from another device.
 
-- **Website.** The server also serves a web client (plain HTML/CSS/JS, about 60 KB, gzipped, ETag-revalidated and cached by a service worker). It speaks the same binary protocol over a compressed WebSocket (`permessage-deflate`), so every server rule applies unchanged. Features: direct and group chat, replies, reactions, edit/delete, disappearing messages, typing and presence, group polls, in-chat search, Campus Pulse photo posts with likes and comments, 24-hour stories, profiles with follow/block/report, three retro themes, and desktop notifications. Photos are shrunk in the browser (max 1600 px JPEG) before upload, and images load over plain HTTP with a one-year private cache, so each one downloads once per device. Browsers can install it as an app ("Install app" / "Add to Home screen").
+- **Website.** The server also serves a web client (plain HTML/CSS/JS, about 60 KB, gzipped, ETag-revalidated and cached by a service worker). It speaks the same binary protocol over a compressed WebSocket (`permessage-deflate`), so every server rule applies unchanged. Features: direct and group chat, replies, reactions, edit/delete, pins and stars (synced to every device), disappearing messages, a single Read more button on long messages, typing indicators, statuses (online, away, automatic idle, do not disturb, invisible), group polls, in-chat search, Campus Pulse photo posts with likes and comments, 24-hour stories, profiles with follow requests you can approve or decline, block and report, and seven retro themes in a picker. New messages in another chat pop up as a card with a quick-reply box; in a background tab they become system notifications with Reply and Mark read buttons; with no tab open they arrive as Web Push notifications (encrypted per browser, RFC 8291/8292). Do not disturb silences all of them. Chats are cached in the browser (IndexedDB) and a returning device downloads only the changes since its last visit; logging out deletes the cache. Photos are shrunk in the browser (max 1600 px JPEG) before upload, and images load over plain HTTP with a one-year private cache, so each one downloads once per device. Browsers can install it as an app ("Install app" / "Add to Home screen").
 - **Desktop app.** `scripts/run-client.bat --url https://ember.example.com` connects the Swing app to a hosted website over the same WebSocket (no local keys needed). Without `--url` it uses the direct TLS socket as before.
-- **Server options.** `--bind` (TLS listener address, default `0.0.0.0`), `--no-tls` (web-only), `--http-port` / `--http-bind` (plain-HTTP web listener for an HTTPS proxy; default bind `127.0.0.1`), `--max-frame-mb` (largest message or upload after login, default 25), `--rootz` (off-server storage, below), `--new-storage-key` (prints a fresh encryption key).
+- **Server options.** `--bind` (TLS listener address, default `0.0.0.0`), `--no-tls` (web-only), `--http-port` / `--http-bind` (plain-HTTP web listener for an HTTPS proxy; default bind `127.0.0.1`), `--max-frame-mb` (largest message or upload after login, default 25), `--rootz` (off-server storage, below), `--new-storage-key` (prints a fresh encryption key), `--trust-proxy` (believe the proxy's `X-Forwarded-For`; use only when the HTTP listener is reachable solely through your own proxy).
 - **Health check.** `GET /health` returns `ok` without touching data, for uptime monitors.
 - **Self-hosting with TLS.** The TLS port also serves the website at `https://<host>:7443/`. `gen-keys` makes a self-signed certificate for `localhost`/`127.0.0.1`; add names with `EMBER_HOSTS=ip:192.168.1.20,dns:mypc` (delete `config/ember-server.p12` first) and copy the new `config/ember-client-trust.p12` to desktop-client machines.
 
-**Limits.** Message length and upload size are capped only by `--max-frame-mb` (default 25 MB) so one upload cannot exhaust server memory. Frames before login are capped at 4 KB, images over 4096 px per side or 16 MP are rejected, and the per-user flood limiter still applies. Behind a proxy the login limiter uses the client address from `X-Forwarded-For`.
+**Limits.** Message length and upload size are capped only by `--max-frame-mb` (default 25 MB) so one upload cannot exhaust server memory. Frames before login are capped at 4 KB, images over 4096 px per side or 16 MP are rejected, and the per-user flood limiter still applies. With `--trust-proxy` the login limiter uses the client address from `X-Forwarded-For` (never a loopback address); without it, every proxied visitor counts as the proxy.
 
 ## Free hosting: Render + rootz.so
 
@@ -49,11 +49,11 @@ How it works: each change is appended to the write-ahead log and uploaded in a b
    ```text
    java -cp build\classes edu.ember.server.EmberServer --new-storage-key
    ```
-2. **rootz.so:** create an API key in dashboard settings. Optionally create a folder for Ember and note its ID.
+2. **rootz.so:** create an API key in dashboard settings. Create a folder named `ember` with two subfolders, `data` (encrypted log and snapshots) and `media` (encrypted images), and note the ID of the `ember` folder (it appears in the dashboard address when the folder is open). Missing subfolders fall back to the `ember` folder itself.
 3. **Render:** push this repository to GitHub, then in Render choose **New → Blueprint** and pick the repository. `render.yaml` creates one free Docker web service with a `/health` check. Fill in the secrets when asked:
    - `ROOTZ_API_KEY`: the rootz API key
    - `EMBER_STORAGE_KEY`: the key from step 1
-   - `ROOTZ_FOLDER_ID`: the folder ID, or leave empty
+   - `ROOTZ_FOLDER_ID`: the ID of the `ember` folder (leave empty to use the account root)
    - `EMBER_ARGS`: extra options, for example `--admin-user yourname`, or leave empty
 4. **Custom domain:** in the Render service, **Settings → Custom Domains → Add** `ember.pokedb.site`, then add the CNAME record Render shows at your DNS provider. Render issues the HTTPS certificate.
 5. **Stay awake:** free Render services sleep after about 15 minutes without traffic. Create a free UptimeRobot HTTP monitor for `https://ember.pokedb.site/health` every 5 minutes. A sleeping service still wakes on the first visit (about 30–60 s), and no data is lost either way.
@@ -63,6 +63,10 @@ Run only one server against the same rootz files at a time. `java -cp build\clas
 ## Local demo
 
 Run `scripts\run-demo.bat` (Windows) or `scripts/run-demo.sh` (Linux/macOS) to build and start a server plus three clients on `localhost:7443`. If keys are missing, the script runs `gen-keys`; `--demo-seed` adds Alice, Bob, Charlie, a study group, a poll, and sample Campus Pulse content to an empty demo data directory. Seeded credentials are `alice` / `alice-demo-42`, `bob` / `bob-demo-42`, and `charlie` / `charlie-demo-42`. Alice receives the administrator role only in this demo launch, which explicitly passes `--admin-user alice`. The seed skips when Alice already exists and does not reset server data.
+
+## Project report
+
+`docs/report/Ember_Report.docx` (and `.pdf`) is the formatted course report: Times New Roman, 12 pt text, 14 pt headings, 1.15 line spacing, UML figures in `docs/report/figures/`, website and desktop screenshots in `docs/screenshots/`. Fill in the team names and roll numbers on the cover page before printing.
 
 ## Proof tools and packaging
 
