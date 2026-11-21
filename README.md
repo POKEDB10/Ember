@@ -54,6 +54,7 @@ How it works: each change is appended to the write-ahead log and uploaded in a b
    - `ROOTZ_API_KEY`: the rootz API key
    - `EMBER_STORAGE_KEY`: the key from step 1
    - `ROOTZ_FOLDER_ID`: the ID of the `ember` folder (leave empty to use the account root)
+   - `EMBER_PUBLIC_URL`: your site address, e.g. `https://ember.pokedb.site` (push services use it as the contact)
    - `EMBER_ARGS`: extra options, for example `--admin-user yourname`, or leave empty
 4. **Custom domain:** in the Render service, **Settings → Custom Domains → Add** `ember.pokedb.site`, then add the CNAME record Render shows at your DNS provider. Render issues the HTTPS certificate.
 5. **Stay awake:** free Render services sleep after about 15 minutes without traffic. Create a free UptimeRobot HTTP monitor for `https://ember.pokedb.site/health` every 5 minutes. A sleeping service still wakes on the first visit (about 30–60 s), and no data is lost either way.
@@ -67,6 +68,8 @@ Run `scripts\run-demo.bat` (Windows) or `scripts/run-demo.sh` (Linux/macOS) to b
 ## Project report
 
 `docs/report/Ember_Report.docx` (and `.pdf`) is the formatted course report: Times New Roman, 12 pt text, 14 pt headings, 1.15 line spacing, UML figures in `docs/report/figures/`, website and desktop screenshots in `docs/screenshots/`. Fill in the team names and roll numbers on the cover page before printing.
+
+The report is generated, not hand-edited. In `docs/report/build/`: `java Diagrams.java ../figures` redraws the UML figures, `npm install` then `node report.js` writes the `.docx`, and LibreOffice's Python (`"C:\Program Files\LibreOffice\program\python.exe" export_pdf.py`) fills in the contents page numbers and writes the `.pdf`.
 
 ## Proof tools and packaging
 
