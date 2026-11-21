@@ -17,5 +17,7 @@ services:
         sync: false
       - key: ROOTZ_FOLDER_ID
         sync: false
+      - key: EMBER_PUBLIC_URL
+        sync: false
       - key: EMBER_ARGS
         sync: false
