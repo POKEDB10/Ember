@@ -47,6 +47,7 @@ public final class InMemoryStorageEngine implements StorageEngine {
     private final Map<String, Map<String, edu.ember.common.model.PushSubscription>> pushSubscriptions =
             new HashMap<>();
     private final Map<String, String> settings = new HashMap<>();
+    private static final int MAX_PUSH_SUBSCRIPTIONS = 10;
 
     /** Remembers a deleted message so caching devices learn to drop it. */
     private record Tombstone(String clientMsgId, String senderUserId, String conversationId,
@@ -364,7 +365,17 @@ public final class InMemoryStorageEngine implements StorageEngine {
         Map<String, edu.ember.common.model.PushSubscription> mine = pushSubscriptions.computeIfAbsent(
                 subscription.userId(), ignored -> new java.util.LinkedHashMap<>());
         if (active) {
+            // A browser endpoint belongs to one account: the last user who subscribed it.
+            pushSubscriptions.forEach((user, theirs) -> {
+                if (!user.equals(subscription.userId())) {
+                    theirs.remove(subscription.endpoint());
+                }
+            });
+            mine.remove(subscription.endpoint());
             mine.put(subscription.endpoint(), subscription);
+            while (mine.size() > MAX_PUSH_SUBSCRIPTIONS) { // bound outbound pushes per message
+                mine.remove(mine.keySet().iterator().next());
+            }
         } else {
             mine.remove(subscription.endpoint());
         }
