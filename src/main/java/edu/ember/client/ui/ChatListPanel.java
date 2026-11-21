@@ -138,7 +138,7 @@ public final class ChatListPanel extends JPanel implements ClientModelListener {
         return row;
     }
 
-    private static String peerName(String conversationId, String userId) {
+    static String peerName(String conversationId, String userId) {
         if (conversationId.startsWith("dm:")) {
             String[] participants = conversationId.substring(3).split(":", -1);
             if (participants.length == 2) {

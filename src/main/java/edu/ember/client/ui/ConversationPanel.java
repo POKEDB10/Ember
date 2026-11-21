@@ -130,7 +130,7 @@ public final class ConversationPanel extends JPanel implements ClientModelListen
     public void openConversation(String id) {
         conversationId = id;
         controller.openConversation(id);
-        heading.setText(id);
+        heading.setText(ChatListPanel.peerName(id, controller.model().userId()));
         createPollButton.setVisible(id.startsWith("grp:"));
         groupInfoButton.setVisible(id.startsWith("grp:"));
         refreshMessages();
