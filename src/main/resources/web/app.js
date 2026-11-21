@@ -242,7 +242,8 @@ function onAuth(f) {
   if (f.status && f.status !== 'online' && f.status !== 'idle') setMyStatus(f.status, false);
   else if (S.myStatus !== 'online') send(OP.STATUS_SET, { status: S.myStatus });
   request(OP.PROFILE_GET, { userId: S.me }).catch(() => {});
-  if (S.notify) subscribePush().catch(() => {});
+  // Re-bind this browser to the signed-in user, or drop a subscription left by someone else.
+  (S.notify ? subscribePush() : unsubscribePush()).catch(() => {});
 }
 
 function onDeliver(m) {
