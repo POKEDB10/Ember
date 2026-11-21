@@ -1,0 +1,8 @@
+{
+  "name": "ember-report",
+  "private": true,
+  "description": "Builds docs/report/Ember_Report.docx. Run: npm install, then node report.js",
+  "dependencies": {
+    "docx": "9.5.1"
+  }
+}
