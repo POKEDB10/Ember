@@ -1215,6 +1215,18 @@ public final class EmberTestSuite {
 
     /** The test plays a browser push service: it decrypts what the server sends (RFC 8291). */
     private void testWebPush() throws Exception {
+        InMemoryStorageEngine subscriptions = new InMemoryStorageEngine();
+        var shared = new edu.ember.common.model.PushSubscription("alice", "https://fcm.googleapis.com/x", "k", "a");
+        subscriptions.savePushSubscription(shared, true);
+        subscriptions.savePushSubscription(new edu.ember.common.model.PushSubscription(
+                "bob", shared.endpoint(), "k", "a"), true);
+        assertTrue(subscriptions.pushSubscriptions("alice").isEmpty(),
+                "A browser endpoint stayed bound to the previous user");
+        for (int index = 0; index < 12; index++) {
+            subscriptions.savePushSubscription(new edu.ember.common.model.PushSubscription(
+                    "carol", "https://fcm.googleapis.com/c" + index, "k", "a"), true);
+        }
+        assertEquals(10, subscriptions.pushSubscriptions("carol").size(), "Subscriptions were not capped");
         Path temporary = Files.createTempDirectory("ember-push");
         EmberServer server = new EmberServer(null, null, 0, new InMemoryStorageEngine(),
                 new SecurityAuditLogger(temporary.resolve("audit.json")), temporary.resolve("media"),
