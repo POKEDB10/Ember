@@ -195,6 +195,7 @@ public final class EmberServer implements AutoCloseable {
                 dataDirectory.resolve("media"), storyTtlSec, adminUsernames, bindAddress);
         server.setMaxFrameBytes(maxFrameMb * 1024 * 1024);
         server.setTrustForwardedFor(trustProxy);
+        server.setPushContact(readOptionalSecret(secrets, "EMBER_PUBLIC_URL"));
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 server.close();
@@ -249,6 +250,13 @@ public final class EmberServer implements AutoCloseable {
     public void setPushEndpointFilter(java.util.function.Predicate<java.net.URI> filter) {
         if (webPush != null) {
             webPush.setAllowedEndpoint(filter);
+        }
+    }
+
+    /** The site address push services may contact (VAPID "sub"); configuration only, never a header. */
+    public void setPushContact(String httpsUrl) {
+        if (webPush != null && httpsUrl != null && httpsUrl.startsWith("https://")) {
+            webPush.setContact(httpsUrl);
         }
     }
 
@@ -413,10 +421,6 @@ public final class EmberServer implements AutoCloseable {
                     input = upgrade.input();
                     output = upgrade.output();
                     useForwardedClient(upgrade.forwardedFor());
-                    if (webPush != null && upgrade.host() != null
-                            && upgrade.host().matches("[A-Za-z0-9.-]{1,253}(:\\d{1,5})?")) {
-                        webPush.setContact("https://" + upgrade.host());
-                    }
                 }
                 while (running.get() && !socket.isClosed()) {
                     try {

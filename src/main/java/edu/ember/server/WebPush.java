@@ -48,11 +48,13 @@ final class WebPush {
     private static final Logger LOGGER = Logger.getLogger(WebPush.class.getName());
     /** Real browser push services. Anything else is refused, so clients cannot make us call
      * arbitrary internal addresses (SSRF). */
-    private static final List<String> PUSH_HOSTS = List.of(".googleapis.com", ".mozilla.com",
-            ".mozaws.net", ".notify.windows.com", ".push.apple.com");
+    private static final List<String> PUSH_HOSTS = List.of("fcm.googleapis.com",
+            "updates.push.services.mozilla.com", "web.push.apple.com");
+    /** Windows assigns regional hosts such as wns2-par02p.notify.windows.com. */
+    private static final String WINDOWS_PUSH_SUFFIX = ".notify.windows.com";
     static final Predicate<URI> KNOWN_PUSH_SERVICES = uri -> "https".equals(uri.getScheme())
-            && uri.getHost() != null && PUSH_HOSTS.stream().anyMatch(suffix ->
-                    uri.getHost().endsWith(suffix) || uri.getHost().equals(suffix.substring(1)));
+            && uri.getHost() != null && (PUSH_HOSTS.contains(uri.getHost())
+                    || uri.getHost().endsWith(WINDOWS_PUSH_SUFFIX));
     private static final Base64.Encoder B64URL = Base64.getUrlEncoder().withoutPadding();
     private static final Base64.Decoder UNB64URL = Base64.getUrlDecoder();
     private final StorageEngine storage;
