@@ -81,6 +81,11 @@ public final class EmberTestSuite {
     }
 
     private void runAll() {
+        try {
+            deleteTree(Path.of("client_data")); // device keys and known contacts from earlier runs
+        } catch (IOException exception) {
+            throw new IllegalStateException("Could not clear old client data", exception);
+        }
         runTest("KV codec round trip", this::testKvRoundTrip);
         runTest("in-chat search matches every token including Arabic", this::testSearchEngine);
         runTest("bad frame magic rejected", this::testBadMagic);
@@ -100,6 +105,7 @@ public final class EmberTestSuite {
         runTest("Web Push: SSRF guard, invisible status, encrypted payload, VAPID signature",
                 this::testWebPush);
         runTest("calls: ringing, answer, encrypted relay, busy, block, and origin check", this::testCalls);
+        runTest("end-to-end chats: tamper, impostor and outsider refused; server sees only ciphertext", this::testEndToEndChat);
         runTest("theme palettes, wrapped message bodies, and EDT notifications",
                 this::testUiBasics);
         runTest("WAL restart recovers Arabic and emoji records and trims torn tail",
@@ -586,8 +592,10 @@ public final class EmberTestSuite {
                 reopened.init();
                 assertTrue(reopened.findUser("bob").isPresent(), "Bob's account was lost on restart");
                 List<Message> history = reopened.getHistory("dm:alice:bob", Long.MAX_VALUE, 10);
-                assertEquals("persist me 🌋", history.get(0).body(),
-                        "WAL message was lost on server restart");
+                String stored = history.get(0).body();
+                // Stored end-to-end encrypted when both devices had keys; never readable otherwise.
+                assertTrue(stored.equals("persist me 🌋") || stored.startsWith("e2e1."),
+                        "WAL message was lost on server restart: " + stored);
             }
         } finally {
             if (alice != null) { alice.close(); }
@@ -1076,8 +1084,9 @@ public final class EmberTestSuite {
                         java.nio.charset.StandardCharsets.US_ASCII);
                 assertEquals("HTTP/1.1 200 OK", head, "Web app file was not served on the TLS port");
             }
-            laptop = new ClientController("127.0.0.1", server.port(), trust, password);
-            phone = new ClientController("127.0.0.1", server.port(), trust, password);
+            Path devices = Files.createTempDirectory("ember-two-devices"); // no keys left by other tests
+            laptop = new ClientController("127.0.0.1", server.port(), trust, password, devices);
+            phone = new ClientController("127.0.0.1", server.port(), trust, password, devices);
             String longBody = "x".repeat(5_000);
             CountDownLatch laptopAuth = new CountDownLatch(1);
             CountDownLatch phoneAuth = new CountDownLatch(1);
@@ -1129,7 +1138,8 @@ public final class EmberTestSuite {
                 assertTrue(phoneGotLong.await(20, TimeUnit.SECONDS), "Second device missed the message");
                 laptop.sendMessage("dm:alice:bob", "from laptop");
                 assertTrue(phoneGotOwn.await(20, TimeUnit.SECONDS),
-                        "Sender's other device did not receive the sent message");
+                        "Sender's other device did not receive the sent message: laptop="
+                                + laptop.model().errorMessage() + " phone=" + phone.model().errorMessage());
                 WireFrame delivered = wsRead(in, WireOpcodes.EVT_MSG_DELIVER);
                 assertEquals("from laptop", KvPayloadCodec.decode(delivered.payload()).get("body"),
                         "Web user did not receive the desktop message");
@@ -1174,7 +1184,7 @@ public final class EmberTestSuite {
             desktop.register("carol", "carol-pass-42".toCharArray(), "Carol");
             assertTrue(auth.await(30, TimeUnit.SECONDS), "Swing client could not log in over WebSocket");
             desktop.sendMessage("dm:carol:dave", "hello over websocket");
-            assertTrue(sent.await(20, TimeUnit.SECONDS), "Swing client message was not acknowledged");
+            assertTrue(sent.await(20, TimeUnit.SECONDS), "Swing client message was not acknowledged: " + desktop.model().errorMessage());
             assertTrue(desktop.transport().startsWith("WebSocket"), "Transport label is wrong");
         } finally {
             if (desktop != null) { desktop.close(); }
@@ -1721,6 +1731,83 @@ public final class EmberTestSuite {
                 assertEquals("403", wsFields(alice, WireOpcodes.EVT_ERROR).get("code"), "A blocked user could call");
             }
         } finally {
+            server.close();
+        }
+    }
+
+    /** End-to-end encryption: crypto rules, then two desktop apps whose server only sees ciphertext. */
+    private void testEndToEndChat() throws Exception {
+        var alice = edu.ember.common.security.E2eCrypto.newIdentity();
+        var bob = edu.ember.common.security.E2eCrypto.newIdentity();
+        var mallory = edu.ember.common.security.E2eCrypto.newIdentity();
+        var keys = List.of(
+                new edu.ember.common.security.E2eCrypto.DeviceKey("alice", alice.deviceId(), alice.publicKey(), true),
+                new edu.ember.common.security.E2eCrypto.DeviceKey("bob", bob.deviceId(), bob.publicKey(), true));
+        String sealed = edu.ember.common.security.E2eCrypto.seal(alice, "dm:alice:bob", "alice", "m1",
+                "top secret 🔐", keys);
+        assertTrue(sealed.startsWith("e2e1.") && !sealed.contains("secret"), "Message was not encrypted");
+        assertEquals("top secret 🔐", edu.ember.common.security.E2eCrypto.open(bob, "dm:alice:bob", "alice", "m1",
+                sealed, keys), "Recipient could not decrypt");
+        assertEquals("top secret 🔐", edu.ember.common.security.E2eCrypto.open(alice, "dm:alice:bob", "alice", "m1",
+                sealed, keys), "Sender's own device could not read its message");
+        for (String[] wrong : new String[][] {{"dm:bob:carol", "alice", "m1"}, {"dm:alice:bob", "alice", "m2"},
+                {"dm:alice:bob", "bob", "m1"}}) {
+            boolean refused = false;
+            try {
+                edu.ember.common.security.E2eCrypto.open(bob, wrong[0], wrong[1], wrong[2], sealed, keys);
+            } catch (java.security.GeneralSecurityException expected) {
+                refused = true;
+            }
+            assertTrue(refused, "A message moved to another chat, id or sender was accepted");
+        }
+        boolean outsider = false;
+        try {
+            edu.ember.common.security.E2eCrypto.open(mallory, "dm:alice:bob", "alice", "m1", sealed, keys);
+        } catch (java.security.GeneralSecurityException expected) {
+            outsider = true;
+        }
+        assertTrue(outsider, "A device the message was not for could read it");
+        // An impostor device posing as Alice is refused: its key is not one of Alice's.
+        String forged = edu.ember.common.security.E2eCrypto.seal(mallory, "dm:alice:bob", "alice", "m3", "hi", keys);
+        boolean impostor = false;
+        try {
+            edu.ember.common.security.E2eCrypto.open(bob, "dm:alice:bob", "alice", "m3", forged, keys);
+        } catch (java.security.GeneralSecurityException expected) {
+            impostor = true;
+        }
+        assertTrue(impostor, "A message from an unknown device was accepted as Alice's");
+
+        Path config = Path.of("config");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        Path trust = config.resolve("ember-client-trust.p12");
+        InMemoryStorageEngine storage = new InMemoryStorageEngine();
+        Path temporary = Files.createTempDirectory("ember-e2e");
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0, storage,
+                new SecurityAuditLogger(temporary.resolve("audit.json")));
+        ClientController aliceApp = null;
+        ClientController bobApp = null;
+        try {
+            server.start();
+            aliceApp = new ClientController("127.0.0.1", server.port(), trust, password, temporary.resolve("a"));
+            bobApp = new ClientController("127.0.0.1", server.port(), trust, password, temporary.resolve("b"));
+            CountDownLatch received = new CountDownLatch(1);
+            bobApp.addListener((model, event, message) -> {
+                if (event.equals("MESSAGE") && message != null && message.body().equals("only bob can read this 🔐")) {
+                    received.countDown();
+                }
+            });
+            aliceApp.register("alice", "alice-pass-42".toCharArray(), "Alice");
+            bobApp.register("bob", "bob-pass-42".toCharArray(), "Bob");
+            waitFor(() -> storage.setting("devkeys:alice").isPresent() && storage.setting("devkeys:bob").isPresent(),
+                    "Devices did not register their keys");
+            aliceApp.sendMessage("dm:alice:bob", "only bob can read this 🔐");
+            assertTrue(received.await(20, TimeUnit.SECONDS), "Bob did not receive the decrypted message");
+            String onServer = storage.getHistory("dm:alice:bob", Long.MAX_VALUE, 5).get(0).body();
+            assertTrue(onServer.startsWith("e2e1.") && !onServer.contains("bob can read"),
+                    "The server stored readable text: " + onServer);
+        } finally {
+            if (aliceApp != null) { aliceApp.close(); }
+            if (bobApp != null) { bobApp.close(); }
             server.close();
         }
     }
