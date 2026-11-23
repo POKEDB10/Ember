@@ -25,7 +25,7 @@ import java.util.zip.Inflater;
  * server rule applies to web users too. WebSocket traffic is compressed (permessage-deflate)
  * when the browser offers it. @concept Adapter pattern, streams, compression
  */
-final class WebGateway {
+public final class WebGateway {
     private static final String WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private static final int MAX_LINE = 8192;
     /** Deflate's sync-flush marker: stripped when sending, appended before inflating (RFC 7692). */
@@ -36,14 +36,20 @@ final class WebGateway {
     private static final Map<String, String> FILES = Map.of(
             "/", "index.html", "/index.html", "index.html", "/app.js", "app.js",
             "/app.css", "app.css", "/manifest.json", "manifest.json", "/sw.js", "sw.js",
-            "/icon.svg", "icon.svg");
+            "/icon.svg", "icon.svg", "/call-worklet.js", "call-worklet.js",
+            "/call.js", "call.js");
     private static final Map<String, String> TYPES = Map.of(
             "html", "text/html; charset=utf-8", "js", "text/javascript; charset=utf-8",
             "css", "text/css; charset=utf-8", "json", "application/manifest+json",
             "svg", "image/svg+xml");
+    /** Locks the page down: only its own scripts, no framing, camera/microphone only for this site. */
     private static final String SECURITY_HEADERS = "\r\nX-Content-Type-Options: nosniff"
             + "\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self';"
-            + " img-src 'self' blob: data:; connect-src 'self'; frame-ancestors 'none'";
+            + " img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self';"
+            + " object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+            + "\r\nStrict-Transport-Security: max-age=31536000"
+            + "\r\nPermissions-Policy: camera=(self), microphone=(self), geolocation=(), payment=(), usb=()"
+            + "\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin";
     private static final Map<String, Asset> CACHE = new ConcurrentHashMap<>();
 
     /** Loads an image for a signed-in viewer, or returns null when it is missing or not visible. */
@@ -97,6 +103,12 @@ final class WebGateway {
         String query = target.length > 1 ? target[1] : "";
         String key = headers.get("sec-websocket-key");
         if ("websocket".equalsIgnoreCase(headers.get("upgrade")) && key != null) {
+            // A browser always sends Origin; another website's page must not open a socket here.
+            if (!sameOrigin(headers.get("origin"), headers.get("host"))) {
+                write(out, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                out.flush();
+                return null;
+            }
             boolean deflate = headers.getOrDefault("sec-websocket-extensions", "")
                     .contains("permessage-deflate");
             write(out, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
@@ -120,6 +132,19 @@ final class WebGateway {
         }
         out.flush();
         return null;
+    }
+
+    /** True with no Origin (desktop app, tools) or when the Origin names this same host. */
+    public static boolean sameOrigin(String origin, String host) {
+        if (origin == null) {
+            return true;
+        }
+        try {
+            String authority = java.net.URI.create(origin).getRawAuthority();
+            return authority != null && host != null && authority.equalsIgnoreCase(host);
+        } catch (IllegalArgumentException exception) {
+            return false;
+        }
     }
 
     /** Images never change once uploaded, so the browser may cache them for a year. */
@@ -404,7 +429,9 @@ final class WebGateway {
             }
             byte[] payload = pending.toByteArray();
             pending.reset();
-            boolean compress = deflater != null && payload.length >= COMPRESS_MIN_BYTES;
+            // Call packets are encrypted, so compressing them would only burn CPU (byte 5 is the opcode).
+            boolean compress = deflater != null && payload.length >= COMPRESS_MIN_BYTES
+                    && (payload[5] & 0xFF) != edu.ember.common.protocol.WireOpcodes.EVT_CALL_MEDIA;
             if (compress) {
                 payload = deflate(payload);
             }
