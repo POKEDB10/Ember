@@ -99,6 +99,7 @@ public final class EmberTestSuite {
                 this::testRevisionSync);
         runTest("Web Push: SSRF guard, invisible status, encrypted payload, VAPID signature",
                 this::testWebPush);
+        runTest("calls: ringing, answer, encrypted relay, busy, block, and origin check", this::testCalls);
         runTest("theme palettes, wrapped message bodies, and EDT notifications",
                 this::testUiBasics);
         runTest("WAL restart recovers Arabic and emoji records and trims torn tail",
@@ -1581,6 +1582,133 @@ public final class EmberTestSuite {
             if (frame.opcode() == opcode) {
                 return frame;
             }
+        }
+    }
+
+    /** A browser-like WebSocket client for the call tests. */
+    private record WsClient(SSLSocket socket, java.io.InputStream in, java.io.OutputStream out) implements AutoCloseable {
+        @Override
+        public void close() throws IOException {
+            socket.close();
+        }
+    }
+
+    private static WsClient wsOpen(Path trust, char[] password, int port, String origin) throws Exception {
+        SSLSocket socket = TlsSocketFactory.createClientSocket(trust, password, "127.0.0.1", port);
+        socket.setSoTimeout(20_000);
+        var in = new java.io.BufferedInputStream(socket.getInputStream());
+        var out = socket.getOutputStream();
+        out.write(("GET / HTTP/1.1\r\nHost: 127.0.0.1:" + port + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                + (origin == null ? "" : "Origin: " + origin + "\r\n")
+                + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+                .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        StringBuilder response = new StringBuilder();
+        while (!response.toString().endsWith("\r\n\r\n")) {
+            int next = in.read();
+            if (next < 0) {
+                break;
+            }
+            response.append((char) next);
+        }
+        if (!response.toString().startsWith("HTTP/1.1 101")) {
+            socket.close();
+            throw new IOException(response.toString().split("\r\n")[0]);
+        }
+        return new WsClient(socket, in, out);
+    }
+
+    private static Map<String, String> wsFields(WsClient client, int opcode) throws Exception {
+        return KvPayloadCodec.decode(wsRead(client.in(), opcode).payload());
+    }
+
+    private static void callCommand(WsClient client, long corr, Map<String, String> fields) throws IOException {
+        wsSend(client.out(), FrameFactory.command(WireOpcodes.CMD_CALL, corr, fields));
+    }
+
+    /** Ringing, answering, encrypted-packet relay, busy, block, capability and origin rules for calls. */
+    private void testCalls() throws Exception {
+        assertTrue(edu.ember.server.WebGateway.sameOrigin(null, "x"), "No Origin (desktop app) must be allowed");
+        assertTrue(edu.ember.server.WebGateway.sameOrigin("https://ember.pokedb.site", "ember.pokedb.site"),
+                "Same-site Origin was refused");
+        assertTrue(!edu.ember.server.WebGateway.sameOrigin("https://evil.example", "ember.pokedb.site"),
+                "Another site's Origin was accepted");
+        TokenBucket bytes = new TokenBucket(100, 0);
+        assertTrue(bytes.tryConsume(60) && !bytes.tryConsume(60), "Byte bucket did not limit");
+
+        Path config = Path.of("config");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        Path trust = config.resolve("ember-client-trust.p12");
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0);
+        try {
+            server.start();
+            int port = server.port();
+            boolean refused = false;
+            try (WsClient evil = wsOpen(trust, password, port, "https://evil.example")) {
+                evil.socket();
+            } catch (IOException expected) {
+                refused = expected.getMessage().contains("403");
+            }
+            assertTrue(refused, "A WebSocket from another website's page was accepted");
+            try (WsClient alice = wsOpen(trust, password, port, "https://127.0.0.1:" + port);
+                    WsClient bob = wsOpen(trust, password, port, null);
+                    WsClient carol = wsOpen(trust, password, port, null)) {
+                wsSend(alice.out(), FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                        Map.of("user", "alice", "pass", "alice-pass-42", "displayName", "Alice", "calls", "1")));
+                assertTrue(wsFields(alice, WireOpcodes.EVT_AUTH_OK).get("ice").contains("stun:"),
+                        "Browsers were not given STUN servers");
+                wsSend(bob.out(), FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                        Map.of("user", "bob", "pass", "bob-pass-42", "displayName", "Bob", "calls", "1")));
+                wsRead(bob.in(), WireOpcodes.EVT_AUTH_OK);
+                // Carol's client says nothing about calls, like the Swing app.
+                wsSend(carol.out(), FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                        Map.of("user", "carol", "pass", "carol-pass-42", "displayName", "Carol")));
+                wsRead(carol.in(), WireOpcodes.EVT_AUTH_OK);
+
+                callCommand(alice, 3, Map.of("kind", "ring", "convId", "dm:alice:carol", "video", "false"));
+                assertEquals("unavailable", wsFields(alice, WireOpcodes.EVT_CALL).get("reason"),
+                        "A device that cannot take calls was rung");
+
+                callCommand(alice, 4, Map.of("kind", "ring", "convId", "dm:alice:bob", "video", "true"));
+                Map<String, String> ringing = wsFields(alice, WireOpcodes.EVT_CALL);
+                assertEquals("ringing", ringing.get("kind"), "Caller did not hear ringing");
+                String callId = ringing.get("callId");
+                Map<String, String> ring = wsFields(bob, WireOpcodes.EVT_CALL);
+                assertEquals("ring", ring.get("kind"), "Callee was not rung");
+                assertEquals(callId, ring.get("callId"), "Ring carried another call id");
+                assertEquals("true", ring.get("video"), "Video flag was lost");
+
+                callCommand(carol, 2, Map.of("kind", "sdp", "callId", callId, "data", "x"));
+                assertEquals("404", wsFields(carol, WireOpcodes.EVT_ERROR).get("code"),
+                        "An outsider could signal into someone else's call");
+                callCommand(carol, 3, Map.of("kind", "ring", "convId", "dm:bob:carol"));
+                assertEquals("busy", wsFields(carol, WireOpcodes.EVT_CALL).get("reason"),
+                        "A second call reached someone already ringing");
+
+                callCommand(bob, 2, Map.of("kind", "accept", "callId", callId));
+                assertEquals("accept", wsFields(alice, WireOpcodes.EVT_CALL).get("kind"), "Caller missed the answer");
+                callCommand(alice, 5, Map.of("kind", "key", "callId", callId, "data", "PUBLICKEY"));
+                Map<String, String> key = wsFields(bob, WireOpcodes.EVT_CALL);
+                assertEquals("PUBLICKEY", key.get("data"), "Key exchange was not relayed unchanged");
+
+                byte[] packet = new byte[1200];
+                new java.security.SecureRandom().nextBytes(packet);
+                wsSend(alice.out(), new WireFrame.Builder(WireOpcodes.CMD_CALL_MEDIA).payload(packet).build());
+                assertTrue(java.util.Arrays.equals(packet, wsRead(bob.in(), WireOpcodes.EVT_CALL_MEDIA).payload()),
+                        "Encrypted call packet was not forwarded byte for byte");
+
+                callCommand(bob, 3, Map.of("kind", "end", "callId", callId));
+                assertEquals("ended", wsFields(alice, WireOpcodes.EVT_CALL).get("reason"), "Hang-up did not reach caller");
+                callCommand(alice, 6, Map.of("kind", "key", "callId", callId, "data", "late"));
+                assertEquals("404", wsFields(alice, WireOpcodes.EVT_ERROR).get("code"), "A finished call accepted signals");
+
+                wsSend(bob.out(), FrameFactory.command(WireOpcodes.CMD_USER_BLOCK, 4,
+                        Map.of("targetUserId", "alice", "blocked", "true")));
+                Thread.sleep(300);
+                callCommand(alice, 7, Map.of("kind", "ring", "convId", "dm:alice:bob"));
+                assertEquals("403", wsFields(alice, WireOpcodes.EVT_ERROR).get("code"), "A blocked user could call");
+            }
+        } finally {
+            server.close();
         }
     }
 
