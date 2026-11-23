@@ -20,8 +20,9 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class CallRegistry<D> {
     /** Ringing calls give up after this long. */
     public static final long RING_TIMEOUT_MS = 45_000;
-    /** Signalling messages (SDP, ICE candidates, keys) allowed per call, so a client cannot flood. */
-    public static final int MAX_SIGNALS = 2_000;
+    /** Signalling messages (SDP, ICE candidates, keys) per device: a burst, then a steady trickle. */
+    private static final double SIGNAL_BURST = 400;
+    private static final double SIGNALS_PER_SEC = 20;
     /** More people than this would make every phone upload too many streams. */
     public static final int MAX_PARTICIPANTS = 8;
     /** Relayed media per device: ~1 Mbit/s sustained, a 2 s burst for key frames. */
@@ -43,7 +44,7 @@ public final class CallRegistry<D> {
         private volatile State state = State.RINGING;
         private final Map<String, D> participants = new LinkedHashMap<>();
         private final Map<D, TokenBucket> media = new ConcurrentHashMap<>();
-        private int signals;
+        private final Map<D, TokenBucket> signals = new ConcurrentHashMap<>();
 
         private Call(String id, String conversationId, String caller, D callerDevice, Set<String> invited,
                 boolean video, boolean group, boolean phantom) {
@@ -137,6 +138,7 @@ public final class CallRegistry<D> {
         if (device != null) {
             callOfDevice.remove(device, call);
             call.media.remove(device);
+            call.signals.remove(device);
         }
         callOfUser.remove(userId, call.id);
         boolean over = !call.group || call.participants().size() <= 1;
@@ -179,9 +181,16 @@ public final class CallRegistry<D> {
         return others;
     }
 
-    /** Counts one signalling message; false once the call has used its allowance. */
-    public synchronized boolean allowSignal(Call<D> call) {
-        return ++call.signals <= MAX_SIGNALS;
+    /** Counts one signalling message from a device; each device has its own allowance. */
+    public boolean allowSignal(Call<D> call, D device) {
+        return call.signals.computeIfAbsent(device,
+                ignored -> new TokenBucket(SIGNAL_BURST, SIGNALS_PER_SEC)).tryConsume();
+    }
+
+    /** The call a person is in or being rung for, or null. */
+    public Call<D> callOfUser(String userId) {
+        String id = callOfUser.get(userId);
+        return id == null ? null : calls.get(id);
     }
 
     /** Byte-rate limit on relayed media, per sending device; false means drop this packet. */

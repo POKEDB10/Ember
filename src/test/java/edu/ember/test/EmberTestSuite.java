@@ -1632,6 +1632,16 @@ public final class EmberTestSuite {
         return KvPayloadCodec.decode(wsRead(client.in(), opcode).payload());
     }
 
+    /** What the server relays: [sender length][sender][the packet unchanged]. */
+    private static byte[] stamp(String sender, byte[] packet) {
+        byte[] name = sender.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] out = new byte[1 + name.length + packet.length];
+        out[0] = (byte) name.length;
+        System.arraycopy(name, 0, out, 1, name.length);
+        System.arraycopy(packet, 0, out, 1 + name.length, packet.length);
+        return out;
+    }
+
     private static void callCommand(WsClient client, long corr, Map<String, String> fields) throws IOException {
         wsSend(client.out(), FrameFactory.command(WireOpcodes.CMD_CALL, corr, fields));
     }
@@ -1722,8 +1732,8 @@ public final class EmberTestSuite {
                 byte[] packet = new byte[1200];
                 new java.security.SecureRandom().nextBytes(packet);
                 wsSend(alice.out(), new WireFrame.Builder(WireOpcodes.CMD_CALL_MEDIA).payload(packet).build());
-                assertTrue(java.util.Arrays.equals(packet, wsRead(bob.in(), WireOpcodes.EVT_CALL_MEDIA).payload()),
-                        "Encrypted call packet was not forwarded byte for byte");
+                assertTrue(java.util.Arrays.equals(stamp("alice", packet), wsRead(bob.in(), WireOpcodes.EVT_CALL_MEDIA).payload()),
+                        "Encrypted call packet was not forwarded byte for byte with its sender");
 
                 callCommand(bob, 3, Map.of("kind", "end", "callId", callId));
                 assertEquals("ended", wsFields(alice, WireOpcodes.EVT_CALL).get("reason"), "Hang-up did not reach caller");
@@ -1754,8 +1764,8 @@ public final class EmberTestSuite {
                     byte[] shout = new byte[300];
                     new java.security.SecureRandom().nextBytes(shout);
                     wsSend(dave.out(), new WireFrame.Builder(WireOpcodes.CMD_CALL_MEDIA).payload(shout).build());
-                    assertTrue(java.util.Arrays.equals(shout, wsRead(alice.in(), WireOpcodes.EVT_CALL_MEDIA).payload())
-                            && java.util.Arrays.equals(shout, wsRead(bob.in(), WireOpcodes.EVT_CALL_MEDIA).payload()),
+                    assertTrue(java.util.Arrays.equals(stamp("dave", shout), wsRead(alice.in(), WireOpcodes.EVT_CALL_MEDIA).payload())
+                            && java.util.Arrays.equals(stamp("dave", shout), wsRead(bob.in(), WireOpcodes.EVT_CALL_MEDIA).payload()),
                             "A group packet did not reach every other participant");
                     callCommand(bob, 44, Map.of("kind", "end", "callId", groupCall));
                     Map<String, String> left = wsFields(alice, WireOpcodes.EVT_CALL);

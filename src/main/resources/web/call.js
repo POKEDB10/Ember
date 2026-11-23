@@ -482,11 +482,15 @@ function sendPacket(c, type, flags, data, time) {
   }).catch(() => {});
 }
 
-function onCallMedia(bytes) {
+/** The server stamps each packet with who sent it; a packet is used only with that person's own key. */
+function onCallMedia(stamped) {
   const c = call;
-  if (!c || !c.relay || bytes.length < 24) return;
+  if (!c || !c.relay || !stamped.length) return;
+  const sender = unutf8.decode(stamped.subarray(1, 1 + stamped[0]));
+  const bytes = stamped.subarray(1 + stamped[0]);
+  if (bytes.length < 24) return;
   const p = c.byTag.get(b64(bytes.subarray(0, 4)));
-  if (!p || !p.relay) return;
+  if (!p || !p.relay || p.user !== sender) return;
   const copy = bytes.slice(), r = p.relay;
   r.chain = r.chain.then(async () => {
     const ctr = new DataView(copy.buffer).getUint32(4);

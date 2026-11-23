@@ -796,7 +796,7 @@ public final class EmberServer implements AutoCloseable {
                     var peer = call.deviceOf(fields.required("to"));
                     String data = fields.values.getOrDefault("data", "");
                     if (peer == null || call.deviceOf(userId) != this || peer == this || data.length() > 16_384
-                            || !callRegistry.allowSignal(call)) {
+                            || !callRegistry.allowSignal(call, this)) {
                         throw new edu.ember.common.exceptions.ValidationException("Call signal rejected");
                     }
                     sendToDevice(peer, callEvent(call, kind, java.util.Map.of("data", data, "from", userId)));
@@ -807,6 +807,9 @@ public final class EmberServer implements AutoCloseable {
 
         private void joinCall(long correlationId, CallRegistry.Call<ConnectionHandler> call) throws IOException,
                 edu.ember.common.exceptions.EmberException {
+            if (call.group) {
+                groupService.requireMember(userId, call.conversationId.substring(4)); // still a member now
+            }
             if (callRegistry.join(call.id, userId, this) == null) {
                 throw new edu.ember.common.exceptions.ResourceNotFoundException("The call has ended");
             }
@@ -912,8 +915,14 @@ public final class EmberServer implements AutoCloseable {
             if (others.isEmpty() || packet.length > 65_536 || !callRegistry.allowMedia(call, this, packet.length)) {
                 return;
             }
+            // Stamped with the sender's account, so nobody in the call can pass audio off as someone else's.
+            byte[] sender = userId.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] stamped = new byte[1 + sender.length + packet.length];
+            stamped[0] = (byte) sender.length;
+            System.arraycopy(sender, 0, stamped, 1, sender.length);
+            System.arraycopy(packet, 0, stamped, 1 + sender.length, packet.length);
             var event = new edu.ember.common.protocol.WireFrame.Builder(
-                    edu.ember.common.protocol.WireOpcodes.EVT_CALL_MEDIA).payload(packet).build();
+                    edu.ember.common.protocol.WireOpcodes.EVT_CALL_MEDIA).payload(stamped).build();
             for (ConnectionHandler other : others) {
                 sendToDevice(other, event);
             }
@@ -1007,9 +1016,15 @@ public final class EmberServer implements AutoCloseable {
                 edu.ember.common.exceptions.EmberException {
             requireAuthenticated(frame.correlationId());
             MapFields fields = new MapFields(frame.payload());
-            groupService.changeMember(userId, fields.required("groupId"),
-                    fields.required("targetUser"), fields.required("action"));
-            sendGroupUpdate(frame.correlationId(), fields.required("groupId"));
+            String groupId = fields.required("groupId");
+            String target = fields.required("targetUser");
+            groupService.changeMember(userId, groupId, target, fields.required("action"));
+            var call = callRegistry.callOfUser(target);
+            if (call != null && call.conversationId.equals("grp:" + groupId)
+                    && !participantsOf(call.conversationId).contains(target)) {
+                leaveCall(call, target, "ended"); // removed from the group: out of its call too
+            }
+            sendGroupUpdate(frame.correlationId(), groupId);
         }
 
         private void groupInfo(edu.ember.common.protocol.WireFrame frame) throws IOException,
