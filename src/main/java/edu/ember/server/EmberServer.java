@@ -507,6 +507,8 @@ public final class EmberServer implements AutoCloseable {
                     case edu.ember.common.protocol.WireOpcodes.CMD_PUSH_SUBSCRIBE -> subscribePush(frame);
                     case edu.ember.common.protocol.WireOpcodes.CMD_CALL -> call(frame);
                     case edu.ember.common.protocol.WireOpcodes.CMD_CALL_MEDIA -> callMedia(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_DEVICE_KEY -> deviceKey(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_KEYS_GET -> keysGet(frame);
                     default -> sendError(frame.correlationId(), "400", "Unsupported command");
                 }
             } catch (edu.ember.common.exceptions.EmberException exception) {
@@ -648,6 +650,80 @@ public final class EmberServer implements AutoCloseable {
                 statuses.put(userId, status);
             }
             broadcastPresence(userId, true);
+        }
+
+        /** Registers (or retires, on logout) this device's public key for encrypted chats. */
+        private void deviceKey(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            String deviceId = fields.required("deviceId");
+            if (!DeviceKeys.validDeviceId(deviceId)) {
+                throw new edu.ember.common.exceptions.ValidationException("Invalid device id");
+            }
+            boolean retire = "retire".equals(fields.values.get("action"));
+            synchronized (DeviceKeys.class) {
+                var keys = DeviceKeys.parse(storage.setting("devkeys:" + userId).orElse(""));
+                java.util.List<DeviceKeys.Key> next;
+                if (retire) {
+                    next = DeviceKeys.retire(keys, deviceId);
+                } else {
+                    String publicKey = fields.required("pub");
+                    if (!DeviceKeys.validPublicKey(publicKey)) {
+                        throw new edu.ember.common.exceptions.ValidationException("Invalid public key");
+                    }
+                    next = DeviceKeys.add(keys, deviceId, publicKey, System.currentTimeMillis());
+                    if (next == null) {
+                        throw new edu.ember.common.exceptions.AuthorizationException(
+                                "This device already has a different key");
+                    }
+                }
+                if (!next.equals(keys)) {
+                    storage.saveSetting("devkeys:" + userId, DeviceKeys.format(next));
+                    auditLogger.log(retire ? "device_key_retired" : "device_key_added", userId, deviceId);
+                    var changed = edu.ember.common.protocol.FrameFactory.event(
+                            edu.ember.common.protocol.WireOpcodes.EVT_KEYS_CHANGED, 0,
+                            java.util.Map.of("userId", userId));
+                    sendToUser(userId, changed, this);
+                    for (String contact : contactsOf(userId)) {
+                        sendToUser(contact, changed, null);
+                    }
+                }
+            }
+            send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_KEYS,
+                    frame.correlationId(), java.util.Map.of("n", "0")));
+        }
+
+        /** The device keys of everyone in a conversation the caller belongs to (their own included). */
+        private void keysGet(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            String conversationId = fields.required("convId");
+            java.util.Set<String> people;
+            if (conversationId.startsWith("dm:")) {
+                people = java.util.Set.of(userId, requireDirectConversationAccess(conversationId, userId));
+            } else if (conversationId.startsWith("grp:")) {
+                groupService.requireMember(userId, conversationId.substring(4));
+                people = participantsOf(conversationId);
+            } else {
+                throw new edu.ember.common.exceptions.AuthorizationException("Invalid conversation");
+            }
+            java.util.Map<String, String> reply = new java.util.HashMap<>();
+            int index = 0;
+            for (String person : people) {
+                for (var key : DeviceKeys.parse(storage.setting("devkeys:" + person).orElse(""))) {
+                    reply.put("user." + index, person);
+                    reply.put("dev." + index, key.deviceId());
+                    reply.put("pub." + index, key.publicKey());
+                    reply.put("active." + index, Boolean.toString(key.active()));
+                    index++;
+                }
+            }
+            reply.put("n", Integer.toString(index));
+            reply.put("convId", conversationId);
+            send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_KEYS,
+                    frame.correlationId(), reply));
         }
 
         private void subscribePush(edu.ember.common.protocol.WireFrame frame) throws IOException,
@@ -1310,7 +1386,9 @@ public final class EmberServer implements AutoCloseable {
                         || (parent.expiresAtMs() > 0 && parent.expiresAtMs() <= System.currentTimeMillis())) {
                     throw new edu.ember.common.exceptions.AuthorizationException("Reply target is not available");
                 }
-                replyPreview = parent.body().substring(0, Math.min(100, parent.body().length()));
+                // An encrypted parent has no readable preview; devices show it from their own copy.
+                replyPreview = isEncrypted(parent.body()) ? ""
+                        : parent.body().substring(0, Math.min(100, parent.body().length()));
             }
             int ttlSec;
             try {
@@ -1347,7 +1425,9 @@ public final class EmberServer implements AutoCloseable {
             var original = storage.findBySenderAndClientMsgId(userId, clientMsgId);
             if (original.isPresent()) {
                 var saved = original.get();
-                if (!saved.conversationId().equals(conversationId) || !saved.body().equals(body)
+                // A resent encrypted message has fresh ciphertext for the same text, so only its chat must match.
+                boolean sameBody = saved.body().equals(body) || (isEncrypted(saved.body()) && isEncrypted(body));
+                if (!saved.conversationId().equals(conversationId) || !sameBody
                         || saved.ttlSec() != ttlSec || !saved.replyToId().equals(replyToId)) {
                     throw new edu.ember.common.exceptions.AuthorizationException("Message ID is already used");
                 }
@@ -1373,7 +1453,7 @@ public final class EmberServer implements AutoCloseable {
                 title += " · " + storage.findGroup(conversationId.substring(4))
                         .map(edu.ember.common.model.GroupChat::name).orElse("group");
             }
-            String preview = ttlSec > 0 ? "⏱ disappearing message"
+            String preview = ttlSec > 0 ? "⏱ disappearing message" : isEncrypted(body) ? "🔒 New message"
                     : body.length() > 140 ? body.substring(0, 140) + "…" : body;
             for (String recipient : recipients) {
                 pushIfAway(recipient, title, preview, conversationId, "message");
@@ -1688,6 +1768,11 @@ public final class EmberServer implements AutoCloseable {
                         .log(Level.FINE, "Event delivery failed", exception);
             }
         }
+    }
+
+    /** End-to-end encrypted message bodies start with this tag; the server cannot read them. */
+    static boolean isEncrypted(String body) {
+        return body.startsWith("e2e1.");
     }
 
     private static edu.ember.common.protocol.WireFrame callEvent(CallRegistry.Call<?> call, String kind,

@@ -8,13 +8,13 @@ const OP = {
   REGISTER: 0x01, LOGIN: 0x02, RESUME: 0x03, LOGOUT: 0x04, PING: 0x05,
   SEND: 0x10, RECEIPT: 0x11, REACT: 0x12, EDIT: 0x13, DELETE: 0x14, PIN: 0x15, STAR: 0x16, TYPING: 0x17,
   POLL_CREATE: 0x18, POLL_VOTE: 0x19, GROUP_CREATE: 0x20, GROUP_MEMBER: 0x21, GROUP_INFO: 0x23,
-  STATUS_SET: 0x24, PUSH_SUBSCRIBE: 0x25, CALL: 0x26, CALL_MEDIA: 0x27,
+  STATUS_SET: 0x24, PUSH_SUBSCRIBE: 0x25, CALL: 0x26, CALL_MEDIA: 0x27, DEVICE_KEY: 0x28, KEYS_GET: 0x29,
   PROFILE_UPDATE: 0x30, FOLLOW: 0x31, MEDIA_UPLOAD: 0x32, POST_CREATE: 0x33, POST_INTERACT: 0x34,
   STORY_CREATE: 0x35, STORY_VIEW: 0x36, BLOCK: 0x37, REPORT: 0x38, FEED_PULL: 0x3A, PROFILE_GET: 0x3B,
   AUTH_OK: 0x40, PONG: 0x41, ACK: 0x42, DELIVER: 0x43, RECEIPT_UPDATE: 0x44, UPDATE: 0x45,
   TYPING_EVT: 0x46, PRESENCE: 0x47, SYNC_ITEM: 0x48, SYNC_DONE: 0x49, HISTORY: 0x4A,
   GROUP_UPDATE: 0x4B, MEDIA_OK: 0x50, FEED_PAGE: 0x52, PROFILE_DATA: 0x53, NOTIFY: 0x54,
-  STORY_UPDATE: 0x55, POLL_UPDATE: 0x57, CALL_EVT: 0x58, CALL_MEDIA_EVT: 0x59, ERROR: 0x70,
+  STORY_UPDATE: 0x55, POLL_UPDATE: 0x57, CALL_EVT: 0x58, CALL_MEDIA_EVT: 0x59, KEYS: 0x5A, KEYS_CHANGED: 0x5B, ERROR: 0x70,
 };
 const MAGIC = 0x454D4252, HEADER = 18;
 const utf8 = new TextEncoder(), unutf8 = new TextDecoder();
@@ -164,7 +164,7 @@ function connect(onOpen) {
   ws.onmessage = (e) => {
     const dv = new DataView(e.data);
     if (dv.getUint8(5) === OP.CALL_MEDIA_EVT) onCallMedia(new Uint8Array(e.data, HEADER, dv.getUint32(14)));
-    else handle(decode(e.data));
+    else inbound(decode(e.data)); // e2e.js: decrypts in order, then handle()
   };
   ws.onclose = () => {
     endLocal('call dropped: connection lost'); // the server ends it too
@@ -247,6 +247,7 @@ function onAuth(f) {
   if (f.syncReset === 'true') { S.convs.clear(); S.rev = 0; } // server data was reset: drop the cache
   S.me = f.userId; S.token = f.token; S.vapidKey = f.vapidKey || null;
   try { S.ice = JSON.parse(f.ice || '[]'); } catch { S.ice = []; }
+  e2eStart();
   store.set('ember.token', f.token); store.set('ember.user', f.userId);
   showApp(); setStatus('syncing…');
   // The server remembers a status set on another device; otherwise restore this device's choice.
@@ -278,7 +279,7 @@ function onUpdate(f) {
     const c = S.convs.get(f.convId);
     if (c) c.msgs.delete(f.clientMsgId);
   } else if (m && f.state === 'EDITED') {
-    m.body = f.body; m.edited = true;
+    m.body = f.body; m.edited = true; m.e2e = f.e2e || '';
   } else if (m && f.state === 'REACTION') {
     m.reacts[f.emoji] = +f.count;
     if (f.userId === S.me) toggleMine(m.id, f.emoji, f.selected === 'true');
@@ -347,6 +348,7 @@ function addMsg(f, live) {
     body: f.body, ts: +f.serverTs, seq: +f.convSeq, expires: +f.expiresAtMs || 0,
     replyPreview: f.replyPreview || '', pending: false,
   });
+  m.e2e = f.e2e || ''; m.replyTo = f.replyToId || '';
   if (f.pinned != null) m.pinned = f.pinned === 'true';
   if (f.starred != null) m.starred = f.starred === 'true';
   m.reacts = {};
@@ -678,10 +680,11 @@ function messageNode(c, m) {
   return h('article', { class: 'msg' + (mine ? ' mine' : '') + (m.pending ? ' pending' : '') + (m.pinned ? ' pinned' : ''), id: 'm-' + m.id,
     onclick: (e) => { if (e.target.tagName !== 'BUTTON') e.currentTarget.classList.toggle('sel'); } },
   !mine && c.id.startsWith('grp:') ? h('button', { class: 'who link', onclick: () => openProfile(m.from) }, name(m.from)) : null,
-  m.replyPreview ? h('div', { class: 'quote' }, '↳ ' + m.replyPreview) : null,
+  replyText(c, m) ? h('div', { class: 'quote' }, '↳ ' + replyText(c, m)) : null,
   bodyNode(m),
   reacts.length ? h('div', { class: 'reacts' }, ...reacts.map(([e, n]) => h('span', {}, e + n))) : null,
-  h('div', { class: 'meta' }, (m.pinned ? '📌 ' : '') + (m.starred ? '★ ' : '') + (m.expires ? '⏱ ' : '') + (m.edited ? 'edited · ' : '') + when(m.ts)
+  h('div', { class: 'meta', title: m.e2e === 'true' ? 'end-to-end encrypted' : m.e2e ? '' : 'not end-to-end encrypted (sent before encryption was set up)' },
+    (m.e2e === 'true' || m.pending ? '' : m.e2e ? '' : '🔓 ') + (m.pinned ? '📌 ' : '') + (m.starred ? '★ ' : '') + (m.expires ? '⏱ ' : '') + (m.edited ? 'edited · ' : '') + when(m.ts)
     + (mine ? (m.read ? ' ✓✓' : ' ✓') : '')),
   h('div', { class: 'actions' },
     h('button', { onclick: () => startReply(m) }, 'reply'),
@@ -692,6 +695,13 @@ function messageNode(c, m) {
     mine ? h('button', { onclick: () => editMsg(m) }, 'edit') : null,
     mine ? h('button', { onclick: () => { if (confirm('Delete this message for everyone?')) send(OP.DELETE, { clientMsgId: m.id }); } }, 'del') : null,
     mine ? null : h('button', { onclick: () => report('message', m.id), title: 'report' }, '⚑')));
+}
+
+/** The quoted text of a reply: from the server, or (for encrypted chats) from our own copy. */
+function replyText(c, m) {
+  if (m.replyPreview) return m.replyPreview;
+  const parent = m.replyTo && c.msgs.get(m.replyTo);
+  return parent ? parent.body.slice(0, 100) : '';
 }
 
 /** Pinned messages: a bar at the top; each click jumps to the next pin. */
@@ -850,6 +860,7 @@ async function openProfile(userId) {
     h('p', { class: 'dim' }, '@' + userId + (p && p.privateAccount === 'true' ? ' · 🔒 private' : '') + (statusText(userId) ? ' · ' + statusText(userId) : '')),
     p ? h('p', {}, p.bio || '') : h('p', { class: 'dim' }, 'This account is private. Follow to request access.'),
     p ? h('p', { class: 'dim' }, p.followerCount + ' followers · ' + p.followingCount + ' following') : null,
+    isMe ? null : safetyNode(userId),
     isMe ? requestsNode() : null,
     tools));
   if (!p) return;
@@ -857,6 +868,14 @@ async function openProfile(userId) {
     const posts = postsFrom(await request(OP.FEED_PULL, { ownerUserId: userId, limit: 10 }));
     if (S.view === 'profile' && S.viewArg === userId) box.append(...posts.map(postNode));
   } catch { /* no visible posts */ }
+}
+
+/** Safety number for a chat: the same digits on both people's screens mean nobody is in between. */
+function safetyNode(userId) {
+  const el = h('p', { class: 'dim small' }, '🔒 checking encryption…');
+  safetyNumber(userId).then((n) => { el.textContent = n ? '🔒 safety number ' + n + ' · compare it with ' + name(userId) + ' in person; same digits = private chat' : '🔓 no encryption keys yet (they have not opened the new app)'; })
+    .catch(() => { el.textContent = ''; });
+  return el;
 }
 
 function setPending(f) {
@@ -962,16 +981,23 @@ function startReply(m) {
 
 function editMsg(m) {
   const body = prompt('Edit message', m.body);
-  if (body && body.trim() && body !== m.body) send(OP.EDIT, { clientMsgId: m.id, newBody: body });
+  if (!body || !body.trim() || body === m.body) return;
+  sealBody(m.conv, m.id, body).then((sealed) => send(OP.EDIT, { clientMsgId: m.id, newBody: sealed }))
+    .catch((e) => toast('⚠ ' + e.message));
 }
 
 /** Sends a message to any chat (the composer, notification replies and quick replies). */
 function sendText(convId, body, replyTo = '', ttl = 0) {
   const id = crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2);
   const c = conv(convId), parent = replyTo && c.msgs.get(replyTo);
-  c.msgs.set(id, { id, conv: c.id, from: S.me, body, ts: Date.now(), seq: 0, reacts: {}, pending: true,
-    replyPreview: parent ? parent.body.slice(0, 100) : '', expires: ttl ? 1 : 0 });
-  send(OP.SEND, { clientMsgId: id, convId: c.id, body, ttlSec: ttl, replyToId: replyTo });
+  const m = { id, conv: c.id, from: S.me, body, ts: Date.now(), seq: 0, reacts: {}, pending: true,
+    replyPreview: parent ? parent.body.slice(0, 100) : '', expires: ttl ? 1 : 0, e2e: 'true' };
+  c.msgs.set(id, m);
+  // Encrypted on this device first; the server only ever sees the sealed text.
+  sealBody(c.id, id, body).then((sealed) => {
+    if (!sealed.startsWith('e2e1.')) m.e2e = '';
+    send(OP.SEND, { clientMsgId: id, convId: c.id, body: sealed, ttlSec: ttl, replyToId: replyTo });
+  }).catch((e) => { c.msgs.delete(id); renderSoon(); toast('⚠ ' + e.message); });
   renderSoon();
 }
 
@@ -1086,6 +1112,7 @@ $('notifyBtn').onclick = async () => {
 };
 $('logoutBtn').onclick = () => {
   hangUp();
+  e2eRetire(S.me); // this device stops receiving encrypted messages and forgets its key
   send(OP.LOGOUT);
   cache.clear(S.me); // a shared computer keeps no copy of the chats
   unsubscribePush().catch(() => {});

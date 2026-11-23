@@ -29,6 +29,10 @@ public final class WireOpcodes {
     public static final int CMD_CALL = 0x26;
     /** One encrypted call packet; the payload is opaque bytes, forwarded unread. */
     public static final int CMD_CALL_MEDIA = 0x27;
+    /** Registers or retires this device's public key for end-to-end encrypted chats. */
+    public static final int CMD_DEVICE_KEY = 0x28;
+    /** Asks for the device keys of everyone in a conversation. */
+    public static final int CMD_KEYS_GET = 0x29;
     public static final int CMD_PROFILE_UPDATE = 0x30;
     public static final int CMD_FOLLOW_ACTION = 0x31;
     public static final int CMD_MEDIA_UPLOAD = 0x32;
@@ -65,6 +69,9 @@ public final class WireOpcodes {
     public static final int EVT_POLL_UPDATE = 0x57;
     public static final int EVT_CALL = 0x58;
     public static final int EVT_CALL_MEDIA = 0x59;
+    public static final int EVT_KEYS = 0x5A;
+    /** A contact added or retired a device: drop cached keys for that user. */
+    public static final int EVT_KEYS_CHANGED = 0x5B;
     public static final int EVT_ERROR = 0x70;
 
     private WireOpcodes() {

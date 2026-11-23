@@ -37,7 +37,7 @@ public final class WebGateway {
             "/", "index.html", "/index.html", "index.html", "/app.js", "app.js",
             "/app.css", "app.css", "/manifest.json", "manifest.json", "/sw.js", "sw.js",
             "/icon.svg", "icon.svg", "/call-worklet.js", "call-worklet.js",
-            "/call.js", "call.js");
+            "/call.js", "call.js", "/e2e.js", "e2e.js");
     private static final Map<String, String> TYPES = Map.of(
             "html", "text/html; charset=utf-8", "js", "text/javascript; charset=utf-8",
             "css", "text/css; charset=utf-8", "json", "application/manifest+json",

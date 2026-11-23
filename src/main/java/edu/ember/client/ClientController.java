@@ -7,6 +7,7 @@ import edu.ember.common.model.UserProfile;
 import edu.ember.common.model.StoryItem;
 import edu.ember.common.model.PollData;
 import edu.ember.common.exceptions.EmberException;
+import edu.ember.common.security.E2eCrypto;
 import edu.ember.common.protocol.FrameFactory;
 import edu.ember.common.protocol.KvPayloadCodec;
 import edu.ember.common.protocol.WireFrame;
@@ -46,6 +47,37 @@ public final class ClientController implements AutoCloseable {
         thread.setDaemon(true);
         return thread;
     });
+    /** Frames are applied here, in arrival order, so decrypting never blocks the network reader. */
+    private final ExecutorService frameWorker = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "ember-client-frames");
+        thread.setDaemon(true);
+        return thread;
+    });
+    /** Encrypts outgoing messages in order (it may wait for the recipients' device keys). */
+    private final ExecutorService sealer = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "ember-client-sealer");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final Map<Long, java.util.concurrent.CompletableFuture<Map<String, String>>> keyRequests =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, KeyCacheEntry> keyCache = new java.util.concurrent.ConcurrentHashMap<>();
+    /** This device's end-to-end key pair; null until signed in. */
+    private volatile E2eCrypto.Identity identity;
+    static final String LOCKED_TEXT = "🔒 This message cannot be read on this device "
+            + "(sent before it was set up, or tampered with).";
+
+    private record KeyCacheEntry(long atMs, java.util.List<E2eCrypto.DeviceKey> keys) { }
+
+    /** The server refused to give out keys for a conversation (the same rules as sending to it). */
+    private static final class KeysRefused extends IOException {
+        private static final long serialVersionUID = 1L;
+
+        KeysRefused(String message) {
+            super(message);
+        }
+    }
+
     private volatile String activeConversationId;
     private volatile String sessionToken;
     private volatile LocalOutbox outbox;
@@ -141,10 +173,23 @@ public final class ClientController implements AutoCloseable {
             message.advanceStatus(MessageStatus.PENDING_LOCAL);
             model.addMessage(message);
         }
-        WireFrame frame = commandFrame(WireOpcodes.CMD_MSG_SEND,
-                Map.of("clientMsgId", clientMsgId, "convId", conversationId, "body", body,
-                        "ttlSec", Integer.toString(ttlSec), "replyToId", replyToId));
-        outboxWriter.execute(() -> persistAndSend(frame));
+        // Encrypted on this device first; the server only ever stores and forwards the sealed text.
+        sealer.execute(() -> {
+            String sealed;
+            try {
+                sealed = sealBody(conversationId, clientMsgId, body);
+            } catch (Exception exception) {
+                model.deleteMessage(clientMsgId);
+                if (!(exception.getCause() instanceof KeysRefused)) { // a refusal already shows the server's error
+                    model.setError("400", "Not sent: " + exception.getMessage());
+                }
+                return;
+            }
+            WireFrame frame = commandFrame(WireOpcodes.CMD_MSG_SEND,
+                    Map.of("clientMsgId", clientMsgId, "convId", conversationId, "body", sealed,
+                            "ttlSec", Integer.toString(ttlSec), "replyToId", replyToId));
+            outboxWriter.execute(() -> persistAndSend(frame));
+        });
         return clientMsgId;
     }
 
@@ -205,8 +250,17 @@ public final class ClientController implements AutoCloseable {
     }
 
     public void editMessage(String clientMsgId, String newBody) {
-        sendCommand(WireOpcodes.CMD_MSG_EDIT,
-                Map.of("clientMsgId", clientMsgId, "newBody", newBody));
+        String conversationId = model.conversationIds().stream()
+                .filter(id -> model.messages(id).stream().anyMatch(m -> m.clientMsgId().equals(clientMsgId)))
+                .findFirst().orElse(null);
+        sealer.execute(() -> {
+            try {
+                String sealed = conversationId == null ? newBody : sealBody(conversationId, clientMsgId, newBody);
+                sendCommand(WireOpcodes.CMD_MSG_EDIT, Map.of("clientMsgId", clientMsgId, "newBody", sealed));
+            } catch (Exception exception) {
+                model.setError("400", "Edit not sent: " + exception.getMessage());
+            }
+        });
     }
 
     public void deleteMessage(String clientMsgId) {
@@ -332,7 +386,17 @@ public final class ClientController implements AutoCloseable {
                 "thumbnail", Boolean.toString(thumbnail)));
     }
 
+    /** Logging out also retires this device's key: it gets no new encrypted messages and forgets its key. */
     public void logout() {
+        E2eCrypto.Identity me = identity;
+        if (me != null && model.userId() != null) {
+            sendCommand(WireOpcodes.CMD_DEVICE_KEY, Map.of("deviceId", me.deviceId(), "action", "retire"));
+            try {
+                Files.deleteIfExists(clientDataRoot.resolve(model.userId()).resolve("device-key.properties"));
+            } catch (IOException exception) {
+                model.setError("500", "Could not delete this device's key");
+            }
+        }
         sendCommand(WireOpcodes.CMD_AUTH_LOGOUT, Map.of());
         close();
     }
@@ -344,6 +408,9 @@ public final class ClientController implements AutoCloseable {
     public void close() {
         closing = true;
         heartbeat.shutdownNow();
+        frameWorker.shutdownNow();
+        sealer.shutdownNow();
+        keyRequests.values().forEach(future -> future.cancel(true));
         mediaWorker.shutdownNow();
         outbound.stopSending();
         outboxWriter.shutdown();
@@ -355,12 +422,41 @@ public final class ClientController implements AutoCloseable {
         inbound.interrupt();
     }
 
+    /** Called on the network reader thread. Key replies are answered here; all else goes in order to the worker. */
     void handleFrame(WireFrame frame) {
-        Map<String, String> fields = KvPayloadCodec.decode(frame.payload());
+        if (frame.opcode() == WireOpcodes.EVT_KEYS || frame.opcode() == WireOpcodes.EVT_ERROR) {
+            var waiting = keyRequests.remove(frame.correlationId());
+            if (waiting != null) {
+                Map<String, String> fields = KvPayloadCodec.decode(frame.payload());
+                if (frame.opcode() == WireOpcodes.EVT_KEYS) {
+                    waiting.complete(fields);
+                    return;
+                }
+                // Refused (for example not a member, or blocked): the error is also shown as usual below.
+                waiting.completeExceptionally(new KeysRefused(fields.getOrDefault("message", "Keys unavailable")));
+            }
+        }
+        if (frame.opcode() == WireOpcodes.EVT_KEYS_CHANGED) {
+            keyCache.clear();
+            return;
+        }
+        try {
+            frameWorker.execute(() -> handleFrameNow(frame));
+        } catch (java.util.concurrent.RejectedExecutionException closed) {
+            // the controller is closing
+        }
+    }
+
+    private void handleFrameNow(WireFrame frame) {
+        Map<String, String> fields = new HashMap<>(KvPayloadCodec.decode(frame.payload()));
+        if (fields.getOrDefault("body", "").startsWith(E2eCrypto.PREFIX)) {
+            openSealed(fields);
+        }
         if (frame.opcode() == WireOpcodes.EVT_AUTH_OK) {
             sessionToken = fields.get("token");
             String userId = fields.get("userId");
             initializeOutbox(userId);
+            setUpIdentity(userId);
             model.authenticated(userId, "ADMIN".equals(fields.get("role")));
         } else if (frame.opcode() == WireOpcodes.EVT_MSG_ACK) {
             model.updateAcknowledgement(fields.get("clientMsgId"),
@@ -522,12 +618,20 @@ public final class ClientController implements AutoCloseable {
     }
 
     private Message readMessage(Map<String, String> fields) {
+        String replyToId = fields.getOrDefault("replyToId", "");
+        String replyPreview = fields.getOrDefault("replyPreview", "");
+        if (replyPreview.isEmpty() && !replyToId.isEmpty()) {
+            // Encrypted chats: the server cannot quote the parent, so quote our own decrypted copy.
+            replyPreview = model.messages(fields.get("convId")).stream()
+                    .filter(parent -> parent.clientMsgId().equals(replyToId)).findFirst()
+                    .map(parent -> parent.body().substring(0, Math.min(100, parent.body().length())))
+                    .orElse("");
+        }
         Message message = new Message(fields.get("clientMsgId"), fields.get("senderUserId"),
                 fields.get("convId"), fields.get("body"),
                 Long.parseLong(fields.get("serverTs")),
                 Integer.parseInt(fields.getOrDefault("ttlSec", "0")),
-                fields.getOrDefault("replyToId", ""),
-                fields.getOrDefault("replyPreview", ""));
+                replyToId, replyPreview);
         message.setExpiresAtMs(Long.parseLong(fields.getOrDefault("expiresAtMs", "0")));
         int reactionCount = Integer.parseInt(fields.getOrDefault("reaction.n", "0"));
         for (int index = 0; index < reactionCount; index++) {
@@ -543,6 +647,145 @@ public final class ClientController implements AutoCloseable {
         }
         message.advanceStatus(MessageStatus.DELIVERED);
         return message;
+    }
+
+    // ---- end-to-end encryption (format shared with the website; see E2eCrypto) ----
+
+    /** Loads this device's key pair for the account, or makes one, and registers the public half. */
+    private void setUpIdentity(String userId) {
+        try {
+            Path file = clientDataRoot.resolve(userId).resolve("device-key.properties");
+            java.util.Properties saved = new java.util.Properties();
+            E2eCrypto.Identity me = null;
+            if (Files.exists(file)) {
+                try (var reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+                    saved.load(reader);
+                }
+                me = E2eCrypto.loadIdentity(saved.getProperty("deviceId"),
+                        E2eCrypto.decode(saved.getProperty("private")), saved.getProperty("public"));
+            }
+            if (me == null) {
+                me = E2eCrypto.newIdentity();
+                saved.setProperty("deviceId", me.deviceId());
+                saved.setProperty("public", me.publicKey());
+                saved.setProperty("private", E2eCrypto.encode(E2eCrypto.privateKeyBytes(me)));
+                Files.createDirectories(file.getParent());
+                try (var writer = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {
+                    saved.store(writer, "Ember device key: keep private, never share");
+                }
+                restrictToOwner(file);
+            }
+            identity = me;
+            sendCommand(WireOpcodes.CMD_DEVICE_KEY, Map.of("deviceId", me.deviceId(), "pub", me.publicKey()));
+        } catch (IOException | java.security.GeneralSecurityException | RuntimeException exception) {
+            model.setError("500", "Encryption could not be set up on this device");
+        }
+    }
+
+    private static void restrictToOwner(Path file) {
+        try {
+            Files.setPosixFilePermissions(file, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+        } catch (UnsupportedOperationException | IOException notPosix) {
+            file.toFile().setReadable(false, false);
+            file.toFile().setReadable(true, true);
+        }
+    }
+
+    /** Device keys of everyone in a conversation, cached for a minute (refreshed on key changes). */
+    private java.util.List<E2eCrypto.DeviceKey> keysFor(String conversationId, boolean fresh) throws Exception {
+        KeyCacheEntry hit = keyCache.get(conversationId);
+        if (hit != null && !fresh && System.currentTimeMillis() - hit.atMs() < 60_000) {
+            return hit.keys();
+        }
+        WireFrame request = commandFrame(WireOpcodes.CMD_KEYS_GET, Map.of("convId", conversationId));
+        var reply = new java.util.concurrent.CompletableFuture<Map<String, String>>();
+        keyRequests.put(request.correlationId(), reply);
+        outbound.enqueue(request);
+        Map<String, String> fields;
+        try {
+            fields = reply.get(10, TimeUnit.SECONDS);
+        } finally {
+            keyRequests.remove(request.correlationId());
+        }
+        java.util.List<E2eCrypto.DeviceKey> keys = new java.util.ArrayList<>();
+        int count = Integer.parseInt(fields.getOrDefault("n", "0"));
+        for (int index = 0; index < count; index++) {
+            keys.add(new E2eCrypto.DeviceKey(fields.get("user." + index), fields.get("dev." + index),
+                    fields.get("pub." + index), Boolean.parseBoolean(fields.get("active." + index))));
+        }
+        keyCache.put(conversationId, new KeyCacheEntry(System.currentTimeMillis(), keys));
+        rememberKeyed(keys);
+        return keys;
+    }
+
+    private Path keyedFile() {
+        return clientDataRoot.resolve(model.userId()).resolve("keyed-users.txt");
+    }
+
+    /** People we have ever seen keys for: we never fall back to plain text for them. */
+    private synchronized void rememberKeyed(java.util.List<E2eCrypto.DeviceKey> keys) {
+        try {
+            java.util.Set<String> known = new java.util.TreeSet<>(Files.exists(keyedFile())
+                    ? Files.readAllLines(keyedFile(), StandardCharsets.UTF_8) : java.util.List.of());
+            boolean changed = false;
+            for (E2eCrypto.DeviceKey key : keys) {
+                changed |= key.active() && known.add(key.userId());
+            }
+            if (changed) {
+                Files.write(keyedFile(), known, StandardCharsets.UTF_8);
+            }
+        } catch (IOException exception) {
+            model.setError("500", "Could not save known encryption contacts");
+        }
+    }
+
+    private synchronized boolean everKeyed(String userId) {
+        try {
+            return Files.exists(keyedFile()) && Files.readAllLines(keyedFile(), StandardCharsets.UTF_8).contains(userId);
+        } catch (IOException exception) {
+            return true; // unsure: refuse plain text
+        }
+    }
+
+    /** The body to send: encrypted for every device in the chat, plain only for people never seen with keys. */
+    private String sealBody(String conversationId, String clientMsgId, String text) throws Exception {
+        E2eCrypto.Identity me = identity;
+        if (me == null) {
+            throw new IOException("encryption is not ready on this device");
+        }
+        java.util.List<E2eCrypto.DeviceKey> active = keysFor(conversationId, false).stream()
+                .filter(E2eCrypto.DeviceKey::active).toList();
+        boolean othersHaveKeys = active.stream().anyMatch(key -> !key.userId().equals(model.userId()));
+        if (!othersHaveKeys) {
+            String[] parts = conversationId.split(":");
+            if (parts.length == 3 && everKeyed(parts[1].equals(model.userId()) ? parts[2] : parts[1])) {
+                throw new IOException("their devices are missing, so it cannot be encrypted");
+            }
+            return text;
+        }
+        return E2eCrypto.seal(me, conversationId, model.userId(), clientMsgId, text, active);
+    }
+
+    /** Replaces an encrypted body with its text, or with a notice when this device cannot read it. */
+    private void openSealed(Map<String, String> fields) {
+        String conversationId = fields.get("convId");
+        String sender = fields.get("senderUserId");
+        String id = fields.get("clientMsgId");
+        try {
+            E2eCrypto.Identity me = identity;
+            if (me == null || conversationId == null || sender == null) {
+                throw new java.security.GeneralSecurityException("cannot decrypt yet");
+            }
+            try {
+                fields.put("body", E2eCrypto.open(me, conversationId, sender, id, fields.get("body"),
+                        keysFor(conversationId, false)));
+            } catch (java.security.GeneralSecurityException unknownDevice) {
+                fields.put("body", E2eCrypto.open(me, conversationId, sender, id, fields.get("body"),
+                        keysFor(conversationId, true)));
+            }
+        } catch (Exception exception) {
+            fields.put("body", LOCKED_TEXT);
+        }
     }
 
     private void sendCommand(int opcode, Map<String, String> fields) {
