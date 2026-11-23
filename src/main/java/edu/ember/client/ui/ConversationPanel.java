@@ -161,9 +161,9 @@ public final class ConversationPanel extends JPanel implements ClientModelListen
                 try {
                     String number = get();
                     text = number.isEmpty() ? other + " has no encryption keys yet (they have not opened the new app)."
-                            : "Safety number with " + other + ":\n\n" + number
-                                    + "\n\nCompare it with " + other + " in person. The same digits mean nobody,"
-                                    + " not even the server, can read this chat.";
+                            : number + "\n\nCheck together with " + other + ": each of you finds your own device code"
+                                    + " on the other's screen, and neither of you sees a code you do not recognise."
+                                    + " Then nobody, not even the server, can read this chat.";
                 } catch (Exception exception) {
                     text = "Could not check encryption right now.";
                 }

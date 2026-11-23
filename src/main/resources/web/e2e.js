@@ -67,10 +67,20 @@ async function keysFor(convId, fresh) {
   const hit = e2e.keys.get(convId);
   if (hit && !fresh && Date.now() - hit.at < E2E.CACHE_MS) return hit.list;
   const f = await request(OP.KEYS_GET, { convId });
-  const list = Array.from({ length: +f.n || 0 }, (_, i) => ({ user: f['user.' + i], dev: f['dev.' + i], pub: f['pub.' + i], active: f['active.' + i] === 'true' }));
+  // Only well-formed keys of people actually in this chat are used; anything else is ignored.
+  const members = chatMembers(convId);
+  const list = Array.from({ length: +f.n || 0 }, (_, i) => ({ user: f['user.' + i], dev: f['dev.' + i], pub: f['pub.' + i], active: f['active.' + i] === 'true' }))
+    .filter((k) => /^[A-Za-z0-9_-]{16,43}$/.test(k.dev) && /^[A-Za-z0-9_-]{87}$/.test(k.pub) && (!members || members.includes(k.user)));
   e2e.keys.set(convId, { at: Date.now(), list });
   noticeNewDevices(convId, list);
   return list;
+}
+
+/** The people in a chat: both names of a direct chat, or the group's members when known. */
+function chatMembers(convId) {
+  if (convId.startsWith('dm:')) return convId.slice(3).split(':');
+  const c = S.convs.get(convId);
+  return c && c.members ? [...c.members, S.me] : null;
 }
 
 /** Remembers each person's devices; a device that appears later is announced in the chat. */
@@ -203,13 +213,21 @@ function inbound(msg) {
 }
 
 // ---- safety number, shown on profiles ----
+/** A device's code: 10 digits from its public key (the desktop app computes the same). */
+async function deviceCode(pub) {
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', dec(pub)));
+  return [0, 2].map((i) => String(((hash[i] << 8) | hash[i + 1]) % 100000).padStart(5, '0')).join(' ');
+}
+
+/**
+ * Device codes for checking a chat. This device's code comes from its own key, never from the
+ * server; the other person's codes are what the server says their devices are. The other person
+ * checks that their own device code is in that list and that no code is unknown to them.
+ */
 async function safetyNumber(userId) {
+  await e2e.ready;
   const convId = 'dm:' + [S.me, userId].sort().join(':');
-  const list = (await keysFor(convId, true)).filter((k) => k.active);
-  if (!list.some((k) => k.user === userId)) return '';
-  const all = list.map((k) => k.user + ':' + k.pub).sort().join('|');
-  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', utf8.encode(all)));
-  const groups = [];
-  for (let i = 0; i < 10; i += 2) groups.push(String(((hash[i] << 8) | hash[i + 1]) % 100000).padStart(5, '0'));
-  return groups.join(' ');
+  const theirs = (await keysFor(convId, true)).filter((k) => k.active && k.user === userId);
+  if (!theirs.length) return null;
+  return { mine: await deviceCode(e2e.dev.pub), theirs: await Promise.all(theirs.map((k) => deviceCode(k.pub))) };
 }

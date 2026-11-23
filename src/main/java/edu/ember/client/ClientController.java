@@ -709,9 +709,17 @@ public final class ClientController implements AutoCloseable {
         }
         java.util.List<E2eCrypto.DeviceKey> keys = new java.util.ArrayList<>();
         int count = Integer.parseInt(fields.getOrDefault("n", "0"));
+        java.util.List<String> members = chatMembers(conversationId);
         for (int index = 0; index < count; index++) {
-            keys.add(new E2eCrypto.DeviceKey(fields.get("user." + index), fields.get("dev." + index),
-                    fields.get("pub." + index), Boolean.parseBoolean(fields.get("active." + index))));
+            String user = fields.getOrDefault("user." + index, "");
+            String device = fields.getOrDefault("dev." + index, "");
+            String publicKey = fields.getOrDefault("pub." + index, "");
+            // Only well-formed keys of people actually in this chat are used; anything else is ignored.
+            if (device.matches("[A-Za-z0-9_-]{16,43}") && publicKey.matches("[A-Za-z0-9_-]{87}")
+                    && user.matches("[a-z0-9_]{3,20}") && (members == null || members.contains(user))) {
+                keys.add(new E2eCrypto.DeviceKey(user, device, publicKey,
+                        Boolean.parseBoolean(fields.get("active." + index))));
+            }
         }
         keyCache.put(conversationId, new KeyCacheEntry(System.currentTimeMillis(), keys));
         rememberKeyed(keys);
@@ -776,28 +784,33 @@ public final class ClientController implements AutoCloseable {
         }
     }
 
+    /** A device's code: 10 digits from its public key (the website computes the same). */
+    public static String deviceCode(String publicKey) throws java.security.GeneralSecurityException {
+        byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(E2eCrypto.decode(publicKey));
+        return String.format("%05d %05d", (((hash[0] & 0xFF) << 8) | (hash[1] & 0xFF)) % 100_000,
+                (((hash[2] & 0xFF) << 8) | (hash[3] & 0xFF)) % 100_000);
+    }
+
     /**
-     * Safety number for a direct chat: the same 25 digits appear on both people's screens (website
-     * and desktop) unless someone, even the server, has put in a device that is not theirs.
+     * How to check a direct chat: this device's code (from its own key, never from the server) and
+     * the codes of the other person's devices as the server lists them. Each person finds their own
+     * device code on the other's screen, and nobody should see a code they do not recognise.
+     * Returns an empty string when the other person has no keys yet.
      */
     public String safetyNumber(String otherUserId) throws Exception {
-        String me = model.userId();
-        String conversationId = "dm:" + (me.compareTo(otherUserId) < 0 ? me + ":" + otherUserId : otherUserId + ":" + me);
-        java.util.List<String> parts = keysFor(conversationId, true).stream().filter(E2eCrypto.DeviceKey::active)
-                .map(key -> key.userId() + ":" + key.publicKey()).sorted().toList();
-        if (parts.stream().noneMatch(part -> part.startsWith(otherUserId + ":"))) {
+        E2eCrypto.Identity me = identity;
+        String self = model.userId();
+        String conversationId = "dm:" + (self.compareTo(otherUserId) < 0 ? self + ":" + otherUserId : otherUserId + ":" + self);
+        java.util.List<String> theirs = new java.util.ArrayList<>();
+        for (E2eCrypto.DeviceKey key : keysFor(conversationId, true)) {
+            if (key.active() && key.userId().equals(otherUserId)) {
+                theirs.add(deviceCode(key.publicKey()));
+            }
+        }
+        if (theirs.isEmpty() || me == null) {
             return "";
         }
-        byte[] hash = java.security.MessageDigest.getInstance("SHA-256")
-                .digest(String.join("|", parts).getBytes(StandardCharsets.UTF_8));
-        StringBuilder digits = new StringBuilder();
-        for (int index = 0; index < 10; index += 2) {
-            if (digits.length() > 0) {
-                digits.append(' ');
-            }
-            digits.append(String.format("%05d", (((hash[index] & 0xFF) << 8) | (hash[index + 1] & 0xFF)) % 100_000));
-        }
-        return digits.toString();
+        return "Your device: " + deviceCode(me.publicKey()) + "\n" + otherUserId + "'s devices: " + String.join(", ", theirs);
     }
 
     private Path keyedFile() {
@@ -850,6 +863,16 @@ public final class ClientController implements AutoCloseable {
         }
         markEncrypted(conversationId);
         return E2eCrypto.seal(me, conversationId, model.userId(), clientMsgId, text, active);
+    }
+
+    /** Everyone in a chat (this user included), or null when a group's members are not known yet. */
+    private java.util.List<String> chatMembers(String conversationId) {
+        String[] parts = conversationId.split(":");
+        if (parts.length == 3 && parts[0].equals("dm")) {
+            return java.util.List.of(parts[1], parts[2]);
+        }
+        var group = parts.length == 2 ? model.groupDetails(parts[1]) : null;
+        return group == null ? null : new java.util.ArrayList<>(group.members().keySet());
     }
 
     /** The other people in a chat: the partner of a direct chat, or the group's known members. */
