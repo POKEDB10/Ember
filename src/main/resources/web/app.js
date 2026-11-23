@@ -8,13 +8,13 @@ const OP = {
   REGISTER: 0x01, LOGIN: 0x02, RESUME: 0x03, LOGOUT: 0x04, PING: 0x05,
   SEND: 0x10, RECEIPT: 0x11, REACT: 0x12, EDIT: 0x13, DELETE: 0x14, PIN: 0x15, STAR: 0x16, TYPING: 0x17,
   POLL_CREATE: 0x18, POLL_VOTE: 0x19, GROUP_CREATE: 0x20, GROUP_MEMBER: 0x21, GROUP_INFO: 0x23,
-  STATUS_SET: 0x24, PUSH_SUBSCRIBE: 0x25,
+  STATUS_SET: 0x24, PUSH_SUBSCRIBE: 0x25, CALL: 0x26, CALL_MEDIA: 0x27,
   PROFILE_UPDATE: 0x30, FOLLOW: 0x31, MEDIA_UPLOAD: 0x32, POST_CREATE: 0x33, POST_INTERACT: 0x34,
   STORY_CREATE: 0x35, STORY_VIEW: 0x36, BLOCK: 0x37, REPORT: 0x38, FEED_PULL: 0x3A, PROFILE_GET: 0x3B,
   AUTH_OK: 0x40, PONG: 0x41, ACK: 0x42, DELIVER: 0x43, RECEIPT_UPDATE: 0x44, UPDATE: 0x45,
   TYPING_EVT: 0x46, PRESENCE: 0x47, SYNC_ITEM: 0x48, SYNC_DONE: 0x49, HISTORY: 0x4A,
   GROUP_UPDATE: 0x4B, MEDIA_OK: 0x50, FEED_PAGE: 0x52, PROFILE_DATA: 0x53, NOTIFY: 0x54,
-  STORY_UPDATE: 0x55, POLL_UPDATE: 0x57, ERROR: 0x70,
+  STORY_UPDATE: 0x55, POLL_UPDATE: 0x57, CALL_EVT: 0x58, CALL_MEDIA_EVT: 0x59, ERROR: 0x70,
 };
 const MAGIC = 0x454D4252, HEADER = 18;
 const utf8 = new TextEncoder(), unutf8 = new TextDecoder();
@@ -22,7 +22,11 @@ const esc = (v) => String(v).replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replac
 const unesc = (v) => v.replace(/\\(.)/g, (_, c) => (c === 'n' ? '\n' : c === 'r' ? '\r' : c));
 
 function encode(op, corr, fields) {
-  const body = utf8.encode(Object.entries(fields).map(([k, v]) => k + '=' + esc(v)).join('\n'));
+  return frame(op, corr, utf8.encode(Object.entries(fields).map(([k, v]) => k + '=' + esc(v)).join('\n')));
+}
+
+/** One frame around raw bytes (call packets travel this way, unread by the server). */
+function frame(op, corr, body) {
   const buf = new Uint8Array(HEADER + body.length), dv = new DataView(buf.buffer);
   dv.setUint32(0, MAGIC); dv.setUint8(4, 1); dv.setUint8(5, op);
   dv.setUint32(6, Math.floor(corr / 2 ** 32)); dv.setUint32(10, corr >>> 0);
@@ -157,8 +161,13 @@ function connect(onOpen) {
   ws.binaryType = 'arraybuffer';
   S.ws = ws;
   ws.onopen = () => { S.retry = 0; onOpen(); };
-  ws.onmessage = (e) => handle(decode(e.data));
+  ws.onmessage = (e) => {
+    const dv = new DataView(e.data);
+    if (dv.getUint8(5) === OP.CALL_MEDIA_EVT) onCallMedia(new Uint8Array(e.data, HEADER, dv.getUint32(14)));
+    else handle(decode(e.data));
+  };
   ws.onclose = () => {
+    endLocal('call dropped: connection lost'); // the server ends it too
     for (const w of S.waiting.values()) w.reject(new Error('offline'));
     S.waiting.clear();
     setStatus(S.synced ? 'offline — showing saved chats' : 'offline — retrying');
@@ -169,7 +178,7 @@ function connect(onOpen) {
 
 function syncFields() { return S.rev ? { sinceRevision: S.rev } : {}; }
 
-function resume() { S.pendingAuth = send(OP.RESUME, { token: S.token, lastGlobalSeq: S.lastSeq, ...syncFields() }); }
+function resume() { S.pendingAuth = send(OP.RESUME, { token: S.token, lastGlobalSeq: S.lastSeq, calls: '1', ...syncFields() }); }
 
 setInterval(() => { if (S.me) send(OP.PING); }, 20000); // server drops idle sockets after 45 s
 
@@ -215,6 +224,7 @@ function handle({ op, corr, f }) {
       renderSoon();
       break;
     case OP.NOTIFY: if (!corr) onNotice(f); break;
+    case OP.CALL_EVT: if (!corr) onCallEvent(f); break; // replies go to the waiting request
     case OP.ERROR:
       if (corr && corr === S.pendingAuth) {
         if (S.me) { const user = S.me; S.me = null; S.token = null; store.set('ember.token', null); cache.clear(user); showLogin(); }
@@ -236,6 +246,7 @@ function onAuth(f) {
   if (S.me && S.me !== f.userId) { S.convs.clear(); S.rev = 0; }
   if (f.syncReset === 'true') { S.convs.clear(); S.rev = 0; } // server data was reset: drop the cache
   S.me = f.userId; S.token = f.token; S.vapidKey = f.vapidKey || null;
+  try { S.ice = JSON.parse(f.ice || '[]'); } catch { S.ice = []; }
   store.set('ember.token', f.token); store.set('ember.user', f.userId);
   showApp(); setStatus('syncing…');
   // The server remembers a status set on another device; otherwise restore this device's choice.
@@ -598,6 +609,7 @@ function renderHeader() {
   }
   $('searchBtn').hidden = $('starBtn').hidden = !c;
   $('pollBtn').hidden = $('addMember').hidden = !group;
+  $('callBtn').hidden = $('videoBtn').hidden = !(c && peer(c));
   $('composer').hidden = !c;
   if (!c) { $('searchBar').hidden = true; $('pinBar').hidden = true; $('polls').replaceChildren(); $('typing').textContent = ''; $('replyBar').hidden = true; }
 }
@@ -995,8 +1007,8 @@ $('loginForm').onsubmit = async (e) => {
   if (!registering && await restoreCache(user.toLowerCase())) { S.synced = true; }
   connect(() => {
     S.pendingAuth = registering
-      ? send(OP.REGISTER, { user, pass, displayName: $('displayName').value.trim() || user })
-      : send(OP.LOGIN, { user, pass, ...syncFields() });
+      ? send(OP.REGISTER, { user, pass, calls: '1', displayName: $('displayName').value.trim() || user })
+      : send(OP.LOGIN, { user, pass, calls: '1', ...syncFields() });
     $('pass').value = ''; $('loginBtn').disabled = false;
   });
 };
@@ -1073,6 +1085,7 @@ $('notifyBtn').onclick = async () => {
   renderMe();
 };
 $('logoutBtn').onclick = () => {
+  hangUp();
   send(OP.LOGOUT);
   cache.clear(S.me); // a shared computer keeps no copy of the chats
   unsubscribePush().catch(() => {});

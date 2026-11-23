@@ -1,6 +1,6 @@
 // Offline app shell (cache first, refreshed in the background) plus Web Push notifications.
-const CACHE = 'ember-v3';
-const SHELL = ['/', '/app.js', '/app.css', '/manifest.json', '/icon.svg'];
+const CACHE = 'ember-v4';
+const SHELL = ['/', '/app.js', '/app.css', '/manifest.json', '/icon.svg', '/call.js', '/call-worklet.js'];
 self.addEventListener('install', (e) => e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener('activate', (e) => e.waitUntil(caches.keys()
   .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))

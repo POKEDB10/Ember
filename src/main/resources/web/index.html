@@ -10,6 +10,7 @@
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
 <script src="/app.js" defer></script>
+<script src="/call.js" defer></script>
 </head>
 <body>
 <main id="login" class="window login" hidden>
@@ -55,6 +56,8 @@
       <div id="meCard"></div>
       <div id="requests"></div>
       <button id="notifyBtn">🔔 NOTIFICATIONS: OFF</button>
+      <button id="hideIpBtn">🛡 HIDE MY IP IN CALLS: OFF</button>
+      <p class="dim small">Calls are end-to-end encrypted. They try a direct link first (lowest delay); with this on, every call goes through the encrypted relay so the other person never sees your IP address.</p>
       <p class="dim small">Notifications reach this device even when Ember is closed. Do&nbsp;not&nbsp;disturb silences them.</p>
     </section>
     <footer id="status" class="status dim">offline</footer>
@@ -65,6 +68,8 @@
       <span class="ellipsis"><button id="back" class="icon back" aria-label="Back">◄</button>
         <button id="chatTitle" class="title-btn">▣ EMBER</button> <span id="chatSub" class="dim"></span></span>
       <span class="tools">
+        <button id="callBtn" class="icon" title="Voice call" aria-label="Voice call" hidden>📞</button>
+        <button id="videoBtn" class="icon" title="Video call" aria-label="Video call" hidden>🎥</button>
         <button id="starBtn" class="icon" title="Show starred messages" aria-label="Show starred messages" aria-pressed="false" hidden>★</button>
         <button id="searchBtn" class="icon" title="Search this chat" aria-label="Search this chat" hidden>🔍</button>
         <button id="pollBtn" class="icon" title="New poll" aria-label="New poll" hidden>📊</button>
@@ -88,6 +93,22 @@
   <figure><img id="overlayImg" alt=""><figcaption id="overlayCap"></figcaption></figure>
   <button id="overlayClose" class="icon" aria-label="Close">×</button>
 </div>
+<section id="callBox" class="window callbox" hidden role="dialog" aria-label="Call">
+  <header class="titlebar"><span id="callTitle" class="ellipsis">▣ CALL</span><span id="callInfo" class="dim"></span></header>
+  <div id="callStage" class="callstage">
+    <video id="callRemote" autoplay playsinline></video>
+    <canvas id="callCanvas" hidden></canvas>
+    <video id="callLocal" class="selfview" autoplay playsinline muted></video>
+  </div>
+  <p id="callStatus" class="callstatus" aria-live="polite"></p>
+  <p id="callCode" class="small dim callcode"></p>
+  <div class="row gap wrap pad">
+    <button id="callAccept" hidden>ACCEPT</button>
+    <button id="callMic" aria-label="Microphone">MIC ON</button>
+    <button id="callCam" aria-label="Camera" hidden>CAM ON</button>
+    <button id="callEnd" class="danger">HANG UP</button>
+  </div>
+</section>
 <div id="notices" class="notices" aria-live="polite"></div>
 <input id="filePick" type="file" accept="image/png,image/jpeg,image/webp,image/heic" hidden>
 <div id="toast" class="toast" role="status" hidden></div>

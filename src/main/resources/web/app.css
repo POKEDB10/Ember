@@ -201,3 +201,14 @@ input:focus, textarea:focus, button:focus-visible { outline: 2px dashed var(--ac
   .msg { max-width: 90%; }
 }
 @media (prefers-reduced-motion: reduce) { button:active:not(:disabled) { transform: none; } .notice { animation: none; } }
+
+/* ---- calls ---- */
+.callbox { position: fixed; z-index: 40; right: 16px; bottom: 16px; width: min(420px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); }
+.callstage { position: relative; background: #000; aspect-ratio: 4 / 3; overflow: hidden; }
+.callstage[hidden] { display: none; }
+.callstage video, .callstage canvas { width: 100%; height: 100%; object-fit: cover; display: block; }
+.callstage .selfview { position: absolute; right: 8px; bottom: 8px; width: 28%; height: auto; aspect-ratio: 4 / 3; border: 2px solid var(--accent); }
+.callstatus { margin: 0; padding: 10px 12px 0; font-size: 20px; color: var(--accent); }
+.callcode { padding: 4px 12px 0; letter-spacing: .05em; }
+.danger { border-color: var(--err); color: var(--err); }
+@media (max-width: 720px) { .callbox { inset: 0; width: 100vw; max-height: none; box-shadow: none; } }
