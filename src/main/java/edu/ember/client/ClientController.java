@@ -715,6 +715,14 @@ public final class ClientController implements AutoCloseable {
             String device = fields.getOrDefault("dev." + index, "");
             String publicKey = fields.getOrDefault("pub." + index, "");
             // Only well-formed keys of people actually in this chat are used; anything else is ignored.
+            E2eCrypto.Identity self = identity;
+            boolean fakeSelf = self != null && device.equals(self.deviceId())
+                    && (!user.equals(model.userId()) || !publicKey.equals(self.publicKey()));
+            if (fakeSelf) {
+                // Anything claiming to be this device must be exactly this device's key.
+                model.setError("KEY", "⚠ The server listed a fake copy of this device. It was ignored.");
+                continue;
+            }
             if (device.matches("[A-Za-z0-9_-]{16,43}") && publicKey.matches("[A-Za-z0-9_-]{87}")
                     && user.matches("[a-z0-9_]{3,20}") && (members == null || members.contains(user))) {
                 keys.add(new E2eCrypto.DeviceKey(user, device, publicKey,
@@ -742,7 +750,7 @@ public final class ClientController implements AutoCloseable {
             boolean changed = false;
             for (E2eCrypto.DeviceKey key : keys) {
                 E2eCrypto.Identity self = identity;
-                if (!key.active() || (self != null && key.deviceId().equals(self.deviceId()))) {
+                if (!key.active() || (self != null && isThisDevice(key, self))) {
                     continue;
                 }
                 String line = key.userId() + " " + key.deviceId() + " " + key.publicKey();
@@ -787,6 +795,11 @@ public final class ClientController implements AutoCloseable {
         }
     }
 
+    private boolean isThisDevice(E2eCrypto.DeviceKey key, E2eCrypto.Identity self) {
+        return key.userId().equals(model.userId()) && key.deviceId().equals(self.deviceId())
+                && key.publicKey().equals(self.publicKey());
+    }
+
     /** A device's code: 8 groups of 5 digits from 128 bits of its key's hash (the website computes the same). */
     public static String deviceCode(String publicKey) throws java.security.GeneralSecurityException {
         byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(E2eCrypto.decode(publicKey));
@@ -815,7 +828,7 @@ public final class ClientController implements AutoCloseable {
         for (E2eCrypto.DeviceKey key : keysFor(conversationId, true)) {
             if (key.active() && key.userId().equals(otherUserId)) {
                 theirs.add(deviceCode(key.publicKey()));
-            } else if (key.active() && me != null && !key.deviceId().equals(me.deviceId())) {
+            } else if (key.active() && me != null && key.userId().equals(self) && !isThisDevice(key, me)) {
                 myOthers.add(deviceCode(key.publicKey()));
             }
         }

@@ -70,7 +70,13 @@ async function keysFor(convId, fresh) {
   // Only well-formed keys of people actually in this chat are used; anything else is ignored.
   const members = chatMembers(convId);
   const list = Array.from({ length: +f.n || 0 }, (_, i) => ({ user: f['user.' + i], dev: f['dev.' + i], pub: f['pub.' + i], active: f['active.' + i] === 'true' }))
-    .filter((k) => /^[A-Za-z0-9_-]{16,43}$/.test(k.dev) && /^[A-Za-z0-9_-]{87}$/.test(k.pub) && (!members || members.includes(k.user)));
+    .filter((k) => /^[A-Za-z0-9_-]{16,43}$/.test(k.dev) && /^[A-Za-z0-9_-]{87}$/.test(k.pub) && (!members || members.includes(k.user)))
+    .filter((k) => {
+      // Anything claiming to be this device must be exactly this device's key; anything else is an impostor.
+      const claims = e2e.dev && k.dev === e2e.dev.id;
+      if (claims && (k.user !== S.me || k.pub !== e2e.dev.pub)) { toast('⚠ the server listed a fake copy of this device. It was ignored.'); return false; }
+      return true;
+    });
   e2e.keys.set(convId, { at: Date.now(), list });
   noticeNewDevices(convId, list);
   return list;
@@ -90,7 +96,7 @@ function noticeNewDevices(convId, list) {
   try { seen = JSON.parse(store.get(key) || '{}'); } catch { seen = {}; }
   let changed = false;
   for (const k of list) {
-    if (!k.active || (k.user === S.me && e2e.dev && k.dev === e2e.dev.id)) continue;
+    if (!k.active || (k.user === S.me && e2e.dev && k.dev === e2e.dev.id && k.pub === e2e.dev.pub)) continue;
     const known = seen[k.user];
     if (!known) { seen[k.user] = [k.dev]; changed = true; continue; }
     if (!known.includes(k.dev)) {
@@ -232,7 +238,7 @@ async function safetyNumber(userId) {
   const list = (await keysFor(convId, true)).filter((k) => k.active);
   const theirs = list.filter((k) => k.user === userId);
   if (!theirs.length) return null;
-  const myOthers = list.filter((k) => k.user === S.me && k.dev !== e2e.dev.id);
+  const myOthers = list.filter((k) => k.user === S.me && !(k.dev === e2e.dev.id && k.pub === e2e.dev.pub));
   return { mine: await deviceCode(e2e.dev.pub), myOthers: await Promise.all(myOthers.map((k) => deviceCode(k.pub))),
     theirs: await Promise.all(theirs.map((k) => deviceCode(k.pub))) };
 }
