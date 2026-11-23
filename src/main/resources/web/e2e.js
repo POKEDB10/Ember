@@ -91,6 +91,17 @@ function noticeNewDevices(convId, list) {
   if (changed) store.set(key, JSON.stringify(seen));
 }
 
+function markEncrypted(convId) {
+  const key = 'ember.e2echats.' + S.me;
+  let chats = [];
+  try { chats = JSON.parse(store.get(key) || '[]'); } catch { chats = []; }
+  if (!chats.includes(convId)) { chats.push(convId); store.set(key, JSON.stringify(chats)); }
+}
+
+function wasEncrypted(convId) {
+  try { return JSON.parse(store.get('ember.e2echats.' + S.me) || '[]').includes(convId); } catch { return true; }
+}
+
 function everKeyed(userId) {
   try { return !!JSON.parse(store.get('ember.devices.' + S.me) || '{}')[userId]; } catch { return false; }
 }
@@ -127,11 +138,15 @@ async function sealBody(convId, msgId, text) {
   const people = convId.startsWith('dm:') ? [peer({ id: convId })] : (c && c.members ? c.members.filter((u) => u !== S.me) : [...others]);
   const missing = people.filter((u) => !others.has(u));
   if (!others.size) {
-    // Nobody else has encryption set up yet (they have not opened the new app). Plain text is
-    // allowed only if we have never seen keys for them: once seen, never downgrade silently.
-    if (missing.some(everKeyed)) throw new Error('cannot encrypt: their devices are missing. Not sent.');
+    // Nobody else has encryption set up yet (they have not opened the new app). Plain text only for
+    // a chat that never used encryption, with people never seen with keys: once seen, never downgrade.
+    const all = await keysFor(convId);
+    if (wasEncrypted(convId) || all.some((k) => k.user !== S.me) || missing.some(everKeyed)) {
+      throw new Error('cannot encrypt: their devices are missing. Not sent.');
+    }
     return text;
   }
+  markEncrypted(convId);
   if (convId.startsWith('dm:') && missing.length) throw new Error('cannot encrypt for this chat. Not sent.');
   if (!list.some((k) => k.dev === e2e.dev.id)) list.push({ user: S.me, dev: e2e.dev.id, pub: e2e.dev.pub, active: true });
   const msgKeyRaw = rand(32), iv = rand(12), salt = rand(16);
@@ -167,8 +182,10 @@ const LOCKED = '🔒 This message cannot be read on this device (it was sent bef
 async function decryptFrame(f) {
   if (!f.body || !f.body.startsWith(E2E.PREFIX)) return;
   try {
-    f.body = await openBody(f.convId || (findMsg(f.clientMsgId) || {}).conv, f.senderUserId || (findMsg(f.clientMsgId) || {}).from, f.clientMsgId, f.body);
+    const conv = f.convId || (findMsg(f.clientMsgId) || {}).conv;
+    f.body = await openBody(conv, f.senderUserId || (findMsg(f.clientMsgId) || {}).from, f.clientMsgId, f.body);
     f.e2e = 'true';
+    markEncrypted(conv);
   } catch {
     f.body = LOCKED; f.e2e = 'locked';
   }

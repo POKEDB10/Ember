@@ -715,7 +715,89 @@ public final class ClientController implements AutoCloseable {
         }
         keyCache.put(conversationId, new KeyCacheEntry(System.currentTimeMillis(), keys));
         rememberKeyed(keys);
+        noticeNewDevices(keys);
         return keys;
+    }
+
+    /**
+     * Trust on first use: the first devices seen for a person are remembered. A device that shows
+     * up later (a new phone, or a key the server slipped in) is announced, so the person can
+     * compare the safety number before trusting it.
+     */
+    private synchronized void noticeNewDevices(java.util.List<E2eCrypto.DeviceKey> keys) {
+        Path file = clientDataRoot.resolve(model.userId()).resolve("known-devices.txt");
+        try {
+            java.util.Set<String> known = new java.util.TreeSet<>(Files.exists(file)
+                    ? Files.readAllLines(file, StandardCharsets.UTF_8) : java.util.List.of());
+            java.util.Set<String> knownUsers = new java.util.HashSet<>();
+            known.forEach(line -> knownUsers.add(line.split(" ")[0]));
+            boolean changed = false;
+            for (E2eCrypto.DeviceKey key : keys) {
+                if (key.userId().equals(model.userId()) || !key.active()) {
+                    continue;
+                }
+                String line = key.userId() + " " + key.deviceId() + " " + key.publicKey();
+                if (known.add(line)) {
+                    changed = true;
+                    if (knownUsers.contains(key.userId())) {
+                        model.setError("KEY", "🔑 " + key.userId() + " signed in on a new device. "
+                                + "Compare the safety number before sharing anything private.");
+                    }
+                }
+            }
+            if (changed) {
+                Files.write(file, known, StandardCharsets.UTF_8);
+            }
+        } catch (IOException exception) {
+            model.setError("500", "Could not save known devices");
+        }
+    }
+
+    /** Chats that have ever carried an encrypted message: they never fall back to plain text. */
+    private synchronized void markEncrypted(String conversationId) {
+        Path file = clientDataRoot.resolve(model.userId()).resolve("encrypted-chats.txt");
+        try {
+            java.util.Set<String> chats = new java.util.TreeSet<>(Files.exists(file)
+                    ? Files.readAllLines(file, StandardCharsets.UTF_8) : java.util.List.of());
+            if (chats.add(conversationId)) {
+                Files.write(file, chats, StandardCharsets.UTF_8);
+            }
+        } catch (IOException exception) {
+            model.setError("500", "Could not save chat encryption state");
+        }
+    }
+
+    private synchronized boolean wasEncrypted(String conversationId) {
+        Path file = clientDataRoot.resolve(model.userId()).resolve("encrypted-chats.txt");
+        try {
+            return Files.exists(file) && Files.readAllLines(file, StandardCharsets.UTF_8).contains(conversationId);
+        } catch (IOException exception) {
+            return true; // unsure: refuse plain text
+        }
+    }
+
+    /**
+     * Safety number for a direct chat: the same 25 digits appear on both people's screens (website
+     * and desktop) unless someone, even the server, has put in a device that is not theirs.
+     */
+    public String safetyNumber(String otherUserId) throws Exception {
+        String me = model.userId();
+        String conversationId = "dm:" + (me.compareTo(otherUserId) < 0 ? me + ":" + otherUserId : otherUserId + ":" + me);
+        java.util.List<String> parts = keysFor(conversationId, true).stream().filter(E2eCrypto.DeviceKey::active)
+                .map(key -> key.userId() + ":" + key.publicKey()).sorted().toList();
+        if (parts.stream().noneMatch(part -> part.startsWith(otherUserId + ":"))) {
+            return "";
+        }
+        byte[] hash = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(String.join("|", parts).getBytes(StandardCharsets.UTF_8));
+        StringBuilder digits = new StringBuilder();
+        for (int index = 0; index < 10; index += 2) {
+            if (digits.length() > 0) {
+                digits.append(' ');
+            }
+            digits.append(String.format("%05d", (((hash[index] & 0xFF) << 8) | (hash[index + 1] & 0xFF)) % 100_000));
+        }
+        return digits.toString();
     }
 
     private Path keyedFile() {
@@ -753,17 +835,32 @@ public final class ClientController implements AutoCloseable {
         if (me == null) {
             throw new IOException("encryption is not ready on this device");
         }
-        java.util.List<E2eCrypto.DeviceKey> active = keysFor(conversationId, false).stream()
-                .filter(E2eCrypto.DeviceKey::active).toList();
+        java.util.List<E2eCrypto.DeviceKey> all = keysFor(conversationId, false);
+        java.util.List<E2eCrypto.DeviceKey> active = all.stream().filter(E2eCrypto.DeviceKey::active).toList();
         boolean othersHaveKeys = active.stream().anyMatch(key -> !key.userId().equals(model.userId()));
         if (!othersHaveKeys) {
-            String[] parts = conversationId.split(":");
-            if (parts.length == 3 && everKeyed(parts[1].equals(model.userId()) ? parts[2] : parts[1])) {
+            // Plain text only for a chat that never used encryption, with people never seen with keys
+            // (they have not opened the new app yet). Otherwise refuse: a server hiding keys cannot
+            // trick this device into sending readable text.
+            if (wasEncrypted(conversationId) || all.stream().anyMatch(key -> !key.userId().equals(model.userId()))
+                    || members(conversationId).stream().anyMatch(this::everKeyed)) {
                 throw new IOException("their devices are missing, so it cannot be encrypted");
             }
             return text;
         }
+        markEncrypted(conversationId);
         return E2eCrypto.seal(me, conversationId, model.userId(), clientMsgId, text, active);
+    }
+
+    /** The other people in a chat: the partner of a direct chat, or the group's known members. */
+    private java.util.List<String> members(String conversationId) {
+        String[] parts = conversationId.split(":");
+        if (parts.length == 3 && parts[0].equals("dm")) {
+            return java.util.List.of(parts[1].equals(model.userId()) ? parts[2] : parts[1]);
+        }
+        var group = parts.length == 2 ? model.groupDetails(parts[1]) : null;
+        return group == null ? java.util.List.of() : group.members().keySet().stream()
+                .filter(member -> !member.equals(model.userId())).toList();
     }
 
     /** Replaces an encrypted body with its text, or with a notice when this device cannot read it. */
@@ -783,6 +880,7 @@ public final class ClientController implements AutoCloseable {
                 fields.put("body", E2eCrypto.open(me, conversationId, sender, id, fields.get("body"),
                         keysFor(conversationId, true)));
             }
+            markEncrypted(conversationId);
         } catch (Exception exception) {
             fields.put("body", LOCKED_TEXT);
         }

@@ -31,6 +31,7 @@ public final class ConversationPanel extends JPanel implements ClientModelListen
     private final JLabel pinnedBanner = new JLabel(" ");
     private final javax.swing.JButton createPollButton = new javax.swing.JButton("Create poll");
     private final javax.swing.JButton groupInfoButton = new javax.swing.JButton("Group info");
+    private final javax.swing.JButton safetyButton = new javax.swing.JButton("🔒 Safety number");
     private final javax.swing.JTextField searchField = new javax.swing.JTextField(14);
     private final SearchEngine searchEngine = new SearchEngine();
     private final JLabel replyIndicator = new JLabel();
@@ -71,6 +72,10 @@ public final class ConversationPanel extends JPanel implements ClientModelListen
         });
         groupInfoButton.setVisible(false);
         headerTools.add(groupInfoButton);
+        safetyButton.setToolTipText("Check that this chat is end-to-end encrypted");
+        safetyButton.addActionListener(event -> showSafetyNumber());
+        safetyButton.setVisible(false);
+        headerTools.add(safetyButton);
         headerTools.add(connection);
         header.add(headerTools, BorderLayout.EAST);
         pinnedBanner.setForeground(ThemeManager.current().muted());
@@ -133,8 +138,39 @@ public final class ConversationPanel extends JPanel implements ClientModelListen
         heading.setText(ChatListPanel.peerName(id, controller.model().userId()));
         createPollButton.setVisible(id.startsWith("grp:"));
         groupInfoButton.setVisible(id.startsWith("grp:"));
+        safetyButton.setVisible(id.startsWith("dm:"));
         refreshMessages();
         composer.requestFocusInWindow();
+    }
+
+    /** Shows the direct chat's safety number; it must match the one on the other person's screen. */
+    private void showSafetyNumber() {
+        String id = conversationId;
+        if (id == null || !id.startsWith("dm:")) {
+            return;
+        }
+        String[] parts = id.split(":");
+        String other = parts[1].equals(controller.model().userId()) ? parts[2] : parts[1];
+        new javax.swing.SwingWorker<String, Void>() {
+            @Override protected String doInBackground() throws Exception {
+                return controller.safetyNumber(other);
+            }
+
+            @Override protected void done() {
+                String text;
+                try {
+                    String number = get();
+                    text = number.isEmpty() ? other + " has no encryption keys yet (they have not opened the new app)."
+                            : "Safety number with " + other + ":\n\n" + number
+                                    + "\n\nCompare it with " + other + " in person. The same digits mean nobody,"
+                                    + " not even the server, can read this chat.";
+                } catch (Exception exception) {
+                    text = "Could not check encryption right now.";
+                }
+                javax.swing.JOptionPane.showMessageDialog(ConversationPanel.this, text, "End-to-end encryption",
+                        javax.swing.JOptionPane.INFORMATION_MESSAGE);
+            }
+        }.execute();
     }
 
     public JTextArea composer() { return composer; }
