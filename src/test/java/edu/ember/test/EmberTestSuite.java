@@ -1680,7 +1680,7 @@ public final class EmberTestSuite {
                 Map<String, String> phantom = wsFields(alice, WireOpcodes.EVT_CALL);
                 assertEquals("ringing", phantom.get("kind"), "An unreachable callee was revealed to the caller");
                 // A phantom call answers every later action exactly like an unanswered real call.
-                callCommand(alice, 29, Map.of("kind", "sdp", "callId", phantom.get("callId"), "data", "x"));
+                callCommand(alice, 29, Map.of("kind", "sdp", "callId", phantom.get("callId"), "to", "carol", "data", "x"));
                 assertEquals("400", wsFields(alice, WireOpcodes.EVT_ERROR).get("code"),
                         "Signalling a phantom call differed from an unanswered call");
                 callCommand(alice, 28, Map.of("kind", "ring", "convId", "dm:alice:bob"));
@@ -1697,7 +1697,7 @@ public final class EmberTestSuite {
                 assertEquals(callId, ring.get("callId"), "Ring carried another call id");
                 assertEquals("true", ring.get("video"), "Video flag was lost");
 
-                callCommand(carol, 2, Map.of("kind", "sdp", "callId", callId, "data", "x"));
+                callCommand(carol, 2, Map.of("kind", "sdp", "callId", callId, "to", "alice", "data", "x"));
                 assertEquals("404", wsFields(carol, WireOpcodes.EVT_ERROR).get("code"),
                         "An outsider could signal into someone else's call");
                 callCommand(carol, 3, Map.of("kind", "ring", "convId", "dm:bob:carol"));
@@ -1708,10 +1708,16 @@ public final class EmberTestSuite {
                         "A caller already in a call could start a second one");
 
                 callCommand(bob, 2, Map.of("kind", "accept", "callId", callId));
-                assertEquals("accept", wsFields(alice, WireOpcodes.EVT_CALL).get("kind"), "Caller missed the answer");
-                callCommand(alice, 5, Map.of("kind", "key", "callId", callId, "data", "PUBLICKEY"));
+                Map<String, String> roster = wsFields(bob, WireOpcodes.EVT_CALL);
+                assertEquals("roster", roster.get("kind"), "The person answering did not get the list of people");
+                assertEquals("alice", roster.get("user.0"), "The roster did not name the caller");
+                Map<String, String> joined = wsFields(alice, WireOpcodes.EVT_CALL);
+                assertEquals("joined", joined.get("kind"), "Caller missed the answer");
+                assertEquals("bob", joined.get("userId"), "Caller was told the wrong person joined");
+                callCommand(alice, 5, Map.of("kind", "key", "callId", callId, "to", "bob", "data", "PUBLICKEY"));
                 Map<String, String> key = wsFields(bob, WireOpcodes.EVT_CALL);
                 assertEquals("PUBLICKEY", key.get("data"), "Key exchange was not relayed unchanged");
+                assertEquals("alice", key.get("from"), "A signal did not say who sent it");
 
                 byte[] packet = new byte[1200];
                 new java.security.SecureRandom().nextBytes(packet);
@@ -1721,8 +1727,47 @@ public final class EmberTestSuite {
 
                 callCommand(bob, 3, Map.of("kind", "end", "callId", callId));
                 assertEquals("ended", wsFields(alice, WireOpcodes.EVT_CALL).get("reason"), "Hang-up did not reach caller");
-                callCommand(alice, 6, Map.of("kind", "key", "callId", callId, "data", "late"));
+                callCommand(alice, 6, Map.of("kind", "key", "callId", callId, "to", "bob", "data", "late"));
                 assertEquals("404", wsFields(alice, WireOpcodes.EVT_ERROR).get("code"), "A finished call accepted signals");
+
+                // Group call: everyone who joins hears everyone else; leaving keeps the call going.
+                try (WsClient dave = wsOpen(trust, password, port, null)) {
+                    wsSend(dave.out(), FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                            Map.of("user", "dave", "pass", "dave-pass-42", "displayName", "Dave", "calls", "1")));
+                    wsRead(dave.in(), WireOpcodes.EVT_AUTH_OK);
+                    wsSend(alice.out(), FrameFactory.command(WireOpcodes.CMD_GROUP_CREATE, 40, Map.of("name", "lab",
+                            "desc", "", "member.n", "3", "member.0", "bob", "member.1", "carol", "member.2", "dave")));
+                    String groupId = wsFields(alice, WireOpcodes.EVT_GROUP_UPDATE).get("groupId");
+                    callCommand(alice, 41, Map.of("kind", "ring", "convId", "grp:" + groupId));
+                    String groupCall = wsFields(alice, WireOpcodes.EVT_CALL).get("callId");
+                    Map<String, String> groupRing = wsFields(bob, WireOpcodes.EVT_CALL);
+                    assertEquals("true", groupRing.get("group"), "A group call was not marked as one");
+                    assertEquals("ring", wsFields(dave, WireOpcodes.EVT_CALL).get("kind"), "A member was not rung");
+                    callCommand(bob, 42, Map.of("kind", "accept", "callId", groupCall));
+                    wsFields(bob, WireOpcodes.EVT_CALL); // roster
+                    assertEquals("bob", wsFields(alice, WireOpcodes.EVT_CALL).get("userId"), "Caller missed Bob joining");
+                    callCommand(dave, 43, Map.of("kind", "accept", "callId", groupCall));
+                    Map<String, String> daveRoster = wsFields(dave, WireOpcodes.EVT_CALL);
+                    assertEquals("2", daveRoster.get("n"), "A late joiner was not told about everyone");
+                    assertEquals("dave", wsFields(alice, WireOpcodes.EVT_CALL).get("userId"), "Alice missed Dave joining");
+                    assertEquals("dave", wsFields(bob, WireOpcodes.EVT_CALL).get("userId"), "Bob missed Dave joining");
+                    byte[] shout = new byte[300];
+                    new java.security.SecureRandom().nextBytes(shout);
+                    wsSend(dave.out(), new WireFrame.Builder(WireOpcodes.CMD_CALL_MEDIA).payload(shout).build());
+                    assertTrue(java.util.Arrays.equals(shout, wsRead(alice.in(), WireOpcodes.EVT_CALL_MEDIA).payload())
+                            && java.util.Arrays.equals(shout, wsRead(bob.in(), WireOpcodes.EVT_CALL_MEDIA).payload()),
+                            "A group packet did not reach every other participant");
+                    callCommand(bob, 44, Map.of("kind", "end", "callId", groupCall));
+                    Map<String, String> left = wsFields(alice, WireOpcodes.EVT_CALL);
+                    assertEquals("left", left.get("kind"), "The call ended when one of three left");
+                    assertEquals("bob", left.get("userId"), "The wrong person was reported as leaving");
+                    callCommand(dave, 45, Map.of("kind", "end", "callId", groupCall));
+                    Map<String, String> over;
+                    do {
+                        over = wsFields(alice, WireOpcodes.EVT_CALL);
+                    } while (!"end".equals(over.get("kind")));
+                    assertEquals(groupCall, over.get("callId"), "The last person was not told the call ended");
+                }
 
                 wsSend(bob.out(), FrameFactory.command(WireOpcodes.CMD_USER_BLOCK, 4,
                         Map.of("targetUserId", "alice", "blocked", "true")));
