@@ -18,11 +18,16 @@ public final class TokenBucket {
     }
 
     public synchronized boolean tryConsume() {
+        return tryConsume(1.0);
+    }
+
+    /** Takes {@code amount} tokens (for example bytes) or none at all. */
+    public synchronized boolean tryConsume(double amount) {
         refill();
-        if (tokens < 1.0) {
+        if (tokens < amount) {
             return false;
         }
-        tokens -= 1.0;
+        tokens -= amount;
         return true;
     }
 

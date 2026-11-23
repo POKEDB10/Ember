@@ -52,6 +52,14 @@ public final class EmberServer implements AutoCloseable {
     private final AutoSaveThread autoSaveThread;
     private final ExpiryReaperThread expiryReaperThread;
     private final SessionStore sessions = new SessionStore();
+    /** Voice and video calls: the server rings and connects, the media itself is end-to-end encrypted. */
+    private final CallRegistry<ConnectionHandler> callRegistry = new CallRegistry<>();
+    private final java.util.concurrent.ConcurrentMap<String, TokenBucket> callBuckets =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** STUN/TURN servers handed to browsers for direct (lowest-delay) calls; JSON, set by EMBER_ICE_SERVERS. */
+    private static final String ICE_SERVERS = java.util.Optional.ofNullable(System.getenv("EMBER_ICE_SERVERS"))
+            .filter(value -> !value.isBlank())
+            .orElse("[{\"urls\":[\"stun:stun.cloudflare.com:3478\",\"stun:stun.l.google.com:19302\"]}]");
     /** Every live connection per user, so several devices can be signed in at once. */
     private final java.util.concurrent.ConcurrentMap<String, java.util.Set<ConnectionHandler>> online =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -347,6 +355,9 @@ public final class EmberServer implements AutoCloseable {
     }
 
     private void disconnect(ConnectionHandler handler) {
+        for (var call : callRegistry.dropDevice(handler)) {
+            sendCallEnd(call, call.other(handler.userId), "ended");
+        }
         if (handler.userId != null && removeOnline(handler.userId, handler)) {
             broadcastPresence(handler.userId, false);
         }
@@ -365,6 +376,8 @@ public final class EmberServer implements AutoCloseable {
         private java.io.OutputStream output;
         private String userId;
         private String token;
+        /** Only browsers that said they can take calls are rung (the Swing app cannot). */
+        private volatile boolean supportsCalls;
         /** Who the login rate limiter sees: the socket peer, or the proxy-reported client. */
         private java.net.InetAddress clientAddress;
 
@@ -401,6 +414,7 @@ public final class EmberServer implements AutoCloseable {
             WebGateway.Upgrade upgrade = null;
             try (socket) {
                 socket.setSoTimeout(45_000);
+                socket.setTcpNoDelay(true); // frames are flushed whole; never hold one back (call audio)
                 if (socket instanceof javax.net.ssl.SSLSocket tls) {
                     tls.setEnabledProtocols(new String[] {"TLSv1.3"});
                     tls.startHandshake();
@@ -489,6 +503,8 @@ public final class EmberServer implements AutoCloseable {
                     case edu.ember.common.protocol.WireOpcodes.CMD_MEDIA_GET -> getMedia(frame);
                     case edu.ember.common.protocol.WireOpcodes.CMD_STATUS_SET -> setStatus(frame);
                     case edu.ember.common.protocol.WireOpcodes.CMD_PUSH_SUBSCRIBE -> subscribePush(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_CALL -> call(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_CALL_MEDIA -> callMedia(frame);
                     default -> sendError(frame.correlationId(), "400", "Unsupported command");
                 }
             } catch (edu.ember.common.exceptions.EmberException exception) {
@@ -522,6 +538,8 @@ public final class EmberServer implements AutoCloseable {
             response.put("role", isAdminUser(user.username()) ? "ADMIN" : "STUDENT");
             response.put("admin", Boolean.toString(isAdminUser(user.username())));
             response.put("globalSeq", "0");
+            response.put("ice", ICE_SERVERS);
+            supportsCalls = "1".equals(fields.values.get("calls"));
             String sinceRevision = syncStart(fields, response);
             send(edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_AUTH_OK,
@@ -548,6 +566,8 @@ public final class EmberServer implements AutoCloseable {
             response.put("role", isAdminUserId(userId) ? "ADMIN" : "STUDENT");
             response.put("admin", Boolean.toString(isAdminUserId(userId)));
             response.put("globalSeq", "0");
+            response.put("ice", ICE_SERVERS);
+            supportsCalls = "1".equals(fields.values.get("calls"));
             String sinceRevision = syncStart(fields, response);
             send(edu.ember.common.protocol.FrameFactory.event(
                     edu.ember.common.protocol.WireOpcodes.EVT_AUTH_OK,
@@ -652,6 +672,110 @@ public final class EmberServer implements AutoCloseable {
                 sessions.remove(token);
             }
             socket.close();
+        }
+
+        /** Call signalling. Ringing follows the same rules as a direct message (no calls across a block). */
+        private void call(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            String kind = fields.required("kind");
+            if (kind.equals("ring")) {
+                ringCall(frame.correlationId(), fields);
+                return;
+            }
+            var call = callRegistry.find(fields.required("callId"));
+            if (call == null || (!call.caller.equals(userId) && !call.callee.equals(userId))) {
+                throw new edu.ember.common.exceptions.ResourceNotFoundException("The call has ended");
+            }
+            switch (kind) {
+                case "accept" -> {
+                    if (callRegistry.accept(call.id, userId, this) == null) {
+                        throw new edu.ember.common.exceptions.ResourceNotFoundException("The call has ended");
+                    }
+                    sendToDevice(call.callerDevice(), callEvent(call, "accept", java.util.Map.of(
+                            "hideIp", Boolean.toString("true".equals(fields.values.get("hideIp"))))));
+                    // Stop the ringing on this user's other devices.
+                    sendToUser(userId, callEvent(call, "end", java.util.Map.of("reason", "elsewhere")), this);
+                }
+                case "decline", "end" -> {
+                    if (callRegistry.end(call.id, userId) != null) {
+                        String reason = kind.equals("decline") ? "declined" : "ended";
+                        sendCallEnd(call, call.other(userId), reason);
+                        sendToUser(userId, callEvent(call, "end", java.util.Map.of("reason", reason)), this);
+                    }
+                }
+                case "sdp", "ice", "key", "relay" -> {
+                    ConnectionHandler peer = callRegistry.peerDevice(call, this);
+                    String data = fields.values.getOrDefault("data", "");
+                    if (peer == null || data.length() > 16_384 || !callRegistry.allowSignal(call)) {
+                        throw new edu.ember.common.exceptions.ValidationException("Call signal rejected");
+                    }
+                    sendToDevice(peer, callEvent(call, kind, java.util.Map.of("data", data)));
+                }
+                default -> throw new edu.ember.common.exceptions.ValidationException("Unknown call action");
+            }
+        }
+
+        private void ringCall(long correlationId, MapFields fields) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            String conversationId = fields.required("convId");
+            if (!conversationId.startsWith("dm:")) {
+                throw new edu.ember.common.exceptions.ValidationException("Calls are one-to-one");
+            }
+            String callee = requireDirectConversationAccess(conversationId, userId);
+            if (!callBuckets.computeIfAbsent(userId, ignored -> new TokenBucket(5, 1 / 20.0)).tryConsume()) {
+                auditLogger.log("rate_limited", userId, "calls");
+                throw new edu.ember.common.exceptions.RateLimitedException("Too many calls, wait a moment");
+            }
+            boolean video = "true".equals(fields.values.get("video"));
+            java.util.List<ConnectionHandler> devices = online.getOrDefault(callee, java.util.Set.of())
+                    .stream().filter(device -> device.supportsCalls).toList();
+            if (devices.isEmpty() || "dnd".equals(statuses.get(callee))) {
+                pushIfAway(callee, displayName(userId), video ? "Missed video call" : "Missed call",
+                        conversationId, "call");
+                send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_CALL,
+                        correlationId, java.util.Map.of("kind", "end", "callId", "", "reason", "unavailable")));
+                return;
+            }
+            var call = callRegistry.ring(userId, this, callee, video);
+            if (call == null) {
+                send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_CALL,
+                        correlationId, java.util.Map.of("kind", "end", "callId", "", "reason", "busy")));
+                return;
+            }
+            send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_CALL,
+                    correlationId, java.util.Map.of("kind", "ringing", "callId", call.id)));
+            var ring = callEvent(call, "ring", java.util.Map.of("from", userId, "convId", conversationId,
+                    "video", Boolean.toString(video),
+                    "hideIp", Boolean.toString("true".equals(fields.values.get("hideIp")))));
+            for (ConnectionHandler device : devices) {
+                sendToDevice(device, ring);
+            }
+            java.util.concurrent.CompletableFuture.delayedExecutor(CallRegistry.RING_TIMEOUT_MS,
+                    java.util.concurrent.TimeUnit.MILLISECONDS).execute(() -> {
+                        var expired = callRegistry.expire(call.id);
+                        if (expired != null) {
+                            sendCallEnd(expired, expired.caller, "noanswer");
+                            sendCallEnd(expired, expired.callee, "missed");
+                        }
+                    });
+        }
+
+        /** One encrypted media packet: forwarded unread to the other device of an answered call. */
+        private void callMedia(edu.ember.common.protocol.WireFrame frame) {
+            if (userId == null) {
+                return;
+            }
+            var call = callRegistry.activeCallOf(this);
+            ConnectionHandler peer = call == null ? null : callRegistry.peerDevice(call, this);
+            byte[] packet = frame.payload();
+            // Dropped silently: answering every bad packet would itself be a flood.
+            if (peer == null || packet.length > 65_536 || !callRegistry.allowMedia(call, this, packet.length)) {
+                return;
+            }
+            sendToDevice(peer, new edu.ember.common.protocol.WireFrame.Builder(
+                    edu.ember.common.protocol.WireOpcodes.EVT_CALL_MEDIA).payload(packet).build());
         }
 
         private void ping(edu.ember.common.protocol.WireFrame frame) throws IOException {
@@ -1547,6 +1671,40 @@ public final class EmberServer implements AutoCloseable {
                 java.util.logging.Logger.getLogger(EmberServer.class.getName())
                         .log(Level.FINE, "Event delivery failed", exception);
             }
+        }
+    }
+
+    private static edu.ember.common.protocol.WireFrame callEvent(CallRegistry.Call<?> call, String kind,
+            java.util.Map<String, String> extra) {
+        java.util.Map<String, String> fields = new java.util.HashMap<>(extra);
+        fields.put("kind", kind);
+        fields.put("callId", call.id);
+        return edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_CALL, 0, fields);
+    }
+
+    private void sendCallEnd(CallRegistry.Call<?> call, String target, String reason) {
+        sendToUser(target, callEvent(call, "end", java.util.Map.of("reason", reason)), null);
+        if (reason.equals("missed")) {
+            String first = call.caller.compareTo(call.callee) < 0 ? call.caller : call.callee;
+            try {
+                pushIfAway(target, displayName(call.caller), call.video ? "Missed video call" : "Missed call",
+                        "dm:" + first + ":" + call.other(first), "call");
+            } catch (IOException exception) {
+                java.util.logging.Logger.getLogger(EmberServer.class.getName())
+                        .log(Level.FINE, "Missed-call push failed", exception);
+            }
+        }
+    }
+
+    private static void sendToDevice(ConnectionHandler device, edu.ember.common.protocol.WireFrame event) {
+        if (device == null) {
+            return;
+        }
+        try {
+            device.send(event);
+        } catch (IOException exception) {
+            java.util.logging.Logger.getLogger(EmberServer.class.getName())
+                    .log(Level.FINE, "Call event delivery failed", exception);
         }
     }
 

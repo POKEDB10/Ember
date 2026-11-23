@@ -25,6 +25,10 @@ public final class WireOpcodes {
     public static final int CMD_GROUP_INFO = 0x23;
     public static final int CMD_STATUS_SET = 0x24;
     public static final int CMD_PUSH_SUBSCRIBE = 0x25;
+    /** Call signalling: ring, accept, decline, end, sdp, ice, key, relay. */
+    public static final int CMD_CALL = 0x26;
+    /** One encrypted call packet; the payload is opaque bytes, forwarded unread. */
+    public static final int CMD_CALL_MEDIA = 0x27;
     public static final int CMD_PROFILE_UPDATE = 0x30;
     public static final int CMD_FOLLOW_ACTION = 0x31;
     public static final int CMD_MEDIA_UPLOAD = 0x32;
@@ -59,6 +63,8 @@ public final class WireOpcodes {
     public static final int EVT_STORY_UPDATE = 0x55;
     public static final int EVT_ADMIN_DATA = 0x56;
     public static final int EVT_POLL_UPDATE = 0x57;
+    public static final int EVT_CALL = 0x58;
+    public static final int EVT_CALL_MEDIA = 0x59;
     public static final int EVT_ERROR = 0x70;
 
     private WireOpcodes() {
