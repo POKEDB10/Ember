@@ -143,7 +143,7 @@ Press 📞 or 🎥 in a direct chat. The other person's website rings. When they
 Either way the call is **end-to-end encrypted**: our server cannot listen.
 
 ### Step by step
-1. **Ring.** Alice's browser sends `CALL kind=ring`. The server checks the same rules as messages (DM only, no blocks), plus a rate limit (5 rings, then 1 per 20 s). It rings only Bob's devices that can take calls (website, not the Swing app). If Bob is on do not disturb or has no such device, Alice hears "cannot take calls" and Bob gets a "missed call" push. Unanswered calls stop after 45 s.
+1. **Ring.** Alice's browser sends `CALL kind=ring`. The server checks the same rules as messages (DM only, no blocks), plus a rate limit (5 rings, then 1 per 20 s). It rings only Bob's devices that can take calls (website, not the Swing app). If Bob is offline, on do not disturb, or already on a call, Alice hears ordinary ringing that is never answered, and Bob gets a "missed call" push. That way a call never reveals whether someone who looks offline or invisible is really online. Unanswered calls stop after 45 s.
 2. **Answer.** Bob presses ACCEPT. The server links exactly *one* of Bob's devices with Alice's device; his other devices stop ringing.
 3. **Keys.** Each browser makes a brand-new key pair for this call (ECDH P-256) and sends the public half. Both compute the same secret key (HKDF, then AES-GCM 128). The server only ever sees the public halves, so it cannot compute the key.
 4. **Safety code.** Both screens show 12 digits made from the two public keys. If the codes match, nobody (not even the server) swapped the keys, so nobody is in the middle. Users can read them out to each other.
@@ -168,7 +168,7 @@ A one-hour voice call is roughly 10–15 MB. Memory: no libraries; video frames 
 - `render.yaml` puts the server in Render's Singapore region, the closest to the UAE.
 
 ### Safety rules the server enforces for calls (`CallRegistry.java`)
-- One call per person at a time ("busy" otherwise).
+- One call per person at a time. A busy person just doesn't answer: callers are never told "busy", so calls can't be used to check whether someone is online.
 - Only the two linked devices can signal or send media; an outsider gets "call not found".
 - At most 400 signalling messages per call; at most ~1 Mbit/s of relayed media per direction; packets over 64 KB are dropped.
 - Calls end when either device disconnects.

@@ -1665,8 +1665,10 @@ public final class EmberTestSuite {
                 wsRead(carol.in(), WireOpcodes.EVT_AUTH_OK);
 
                 callCommand(alice, 3, Map.of("kind", "ring", "convId", "dm:alice:carol", "video", "false"));
-                assertEquals("unavailable", wsFields(alice, WireOpcodes.EVT_CALL).get("reason"),
-                        "A device that cannot take calls was rung");
+                // Unreachable looks exactly like ringing, so calls never reveal hidden presence.
+                Map<String, String> phantom = wsFields(alice, WireOpcodes.EVT_CALL);
+                assertEquals("ringing", phantom.get("kind"), "An unreachable callee was revealed to the caller");
+                callCommand(alice, 30, Map.of("kind", "end", "callId", phantom.get("callId")));
 
                 callCommand(alice, 4, Map.of("kind", "ring", "convId", "dm:alice:bob", "video", "true"));
                 Map<String, String> ringing = wsFields(alice, WireOpcodes.EVT_CALL);
@@ -1681,8 +1683,11 @@ public final class EmberTestSuite {
                 assertEquals("404", wsFields(carol, WireOpcodes.EVT_ERROR).get("code"),
                         "An outsider could signal into someone else's call");
                 callCommand(carol, 3, Map.of("kind", "ring", "convId", "dm:bob:carol"));
-                assertEquals("busy", wsFields(carol, WireOpcodes.EVT_CALL).get("reason"),
-                        "A second call reached someone already ringing");
+                assertEquals("ringing", wsFields(carol, WireOpcodes.EVT_CALL).get("kind"),
+                        "A busy callee was revealed to the caller");
+                callCommand(alice, 31, Map.of("kind", "ring", "convId", "dm:alice:carol"));
+                assertEquals("400", wsFields(alice, WireOpcodes.EVT_ERROR).get("code"),
+                        "A caller already in a call could start a second one");
 
                 callCommand(bob, 2, Map.of("kind", "accept", "callId", callId));
                 assertEquals("accept", wsFields(alice, WireOpcodes.EVT_CALL).get("kind"), "Caller missed the answer");

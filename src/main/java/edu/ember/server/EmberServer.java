@@ -686,6 +686,9 @@ public final class EmberServer implements AutoCloseable {
             }
             var call = callRegistry.find(fields.required("callId"));
             if (call == null || (!call.caller.equals(userId) && !call.callee.equals(userId))) {
+                if (kind.equals("end") || kind.equals("decline")) {
+                    return; // hanging up a call that never rang (see ringCall) must look like any other
+                }
                 throw new edu.ember.common.exceptions.ResourceNotFoundException("The call has ended");
             }
             switch (kind) {
@@ -729,19 +732,28 @@ public final class EmberServer implements AutoCloseable {
                 throw new edu.ember.common.exceptions.RateLimitedException("Too many calls, wait a moment");
             }
             boolean video = "true".equals(fields.values.get("video"));
+            if (callRegistry.inCall(userId)) {
+                throw new edu.ember.common.exceptions.ValidationException("You are already in a call");
+            }
             java.util.List<ConnectionHandler> devices = online.getOrDefault(callee, java.util.Set.of())
                     .stream().filter(device -> device.supportsCalls).toList();
-            if (devices.isEmpty() || "dnd".equals(statuses.get(callee))) {
+            var call = devices.isEmpty() || "dnd".equals(statuses.get(callee)) ? null
+                    : callRegistry.ring(userId, this, callee, video);
+            if (call == null) {
+                // Offline, invisible-and-away, do not disturb or busy: the caller hears ordinary ringing
+                // that goes unanswered, so a call never reveals presence the callee has hidden.
                 pushIfAway(callee, displayName(userId), video ? "Missed video call" : "Missed call",
                         conversationId, "call");
+                byte[] bytes = new byte[18];
+                new java.security.SecureRandom().nextBytes(bytes);
+                String phantom = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
                 send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_CALL,
-                        correlationId, java.util.Map.of("kind", "end", "callId", "", "reason", "unavailable")));
-                return;
-            }
-            var call = callRegistry.ring(userId, this, callee, video);
-            if (call == null) {
-                send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_CALL,
-                        correlationId, java.util.Map.of("kind", "end", "callId", "", "reason", "busy")));
+                        correlationId, java.util.Map.of("kind", "ringing", "callId", phantom)));
+                java.util.concurrent.CompletableFuture.delayedExecutor(CallRegistry.RING_TIMEOUT_MS,
+                        java.util.concurrent.TimeUnit.MILLISECONDS).execute(() -> sendToDevice(this,
+                                edu.ember.common.protocol.FrameFactory.event(
+                                        edu.ember.common.protocol.WireOpcodes.EVT_CALL, 0, java.util.Map.of(
+                                                "kind", "end", "callId", phantom, "reason", "noanswer"))));
                 return;
             }
             send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_CALL,
