@@ -386,6 +386,34 @@ public final class InMemoryStorageEngine implements StorageEngine {
         return List.copyOf(pushSubscriptions.getOrDefault(userId, Map.of()).values());
     }
 
+    @Override public synchronized java.util.Set<String> contactsOf(String userId) {
+        java.util.Set<String> contacts = new java.util.HashSet<>();
+        for (String conversationId : conversationSequences.keySet()) {
+            String[] parts = conversationId.split(":");
+            if (parts.length == 3 && parts[0].equals("dm") && (parts[1].equals(userId) || parts[2].equals(userId))) {
+                contacts.add(parts[1].equals(userId) ? parts[2] : parts[1]);
+            }
+        }
+        for (GroupChat group : groups.values()) {
+            if (group.contains(userId)) {
+                contacts.addAll(group.members().keySet());
+            }
+        }
+        // Only accepted follows count: a follow request alone must not reveal presence.
+        follows.getOrDefault(userId, Map.of()).forEach((followed, status) -> {
+            if (status == FollowStatus.ACCEPTED) {
+                contacts.add(followed);
+            }
+        });
+        follows.forEach((follower, targets) -> {
+            if (targets.get(userId) == FollowStatus.ACCEPTED) {
+                contacts.add(follower);
+            }
+        });
+        contacts.remove(userId);
+        return contacts;
+    }
+
     @Override public synchronized void saveSetting(String key, String value) {
         settings.put(key, value);
     }

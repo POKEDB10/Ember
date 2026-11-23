@@ -82,6 +82,11 @@ public interface StorageEngine extends AutoCloseable {
             boolean active) throws IOException { }
     default List<edu.ember.common.model.PushSubscription> pushSubscriptions(String userId)
             throws IOException { return List.of(); }
+    /**
+     * Everyone this user has a reason to know: direct-chat partners, people in the same groups,
+     * and follows in either direction. Presence and key updates go only to these people.
+     */
+    default java.util.Set<String> contactsOf(String userId) throws IOException { return java.util.Set.of(); }
     default void saveSetting(String key, String value) throws IOException { }
     default Optional<String> setting(String key) throws IOException { return Optional.empty(); }
     /** Copies a stored media file off-server, when the engine has a replica. */

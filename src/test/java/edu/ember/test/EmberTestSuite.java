@@ -894,6 +894,7 @@ public final class EmberTestSuite {
             alice.register("alice", "alice-pass-42".toCharArray(), "Alice");
             bob.register("bob", "bob-pass-42".toCharArray(), "Bob");
             assertTrue(authenticated.await(30, TimeUnit.SECONDS), "Resume users did not authenticate");
+            alice.follow("bob", true); // presence is shared only between contacts
             assertTrue(awaitPresence(alice.model(), "bob", true, 10_000),
                     "Online presence was not broadcast (events=" + presenceEvents.get()
                             + ", lastError=" + alice.model().errorMessage() + ")");
@@ -1272,6 +1273,10 @@ public final class EmberTestSuite {
                 wsSend(quin.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
                         Map.of("user", "quin", "pass", "quin-pass-42", "displayName", "Quin")));
                 wsRead(quinIn, WireOpcodes.EVT_AUTH_OK);
+                wsSend(quin.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_MSG_SEND, 2, Map.of(
+                        "clientMsgId", "push-0", "convId", "dm:pam:quin", "body", "pam is online, no push")));
+                wsRead(quinIn, WireOpcodes.EVT_MSG_ACK);
+                assertTrue(pushes.poll(1, TimeUnit.SECONDS) == null, "Pushed although a device was connected");
                 wsSend(pam.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_STATUS_SET, 4,
                         Map.of("status", "invisible")));
                 Map<String, String> seen;
@@ -1279,10 +1284,6 @@ public final class EmberTestSuite {
                     seen = KvPayloadCodec.decode(wsRead(quinIn, WireOpcodes.EVT_PRESENCE_UPDATE).payload());
                 } while (!"pam".equals(seen.get("userId")) || !"offline".equals(seen.get("status")));
                 assertEquals("false", seen.get("online"), "Invisible user still looked online");
-                wsSend(quin.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_MSG_SEND, 2, Map.of(
-                        "clientMsgId", "push-0", "convId", "dm:pam:quin", "body", "pam is online, no push")));
-                wsRead(quinIn, WireOpcodes.EVT_MSG_ACK);
-                assertTrue(pushes.poll(1, TimeUnit.SECONDS) == null, "Pushed although a device was connected");
                 pam.close();
                 Thread.sleep(300); // let the server notice pam's device left
                 wsSend(quin.getOutputStream(), FrameFactory.command(WireOpcodes.CMD_MSG_SEND, 3, Map.of(

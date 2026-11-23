@@ -919,12 +919,17 @@ public final class EmberServer implements AutoCloseable {
                 boolean approve = Boolean.parseBoolean(fields.values.getOrDefault("approve", "false"));
                 socialFeedService.approveFollow(userId, target, approve);
                 notifyUser(target, approve ? "FOLLOW_APPROVED" : "FOLLOW_DECLINED", userId);
+                if (approve) {
+                    introduce(userId, target);
+                }
             } else {
                 socialFeedService.follow(userId, target, following);
                 if (following && storage.followStatus(userId, target).orElse(null)
                         == edu.ember.common.model.FollowStatus.PENDING) {
                     notifyUser(target, "FOLLOW_REQUEST", userId);
                     pushIfAway(target, displayName(userId), "wants to follow you", "", "follow");
+                } else if (following) {
+                    introduce(userId, target);
                 }
             }
             send(edu.ember.common.protocol.FrameFactory.event(
@@ -1352,6 +1357,9 @@ public final class EmberServer implements AutoCloseable {
             var message = new edu.ember.common.model.Message(clientMsgId, userId, conversationId,
                     body, System.currentTimeMillis(), ttlSec, replyToId, replyPreview);
             storage.appendMessage(message);
+            if (conversationId.startsWith("dm:") && message.conversationSequence() == 1) {
+                introduce(userId, recipients.get(0));
+            }
             receiptTrackers.put(receiptKey(message), new GroupReceiptTracker(recipients.size()));
             sendMessageAck(frame.correlationId(), message);
             var deliver = edu.ember.common.protocol.FrameFactory.event(
@@ -1768,29 +1776,75 @@ public final class EmberServer implements AutoCloseable {
                         "status", visible ? status : "offline"));
     }
 
+    /** Presence goes only to contacts (chat partners, group mates, follows), never to strangers. */
     private void broadcastPresence(String userId, boolean isOnline) {
-        var everyone = presenceEvent(userId, isOnline, false);
-        var self = presenceEvent(userId, isOnline, true);
-        for (String onlineUser : online.keySet()) {
-            sendToUser(onlineUser, onlineUser.equals(userId) ? self : everyone, null);
+        sendToUser(userId, presenceEvent(userId, isOnline, true), null);
+        var event = presenceEvent(userId, isOnline, false);
+        for (String contact : contactsOf(userId)) {
+            if (online.containsKey(contact)) {
+                sendToUser(contact, event, null);
+            }
         }
     }
 
+    /** Contacts minus anyone blocked in either direction. */
+    private java.util.Set<String> contactsOf(String userId) {
+        try {
+            java.util.Set<String> contacts = new java.util.HashSet<>();
+            for (String contact : storage.contactsOf(userId)) {
+                if (!storage.isBlockedEitherDirection(userId, contact)) {
+                    contacts.add(contact);
+                }
+            }
+            return contacts;
+        } catch (IOException exception) {
+            return java.util.Set.of();
+        }
+    }
+
+    /** Two people who just started a direct chat learn each other's presence. */
+    private void introduce(String first, String second) {
+        if (online.containsKey(second)) {
+            sendToUser(first, presenceEvent(second, true, false), null);
+        }
+        if (online.containsKey(first)) {
+            sendToUser(second, presenceEvent(first, true, false), null);
+        }
+    }
+
+    /** Tells only the people in that chat; others never learn the conversation exists. */
     private void broadcastExpiredMessage(edu.ember.common.model.Message message) {
         var event = edu.ember.common.protocol.FrameFactory.event(
                 edu.ember.common.protocol.WireOpcodes.EVT_MSG_UPDATE, 0,
                 java.util.Map.of("clientMsgId", message.clientMsgId(),
                         "convId", message.conversationId(), "state", "EXPIRED"));
-        for (String onlineUser : online.keySet()) {
-            sendToUser(onlineUser, event, null);
+        for (String participant : participantsOf(message.conversationId())) {
+            sendToUser(participant, event, null);
         }
     }
 
+    /** The users in a conversation: both people of a direct chat, or a group's members. */
+    private java.util.Set<String> participantsOf(String conversationId) {
+        String[] parts = conversationId.split(":");
+        if (parts.length == 3 && parts[0].equals("dm")) {
+            return java.util.Set.of(parts[1], parts[2]);
+        }
+        if (parts.length == 2 && parts[0].equals("grp")) {
+            try {
+                return storage.findGroup(parts[1]).map(group -> group.members().keySet())
+                        .orElse(java.util.Set.of());
+            } catch (IOException exception) {
+                return java.util.Set.of();
+            }
+        }
+        return java.util.Set.of();
+    }
+
     private void sendPresenceSnapshot(ConnectionHandler handler) throws IOException {
-        for (String onlineUser : online.keySet()) {
-            boolean self = onlineUser.equals(handler.userId);
-            if (self || !"invisible".equals(statuses.get(onlineUser))) {
-                handler.send(presenceEvent(onlineUser, true, self));
+        handler.send(presenceEvent(handler.userId, true, true));
+        for (String contact : contactsOf(handler.userId)) {
+            if (online.containsKey(contact) && !"invisible".equals(statuses.get(contact))) {
+                handler.send(presenceEvent(contact, true, false));
             }
         }
     }

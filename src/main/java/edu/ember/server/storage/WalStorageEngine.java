@@ -354,6 +354,10 @@ public final class WalStorageEngine implements StorageEngine {
         state.votePoll(pollId, userId, optionIndex);
     }
 
+    @Override public synchronized java.util.Set<String> contactsOf(String userId) throws IOException {
+        return state.contactsOf(userId);
+    }
+
     @Override public synchronized List<String> followersOf(String userId) throws IOException {
         return state.followersOf(userId);
     }
