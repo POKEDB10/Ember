@@ -90,12 +90,14 @@ function noticeNewDevices(convId, list) {
   try { seen = JSON.parse(store.get(key) || '{}'); } catch { seen = {}; }
   let changed = false;
   for (const k of list) {
-    if (k.user === S.me || !k.active) continue;
+    if (!k.active || (k.user === S.me && e2e.dev && k.dev === e2e.dev.id)) continue;
     const known = seen[k.user];
     if (!known) { seen[k.user] = [k.dev]; changed = true; continue; }
     if (!known.includes(k.dev)) {
       known.push(k.dev); changed = true;
-      toast('🔑 ' + name(k.user) + ' signed in on a new device. Compare the safety number in their profile.');
+      // A device added to your own account also receives your messages: warn about that too.
+      toast(k.user === S.me ? '🔑 A new device was added to YOUR account. If it is not yours, change your password and check the device codes in your profile.'
+        : '🔑 ' + name(k.user) + ' signed in on a new device. Compare the device codes in their profile.');
     }
   }
   if (changed) store.set(key, JSON.stringify(seen));
@@ -213,10 +215,10 @@ function inbound(msg) {
 }
 
 // ---- safety number, shown on profiles ----
-/** A device's code: 10 digits from its public key (the desktop app computes the same). */
+/** A device's code: 8 groups of 5 digits from 128 bits of its key's hash (the desktop computes the same). */
 async function deviceCode(pub) {
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', dec(pub)));
-  return [0, 2].map((i) => String(((hash[i] << 8) | hash[i + 1]) % 100000).padStart(5, '0')).join(' ');
+  return Array.from({ length: 8 }, (_, i) => String(((hash[2 * i] << 8) | hash[2 * i + 1]) % 100000).padStart(5, '0')).join(' ');
 }
 
 /**
@@ -227,7 +229,10 @@ async function deviceCode(pub) {
 async function safetyNumber(userId) {
   await e2e.ready;
   const convId = 'dm:' + [S.me, userId].sort().join(':');
-  const theirs = (await keysFor(convId, true)).filter((k) => k.active && k.user === userId);
+  const list = (await keysFor(convId, true)).filter((k) => k.active);
+  const theirs = list.filter((k) => k.user === userId);
   if (!theirs.length) return null;
-  return { mine: await deviceCode(e2e.dev.pub), theirs: await Promise.all(theirs.map((k) => deviceCode(k.pub))) };
+  const myOthers = list.filter((k) => k.user === S.me && k.dev !== e2e.dev.id);
+  return { mine: await deviceCode(e2e.dev.pub), myOthers: await Promise.all(myOthers.map((k) => deviceCode(k.pub))),
+    theirs: await Promise.all(theirs.map((k) => deviceCode(k.pub))) };
 }

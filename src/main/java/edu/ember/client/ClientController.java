@@ -741,15 +741,18 @@ public final class ClientController implements AutoCloseable {
             known.forEach(line -> knownUsers.add(line.split(" ")[0]));
             boolean changed = false;
             for (E2eCrypto.DeviceKey key : keys) {
-                if (key.userId().equals(model.userId()) || !key.active()) {
+                E2eCrypto.Identity self = identity;
+                if (!key.active() || (self != null && key.deviceId().equals(self.deviceId()))) {
                     continue;
                 }
                 String line = key.userId() + " " + key.deviceId() + " " + key.publicKey();
                 if (known.add(line)) {
                     changed = true;
                     if (knownUsers.contains(key.userId())) {
-                        model.setError("KEY", "🔑 " + key.userId() + " signed in on a new device. "
-                                + "Compare the safety number before sharing anything private.");
+                        // A device added to your own account also receives your messages: warn about that too.
+                        model.setError("KEY", key.userId().equals(model.userId())
+                                ? "🔑 A new device was added to YOUR account. If it is not yours, change your password."
+                                : "🔑 " + key.userId() + " signed in on a new device. Compare the device codes.");
                     }
                 }
             }
@@ -784,11 +787,17 @@ public final class ClientController implements AutoCloseable {
         }
     }
 
-    /** A device's code: 10 digits from its public key (the website computes the same). */
+    /** A device's code: 8 groups of 5 digits from 128 bits of its key's hash (the website computes the same). */
     public static String deviceCode(String publicKey) throws java.security.GeneralSecurityException {
         byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(E2eCrypto.decode(publicKey));
-        return String.format("%05d %05d", (((hash[0] & 0xFF) << 8) | (hash[1] & 0xFF)) % 100_000,
-                (((hash[2] & 0xFF) << 8) | (hash[3] & 0xFF)) % 100_000);
+        StringBuilder code = new StringBuilder();
+        for (int group = 0; group < 8; group++) {
+            if (group > 0) {
+                code.append(' ');
+            }
+            code.append(String.format("%05d", (((hash[2 * group] & 0xFF) << 8) | (hash[2 * group + 1] & 0xFF)) % 100_000));
+        }
+        return code.toString();
     }
 
     /**
@@ -802,15 +811,20 @@ public final class ClientController implements AutoCloseable {
         String self = model.userId();
         String conversationId = "dm:" + (self.compareTo(otherUserId) < 0 ? self + ":" + otherUserId : otherUserId + ":" + self);
         java.util.List<String> theirs = new java.util.ArrayList<>();
+        java.util.List<String> myOthers = new java.util.ArrayList<>();
         for (E2eCrypto.DeviceKey key : keysFor(conversationId, true)) {
             if (key.active() && key.userId().equals(otherUserId)) {
                 theirs.add(deviceCode(key.publicKey()));
+            } else if (key.active() && me != null && !key.deviceId().equals(me.deviceId())) {
+                myOthers.add(deviceCode(key.publicKey()));
             }
         }
         if (theirs.isEmpty() || me == null) {
             return "";
         }
-        return "Your device: " + deviceCode(me.publicKey()) + "\n" + otherUserId + "'s devices: " + String.join(", ", theirs);
+        return "This device:\n  " + deviceCode(me.publicKey())
+                + (myOthers.isEmpty() ? "" : "\nYour other devices:\n  " + String.join("\n  ", myOthers))
+                + "\n" + otherUserId + "'s devices:\n  " + String.join("\n  ", theirs);
     }
 
     private Path keyedFile() {
