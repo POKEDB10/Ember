@@ -145,6 +145,9 @@ public interface ServerLink extends Closeable {
                 }
 
                 @Override public int read(byte[] buffer, int offset, int length) throws IOException {
+                    if (length == 0) {
+                        return 0; // readNBytes asks for 0 bytes after a frame; waiting here held each reply back
+                    }
                     while (position == current.length) {
                         if (current == END) {
                             return -1;
