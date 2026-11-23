@@ -97,12 +97,11 @@
 <section id="callBox" class="window callbox" hidden role="dialog" aria-label="Call">
   <header class="titlebar"><span id="callTitle" class="ellipsis">▣ CALL</span><span id="callInfo" class="dim"></span></header>
   <div id="callStage" class="callstage">
-    <video id="callRemote" autoplay playsinline></video>
-    <canvas id="callCanvas" hidden></canvas>
+    <div id="callTiles" class="tiles"></div>
     <video id="callLocal" class="selfview" autoplay playsinline muted></video>
   </div>
   <p id="callStatus" class="callstatus" aria-live="polite"></p>
-  <p id="callCode" class="small dim callcode"></p>
+  <div id="callCode" class="small dim callcode"></div>
   <div class="row gap wrap pad">
     <button id="callAccept" hidden>ACCEPT</button>
     <button id="callMic" aria-label="Microphone">MIC ON</button>

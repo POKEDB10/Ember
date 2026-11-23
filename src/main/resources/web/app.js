@@ -611,7 +611,7 @@ function renderHeader() {
   }
   $('searchBtn').hidden = $('starBtn').hidden = !c;
   $('pollBtn').hidden = $('addMember').hidden = !group;
-  $('callBtn').hidden = $('videoBtn').hidden = !(c && peer(c));
+  $('callBtn').hidden = $('videoBtn').hidden = !c; // direct and group calls
   $('composer').hidden = !c;
   if (!c) { $('searchBar').hidden = true; $('pinBar').hidden = true; $('polls').replaceChildren(); $('typing').textContent = ''; $('replyBar').hidden = true; }
 }
@@ -873,7 +873,12 @@ async function openProfile(userId) {
 /** Safety number for a chat: the same digits on both people's screens mean nobody is in between. */
 function safetyNode(userId) {
   const el = h('p', { class: 'dim small' }, '🔒 checking encryption…');
-  safetyNumber(userId).then((n) => { el.textContent = n ? '🔒 safety number ' + n + ' · compare it with ' + name(userId) + ' in person; same digits = private chat' : '🔓 no encryption keys yet (they have not opened the new app)'; })
+  safetyNumber(userId).then((n) => {
+    el.textContent = !n ? '🔓 no encryption keys yet (they have not opened the new app)'
+      : '🔒 this device: ' + n.mine + (n.myOthers.length ? ' · your other devices: ' + n.myOthers.join(' / ') : '')
+        + ' · ' + name(userId) + "'s devices: " + n.theirs.join(' / ')
+        + '. Check together: each of you finds your own device codes on the other screen, and nobody sees a code they do not recognise.';
+  })
     .catch(() => { el.textContent = ''; });
   return el;
 }
