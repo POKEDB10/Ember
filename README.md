@@ -32,6 +32,7 @@ On Unix-like systems, use the matching `scripts/build.sh`, `scripts/run.sh`, `sc
 All messages live on the server, so an account can sign in on any number of devices at once (website, installed web app, Swing desktop app) and every device sees the full history plus live messages, including ones the same account sent from another device.
 
 - **Website.** The server also serves a web client (plain HTML/CSS/JS, about 60 KB, gzipped, ETag-revalidated and cached by a service worker). It speaks the same binary protocol over a compressed WebSocket (`permessage-deflate`), so every server rule applies unchanged. Features: direct and group chat, replies, reactions, edit/delete, pins and stars (synced to every device), disappearing messages, a single Read more button on long messages, typing indicators, statuses (online, away, automatic idle, do not disturb, invisible), group polls, in-chat search, Campus Pulse photo posts with likes and comments, 24-hour stories, profiles with follow requests you can approve or decline, block and report, and seven retro themes in a picker. New messages in another chat pop up as a card with a quick-reply box; in a background tab they become system notifications with Reply and Mark read buttons; with no tab open they arrive as Web Push notifications (encrypted per browser, RFC 8291/8292). Do not disturb silences all of them. Chats are cached in the browser (IndexedDB) and a returning device downloads only the changes since its last visit; logging out deletes the cache. Photos are shrunk in the browser (max 1600 px JPEG) before upload, and images load over plain HTTP with a one-year private cache, so each one downloads once per device. Browsers can install it as an app ("Install app" / "Add to Home screen").
+- **Voice and video calls (website).** One-to-one calls from any direct chat. They connect peer-to-peer when the network allows (lowest delay). Otherwise, within about 6 s, they fall back to a relay inside the site's own HTTPS WebSocket, so they still work where VoIP or UDP is blocked. Either way they are end-to-end encrypted: the browsers agree a key with ECDH P-256 and both screens show a safety code, so the server only forwards unreadable packets and never sees the other person's IP address. "Hide my IP in calls" (ME tab) always uses the relay. Data use: about 20–35 kbit/s for voice and about 200 kbit/s for 320×240 video.
 - **Desktop app.** `scripts/run-client.bat --url https://ember.example.com` connects the Swing app to a hosted website over the same WebSocket (no local keys needed). Without `--url` it uses the direct TLS socket as before.
 - **Server options.** `--bind` (TLS listener address, default `0.0.0.0`), `--no-tls` (web-only), `--http-port` / `--http-bind` (plain-HTTP web listener for an HTTPS proxy; default bind `127.0.0.1`), `--max-frame-mb` (largest message or upload after login, default 25), `--rootz` (off-server storage, below), `--new-storage-key` (prints a fresh encryption key), `--trust-proxy` (believe the proxy's `X-Forwarded-For`; use only when the HTTP listener is reachable solely through your own proxy).
 - **Health check.** `GET /health` returns `ok` without touching data, for uptime monitors.
@@ -56,6 +57,7 @@ How it works: each change is appended to the write-ahead log and uploaded in a b
    - `ROOTZ_FOLDER_ID`: the ID of the `ember` folder (leave empty to use the account root)
    - `EMBER_PUBLIC_URL`: your site address, e.g. `https://ember.pokedb.site` (push services use it as the contact)
    - `EMBER_ARGS`: extra options, for example `--admin-user yourname`, or leave empty
+   - `EMBER_ICE_SERVERS`: optional JSON list of STUN/TURN servers for direct calls; leave empty to use Cloudflare and Google STUN
 4. **Custom domain:** in the Render service, **Settings → Custom Domains → Add** `ember.pokedb.site`, then add the CNAME record Render shows at your DNS provider. Render issues the HTTPS certificate.
 5. **Stay awake:** free Render services sleep after about 15 minutes without traffic. Create a free UptimeRobot HTTP monitor for `https://ember.pokedb.site/health` every 5 minutes. A sleeping service still wakes on the first visit (about 30–60 s), and no data is lost either way.
 
@@ -64,6 +66,10 @@ Run only one server against the same rootz files at a time. `java -cp build\clas
 ## Local demo
 
 Run `scripts\run-demo.bat` (Windows) or `scripts/run-demo.sh` (Linux/macOS) to build and start a server plus three clients on `localhost:7443`. If keys are missing, the script runs `gen-keys`; `--demo-seed` adds Alice, Bob, Charlie, a study group, a poll, and sample Campus Pulse content to an empty demo data directory. Seeded credentials are `alice` / `alice-demo-42`, `bob` / `bob-demo-42`, and `charlie` / `charlie-demo-42`. Alice receives the administrator role only in this demo launch, which explicitly passes `--admin-user alice`. The seed skips when Alice already exists and does not reset server data.
+
+## How the code works
+
+`docs/CODEBASE_GUIDE.md` explains the whole codebase in plain words: folders, the frame protocol, the life of a message, calls, storage, security, and likely demo questions.
 
 ## Project report
 

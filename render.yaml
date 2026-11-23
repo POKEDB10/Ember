@@ -5,6 +5,8 @@ services:
     name: ember
     runtime: docker
     plan: free
+    # Closest Render region to the UAE (lowest call delay through the relay). Set before the first deploy.
+    region: singapore
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     autoDeployTrigger: commit
@@ -20,4 +22,7 @@ services:
       - key: EMBER_PUBLIC_URL
         sync: false
       - key: EMBER_ARGS
+        sync: false
+      # Optional: JSON list of STUN/TURN servers for direct calls; empty uses Cloudflare and Google STUN.
+      - key: EMBER_ICE_SERVERS
         sync: false
