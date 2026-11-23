@@ -30,6 +30,8 @@ public final class CallRegistry<D> {
         public final String caller;
         public final String callee;
         public final boolean video;
+        /** Rings nobody: the callee is unreachable, hidden or busy. Behaves like an unanswered call. */
+        public final boolean phantom;
         public final long createdMs = System.currentTimeMillis();
         private volatile State state = State.RINGING;
         private volatile D callerDevice;
@@ -38,8 +40,9 @@ public final class CallRegistry<D> {
         private final TokenBucket callerMedia = new TokenBucket(MEDIA_BYTES_PER_SEC * 2, MEDIA_BYTES_PER_SEC);
         private final TokenBucket calleeMedia = new TokenBucket(MEDIA_BYTES_PER_SEC * 2, MEDIA_BYTES_PER_SEC);
 
-        private Call(String id, String caller, D callerDevice, String callee, boolean video) {
+        private Call(String id, String caller, D callerDevice, String callee, boolean video, boolean phantom) {
             this.id = id;
+            this.phantom = phantom;
             this.caller = caller;
             this.callerDevice = callerDevice;
             this.callee = callee;
@@ -68,18 +71,26 @@ public final class CallRegistry<D> {
     private final Map<String, String> callOfUser = new ConcurrentHashMap<>();
     private final Map<D, Call<D>> callOfDevice = new ConcurrentHashMap<>();
 
-    /** Starts ringing, or returns null when either person is already in a call. */
-    public synchronized Call<D> ring(String caller, D callerDevice, String callee, boolean video) {
-        if (caller.equals(callee) || callOfUser.containsKey(caller) || callOfUser.containsKey(callee)) {
+    /**
+     * Starts a call, or returns null when the caller is already in one. When the callee cannot be
+     * rung (unreachable, or busy) the call is a phantom: the caller sees exactly what an
+     * unanswered call looks like, so calling never reveals someone's presence.
+     */
+    public synchronized Call<D> ring(String caller, D callerDevice, String callee, boolean video,
+            boolean reachable) {
+        if (caller.equals(callee) || callOfUser.containsKey(caller)) {
             return null;
         }
+        boolean phantom = !reachable || callOfUser.containsKey(callee);
         byte[] bytes = new byte[18];
         random.nextBytes(bytes);
         Call<D> call = new Call<>(Base64.getUrlEncoder().withoutPadding().encodeToString(bytes),
-                caller, callerDevice, callee, video);
+                caller, callerDevice, callee, video, phantom);
         calls.put(call.id, call);
         callOfUser.put(caller, call.id);
-        callOfUser.put(callee, call.id);
+        if (!phantom) {
+            callOfUser.put(callee, call.id);
+        }
         callOfDevice.put(callerDevice, call);
         return call;
     }
@@ -87,7 +98,7 @@ public final class CallRegistry<D> {
     /** The callee answers on one device; returns null when the call is gone or already answered. */
     public synchronized Call<D> accept(String callId, String callee, D device) {
         Call<D> call = calls.get(callId);
-        if (call == null || !call.callee.equals(callee) || call.state != State.RINGING) {
+        if (call == null || call.phantom || !call.callee.equals(callee) || call.state != State.RINGING) {
             return null;
         }
         call.state = State.ACTIVE;
@@ -159,10 +170,6 @@ public final class CallRegistry<D> {
     /** Byte-rate limit on relayed media, per direction; false means drop this packet. */
     public boolean allowMedia(Call<D> call, D device, int bytes) {
         return (device.equals(call.callerDevice) ? call.callerMedia : call.calleeMedia).tryConsume(bytes);
-    }
-
-    public boolean inCall(String userId) {
-        return callOfUser.containsKey(userId);
     }
 
     private void remove(Call<D> call) {

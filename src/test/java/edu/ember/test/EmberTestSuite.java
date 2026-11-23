@@ -1668,6 +1668,13 @@ public final class EmberTestSuite {
                 // Unreachable looks exactly like ringing, so calls never reveal hidden presence.
                 Map<String, String> phantom = wsFields(alice, WireOpcodes.EVT_CALL);
                 assertEquals("ringing", phantom.get("kind"), "An unreachable callee was revealed to the caller");
+                // A phantom call answers every later action exactly like an unanswered real call.
+                callCommand(alice, 29, Map.of("kind", "sdp", "callId", phantom.get("callId"), "data", "x"));
+                assertEquals("400", wsFields(alice, WireOpcodes.EVT_ERROR).get("code"),
+                        "Signalling a phantom call differed from an unanswered call");
+                callCommand(alice, 28, Map.of("kind", "ring", "convId", "dm:alice:bob"));
+                assertEquals("400", wsFields(alice, WireOpcodes.EVT_ERROR).get("code"),
+                        "A caller with a phantom call in progress was not treated as in a call");
                 callCommand(alice, 30, Map.of("kind", "end", "callId", phantom.get("callId")));
 
                 callCommand(alice, 4, Map.of("kind", "ring", "convId", "dm:alice:bob", "video", "true"));

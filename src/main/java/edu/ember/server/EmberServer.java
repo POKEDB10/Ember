@@ -356,7 +356,9 @@ public final class EmberServer implements AutoCloseable {
 
     private void disconnect(ConnectionHandler handler) {
         for (var call : callRegistry.dropDevice(handler)) {
-            sendCallEnd(call, call.other(handler.userId), "ended");
+            if (!call.phantom) {
+                sendCallEnd(call, call.other(handler.userId), "ended");
+            }
         }
         if (handler.userId != null && removeOnline(handler.userId, handler)) {
             broadcastPresence(handler.userId, false);
@@ -704,7 +706,9 @@ public final class EmberServer implements AutoCloseable {
                 case "decline", "end" -> {
                     if (callRegistry.end(call.id, userId) != null) {
                         String reason = kind.equals("decline") ? "declined" : "ended";
-                        sendCallEnd(call, call.other(userId), reason);
+                        if (!call.phantom) {
+                            sendCallEnd(call, call.other(userId), reason);
+                        }
                         sendToUser(userId, callEvent(call, "end", java.util.Map.of("reason", reason)), this);
                     }
                 }
@@ -732,44 +736,36 @@ public final class EmberServer implements AutoCloseable {
                 throw new edu.ember.common.exceptions.RateLimitedException("Too many calls, wait a moment");
             }
             boolean video = "true".equals(fields.values.get("video"));
-            if (callRegistry.inCall(userId)) {
-                throw new edu.ember.common.exceptions.ValidationException("You are already in a call");
-            }
             java.util.List<ConnectionHandler> devices = online.getOrDefault(callee, java.util.Set.of())
                     .stream().filter(device -> device.supportsCalls).toList();
-            var call = devices.isEmpty() || "dnd".equals(statuses.get(callee)) ? null
-                    : callRegistry.ring(userId, this, callee, video);
+            boolean reachable = !devices.isEmpty() && !"dnd".equals(statuses.get(callee));
+            var call = callRegistry.ring(userId, this, callee, video, reachable);
             if (call == null) {
-                // Offline, invisible-and-away, do not disturb or busy: the caller hears ordinary ringing
-                // that goes unanswered, so a call never reveals presence the callee has hidden.
-                pushIfAway(callee, displayName(userId), video ? "Missed video call" : "Missed call",
-                        conversationId, "call");
-                byte[] bytes = new byte[18];
-                new java.security.SecureRandom().nextBytes(bytes);
-                String phantom = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
-                send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_CALL,
-                        correlationId, java.util.Map.of("kind", "ringing", "callId", phantom)));
-                java.util.concurrent.CompletableFuture.delayedExecutor(CallRegistry.RING_TIMEOUT_MS,
-                        java.util.concurrent.TimeUnit.MILLISECONDS).execute(() -> sendToDevice(this,
-                                edu.ember.common.protocol.FrameFactory.event(
-                                        edu.ember.common.protocol.WireOpcodes.EVT_CALL, 0, java.util.Map.of(
-                                                "kind", "end", "callId", phantom, "reason", "noanswer"))));
-                return;
+                throw new edu.ember.common.exceptions.ValidationException("You are already in a call");
             }
+            // Offline, hidden, do not disturb or busy callees get a phantom call: the caller hears the
+            // same ringing and the same "no answer", so a call never reveals hidden presence.
             send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_CALL,
                     correlationId, java.util.Map.of("kind", "ringing", "callId", call.id)));
-            var ring = callEvent(call, "ring", java.util.Map.of("from", userId, "convId", conversationId,
-                    "video", Boolean.toString(video),
-                    "hideIp", Boolean.toString("true".equals(fields.values.get("hideIp")))));
-            for (ConnectionHandler device : devices) {
-                sendToDevice(device, ring);
+            if (call.phantom) {
+                pushIfAway(callee, displayName(userId), video ? "Missed video call" : "Missed call",
+                        conversationId, "call");
+            } else {
+                var ring = callEvent(call, "ring", java.util.Map.of("from", userId, "convId", conversationId,
+                        "video", Boolean.toString(video),
+                        "hideIp", Boolean.toString("true".equals(fields.values.get("hideIp")))));
+                for (ConnectionHandler device : devices) {
+                    sendToDevice(device, ring);
+                }
             }
             java.util.concurrent.CompletableFuture.delayedExecutor(CallRegistry.RING_TIMEOUT_MS,
                     java.util.concurrent.TimeUnit.MILLISECONDS).execute(() -> {
                         var expired = callRegistry.expire(call.id);
                         if (expired != null) {
                             sendCallEnd(expired, expired.caller, "noanswer");
-                            sendCallEnd(expired, expired.callee, "missed");
+                            if (!expired.phantom) {
+                                sendCallEnd(expired, expired.callee, "missed");
+                            }
                         }
                     });
         }
