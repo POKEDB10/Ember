@@ -34,6 +34,11 @@ public interface ServerLink extends Closeable {
     /** Shown in the status bar, e.g. "TLS 1.3". */
     String describe();
 
+    /** The website this link reaches (https://host), or null when it is a direct TLS socket. */
+    default String webUrl() {
+        return null;
+    }
+
     static ServerLink tls(String host, int port, Path trustStore, char[] password) throws Exception {
         return new TlsLink(host, port, trustStore, password);
     }
@@ -90,6 +95,10 @@ public interface ServerLink extends Closeable {
         private final URI uri;
         private final WebSocket socket;
         private volatile boolean closed;
+
+        @Override public String webUrl() {
+            return (uri.getScheme().equals("ws") ? "http://" : "https://") + uri.getRawAuthority();
+        }
 
         private WebSocketLink(URI uri) throws IOException {
             this.uri = uri;

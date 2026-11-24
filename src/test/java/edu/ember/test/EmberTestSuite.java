@@ -112,6 +112,7 @@ public final class EmberTestSuite {
         runTest("calls v2: settings persist, microphone unplug falls back, devices released", this::testCallSettingsAndDevices);
         runTest("calls v2: feature flag reported in AUTH_OK, off by default", this::testCallsV2Flag);
         runTest("calls v2: hand-off is single-use, short-lived, same person only, first commit wins", this::testCallHandoff);
+        runTest("calls v2: Speaker mode ducks the mic only while the other person is heard", this::testSpeakerMode);
         runTest("end-to-end chats: tamper, impostor and outsider refused; server sees only ciphertext", this::testEndToEndChat);
         runTest("theme palettes, wrapped message bodies, and EDT notifications",
                 this::testUiBasics);
@@ -2335,6 +2336,96 @@ public final class EmberTestSuite {
         } finally {
             server.close();
         }
+    }
+
+    /** Speaker mode (opt-in): while the other person is heard, the microphone is turned down about 20 dB. */
+    private void testSpeakerMode() throws Exception {
+        var settings = edu.ember.client.call.CallSettings.load(Files.createTempDirectory("ember-speaker").resolve("s.properties"));
+        var devices = new edu.ember.client.call.AudioDevices.Provider() {
+            @Override
+            public edu.ember.client.call.AudioDevices.Microphone openMicrophone(String preferred) {
+                return new edu.ember.client.call.AudioDevices.Microphone() {
+                    long phase;
+
+                    @Override public int sampleRate() { return 48_000; }
+                    @Override public String name() { return "mic"; }
+
+                    @Override public void read(short[] samples) {
+                        sleepQuietly(20);
+                        for (int index = 0; index < samples.length; index++) {
+                            samples[index] = (short) (8000 * Math.sin(2 * Math.PI * 440 * phase++ / 48_000.0));
+                        }
+                    }
+
+                    @Override public void close() { }
+                };
+            }
+
+            @Override
+            public edu.ember.client.call.AudioDevices.Speaker openSpeaker(String preferred) {
+                return new edu.ember.client.call.AudioDevices.Speaker() {
+                    @Override public int sampleRate() { return 48_000; }
+                    @Override public String name() { return "speaker"; }
+                    @Override public void write(short[] samples) { sleepQuietly(20); }
+                    @Override public void close() { }
+                };
+            }
+        };
+        var codec = new edu.ember.client.call.AdpcmCodec(32_000);
+        List<double[]> sent = new java.util.concurrent.CopyOnWriteArrayList<>(); // {time, rms}
+        var engine = new edu.ember.client.call.VoiceEngine(devices, settings, edu.ember.client.call.Clock.SYSTEM,
+                (sequence, codecId, frame) -> {
+                    short[] pcm = codec.fresh().decode(frame);
+                    double sum = 0;
+                    for (short sample : pcm) {
+                        sum += (double) sample * sample;
+                    }
+                    sent.add(new double[] {System.nanoTime() / 1e6, Math.sqrt(sum / Math.max(1, pcm.length))});
+                }, message -> { });
+        engine.setSendCodec(codec);
+        short[] loud = new short[codec.frameSamples()];
+        for (int index = 0; index < loud.length; index++) {
+            loud[index] = (short) (16000 * Math.sin(2 * Math.PI * 1000 * index / 32_000.0));
+        }
+        byte[] remote = codec.fresh().encode(loud);
+        AtomicBoolean talking = new AtomicBoolean(true);
+        Thread other = new Thread(() -> {
+            long sequence = 0;
+            while (talking.get()) {
+                engine.receive("peer", ++sequence, codec.id(), remote);
+                sleepQuietly(20);
+            }
+        });
+        engine.start();
+        other.start();
+        try {
+            Thread.sleep(700); // settings default: Speaker mode off
+            double normal = averageRms(sent, 300);
+            settings.setSpeakerMode(true);
+            Thread.sleep(700);
+            double ducked = averageRms(sent, 300);
+            assertTrue(normal > 2000, "The test microphone did not reach the sender (rms " + normal + ")");
+            assertTrue(ducked < normal * 0.2, "Speaker mode did not turn the mic down (" + normal + " -> " + ducked + ")");
+            talking.set(false);
+            other.join();
+            Thread.sleep(700); // the other side went quiet: full level again
+            assertTrue(averageRms(sent, 300) > normal * 0.7, "The mic stayed ducked after the other person stopped");
+        } finally {
+            talking.set(false);
+            engine.stop();
+        }
+    }
+
+    private static double averageRms(List<double[]> frames, double lastMs) {
+        double now = System.nanoTime() / 1e6, sum = 0;
+        int count = 0;
+        for (double[] frame : frames) {
+            if (now - frame[0] <= lastMs) {
+                sum += frame[1];
+                count++;
+            }
+        }
+        return count == 0 ? 0 : sum / count;
     }
 
     private void testUiBasics() throws Exception {

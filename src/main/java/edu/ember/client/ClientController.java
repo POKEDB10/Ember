@@ -463,6 +463,19 @@ public final class ClientController implements AutoCloseable {
         callChanged();
     }
 
+    /**
+     * Calls v2 hand-off link: the website page that offers to continue this voice call with video.
+     * Null when there is nothing to hand off (no answered 1:1 v2 call, or no website address).
+     */
+    public String handoffUrl() {
+        CallSession current = call;
+        String web = socket.webUrl();
+        if (web == null || current == null || !current.v2() || current.state() != CallSession.State.ACTIVE) {
+            return null;
+        }
+        return web + "/?join=" + current.callId();
+    }
+
     public void acceptCall() {
         CallSession current = call;
         if (current == null || current.state() != CallSession.State.RINGING_IN) {

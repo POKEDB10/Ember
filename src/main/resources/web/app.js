@@ -518,6 +518,7 @@ function handleLaunch(convId, text) {
  *  composer; the user presses Send. Direct replies come from the service worker by postMessage. */
 function handleLaunchParams() {
   const q = new URLSearchParams(location.search);
+  if (q.has('join')) { offerJoin(q.get('join')); history.replaceState(null, '', '/'); return; }
   if (!q.has('open')) return;
   openChat(q.get('open'));
   if (q.get('reply')) { $('input').value = q.get('reply'); $('input').focus(); toast('press SEND to send your reply'); }

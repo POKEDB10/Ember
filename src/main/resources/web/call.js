@@ -70,6 +70,7 @@ async function onRing(f) {
 }
 
 async function acceptCall() {
+  if (call && call.role === 'handoff' && call.state === 'ringing') { joinHandoff(); return; }
   if (!call || call.role !== 'callee' || call.state !== 'ringing') return;
   ringTone(false);
   $('callAccept').hidden = true;
@@ -88,6 +89,7 @@ async function acceptCall() {
 
 function hangUp() {
   if (!call) return;
+  if (call.role === 'handoff' && call.state === 'ringing') { endLocal(''); return; } // only the offer: nothing to tell the server
   if (call.id) send(OP.CALL, { kind: call.state === 'ringing' && call.role === 'callee' ? 'decline' : 'end', callId: call.id });
   endLocal('call ended');
 }
@@ -116,12 +118,67 @@ function endLocal(text) {
 
 const clock = (ms) => Math.floor(ms / 60000) + ':' + String(Math.floor(ms / 1000) % 60).padStart(2, '0');
 
+// ---- hand-off: the call moves here from the desktop app (calls v2, 1:1) ----
+/** ?join=<callId> only offers a button: anyone can send a link, so nothing happens until the user clicks. */
+function offerJoin(callId) {
+  if (!/^[A-Za-z0-9_-]{24}$/.test(callId || '') || call || !S.callsV2 || !callPrefs.v2) return;
+  call = newCall({ id: callId, conv: '', video: true, role: 'handoff', group: false, title: 'your call' });
+  showCall('continue your call here, with video?', true);
+  $('callAccept').textContent = 'JOIN CALL';
+  $('callStage').hidden = true;
+}
+
+/**
+ * Phase 1 asks the server for a ticket and opens camera and microphone; a refusal stops here and
+ * the desktop keeps the call. Phase 2 swaps this device in (the first commit wins); the desktop
+ * is told to stop and the other person re-keys with this device. The call continues on the relay.
+ */
+async function joinHandoff() {
+  const c = call;
+  $('callAccept').hidden = true;
+  setCallStatus('getting ready…');
+  try {
+    const ready = await request(OP.CALL, { kind: 'handoff-prepare', callId: c.id });
+    if (call !== c) return;
+    const other = String(ready.convId || '').split(':').slice(1).find((u) => u !== S.me);
+    if (!other) throw new Error('not a one-to-one call');
+    await ensureNames([other]);
+    c.conv = ready.convId; c.title = name(other);
+    $('callTitle').textContent = '▣ ' + c.title;
+    await getMedia(true);
+    if (call !== c) return;
+    $('callCam').hidden = false; $('callStage').hidden = false;
+    c.state = 'connecting';
+    setCallStatus('moving the call here…');
+    const f = await request(OP.CALL, { kind: 'handoff-commit', callId: c.id, token: ready.token });
+    if (call !== c) return;
+    c.joinedAt = Date.now();
+    goRelay(c);
+    for (let i = 0; i < +f.n; i++) addPeer(c, f['user.' + i]);
+    renderPeople();
+  } catch (e) { if (call === c) endLocal('⚠ ' + e.message); }
+}
+
+/** The other person moved the call to another device: forget the old one, re-key with the new one. */
+function onMoved(c, userId) {
+  const old = c.peers.get(userId);
+  if (!old) return;
+  old.gone = true; // its timers stop sending; the server would deliver them to the new device
+  if (old.resize) old.resize.disconnect();
+  if (old.relay && old.relay.tag) c.byTag.delete(old.relay.tag);
+  dropPeer(c, old);
+  if (c.relay) newSenderKey(c.relay); // the old device cannot read what follows; the new one gets this key
+  addPeer(c, userId);
+  renderPeople();
+  toast(name(userId) + ' moved the call to another device · the safety code changed');
+}
+
 // ---- events from the server ----
 function onCallEvent(f) {
   if (f.kind === 'ring') { onRing(f); return; }
   const c = call;
   if (!c || f.callId !== c.id) return;
-  if (f.kind === 'end') { endLocal(reasonText(f.reason)); return; }
+  if (f.kind === 'end') { endLocal(f.reason === 'elsewhere' && c.state === 'active' ? 'continued on another device' : reasonText(f.reason)); return; }
   if (f.kind === 'joined') {
     ringTone(false);
     if (c.state === 'ringing') { c.state = 'connecting'; setCallStatus('connecting…'); }
@@ -130,6 +187,7 @@ function onCallEvent(f) {
     renderPeople();
     return;
   }
+  if (f.kind === 'moved') { if (c.v2) onMoved(c, f.userId); return; }
   if (f.kind === 'left') {
     const p = c.peers.get(f.userId);
     if (p) { closePeer(p); c.peers.delete(f.userId); }
@@ -140,6 +198,8 @@ function onCallEvent(f) {
   }
   const p = c.peers.get(f.from) || addPeer(c, f.from);
   p.chain = p.chain.then(() => onSignal(c, p, f.kind, f.data)).catch(() => {
+    // Right after a hand-off, signals sealed for the old device can still be in flight: skip them.
+    if (call === c && c.joinedAt && Date.now() - c.joinedAt < 5000) return;
     if (call === c) { toast('⚠ could not secure the call with ' + name(p.user)); dropPeer(c, p); }
   });
 }
@@ -246,7 +306,7 @@ async function sendSignal(c, p, kind, obj) {
   await p.keyReady;
   const head = new Uint8Array(5); head[0] = sigDir(p, true); new DataView(head.buffer).setUint32(1, ++p.sigSend);
   const sealed = await seal(p.key, head, utf8.encode(JSON.stringify(obj)));
-  if (call === c) send(OP.CALL, { kind, callId: c.id, to: p.user, data: b64(sealed) });
+  if (call === c && !p.gone) send(OP.CALL, { kind, callId: c.id, to: p.user, data: b64(sealed) });
 }
 
 async function openSignal(p, data) {
@@ -888,6 +948,7 @@ function drawRemote(p, vf) {
   canvas.getContext('2d').drawImage(vf, 0, 0);
   vf.close();
   canvas.hidden = false; p.tile.video.hidden = true;
+  $('callStage').hidden = false; // a voice call where the other side turned video on (after a hand-off)
 }
 
 function stopRelay(c) {
@@ -952,6 +1013,7 @@ async function getMedia(video) {
 function showCall(text, incoming) {
   $('callTitle').textContent = '▣ ' + call.title;
   $('callAccept').hidden = !incoming;
+  $('callAccept').textContent = 'ACCEPT';
   $('callCam').hidden = !call.video;
   $('callStage').hidden = !call.video;
   $('callTiles').replaceChildren();

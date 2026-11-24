@@ -29,6 +29,13 @@ public final class CallDialog extends JDialog {
     private final JButton accept = new JButton("Accept");
     private final JButton mute = new JButton("Mute");
     private final JButton hangUp = new JButton("Hang up");
+    /** Command objects: the same Action can sit on a button, a menu or a key. */
+    private final javax.swing.Action videoAction = new javax.swing.AbstractAction("Video on website") {
+        @Override public void actionPerformed(java.awt.event.ActionEvent event) {
+            openVideo();
+        }
+    };
+    private final JButton video = new JButton(videoAction);
     private final Timer clock = new Timer(1000, event -> refresh());
 
     private CallDialog(Window owner, ClientController controller) {
@@ -53,6 +60,7 @@ public final class CallDialog extends JDialog {
         buttons.setOpaque(false);
         buttons.add(accept);
         buttons.add(mute);
+        buttons.add(video);
         buttons.add(hangUp);
         body.add(top, BorderLayout.NORTH);
         body.add(codes, BorderLayout.CENTER);
@@ -73,6 +81,21 @@ public final class CallDialog extends JDialog {
             }
         });
         clock.start();
+    }
+
+    /** Opens the website's "Join call" page; the call stays here until the browser takes it over. */
+    private void openVideo() {
+        String url = controller.handoffUrl();
+        if (url == null) {
+            return;
+        }
+        try {
+            java.awt.Desktop.getDesktop().browse(java.net.URI.create(url));
+            status.setText("Press Join call in the browser…");
+        } catch (java.io.IOException | UnsupportedOperationException exception) {
+            javax.swing.JOptionPane.showMessageDialog(this, "Open this address in your browser:\n" + url,
+                    "Video on website", javax.swing.JOptionPane.INFORMATION_MESSAGE);
+        }
     }
 
     /** Called (on the Swing thread) whenever the call changes. */
@@ -121,6 +144,10 @@ public final class CallDialog extends JDialog {
         accept.setVisible(shown.state() == CallSession.State.RINGING_IN);
         mute.setText(shown.muted() ? "Unmute" : "Mute");
         mute.setEnabled(shown.state() == CallSession.State.ACTIVE);
+        String handoff = call == null ? null : controller.handoffUrl();
+        video.setVisible(handoff != null);
+        videoAction.putValue(javax.swing.Action.SHORT_DESCRIPTION,
+                "Continue this call with video in the browser; this window keeps the call until you join there");
         if (shown.state() == CallSession.State.ENDED) {
             hangUp.setEnabled(false);
             accept.setVisible(false);

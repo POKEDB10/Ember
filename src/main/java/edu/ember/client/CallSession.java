@@ -202,7 +202,22 @@ public final class CallSession {
     synchronized void onEvent(Map<String, String> fields) {
         String kind = fields.getOrDefault("kind", "");
         switch (kind) {
-            case "end" -> end(reason(fields.get("reason")));
+            case "end" -> end(answered() && "elsewhere".equals(fields.get("reason"))
+                    ? "continued on another device" : reason(fields.get("reason")));
+            case "moved" -> {
+                // Calls v2: the other person moved to another device. Forget the old one, re-key with the new one.
+                String user = fields.get("userId");
+                Peer old = engine == null || user == null ? null : peers.remove(user);
+                if (old != null) {
+                    engine.removePeer(user);
+                    if (old.tag != null) {
+                        byTag.remove(old.tag);
+                    }
+                    rotateSenderKey(); // the old device cannot read what follows
+                    addPeer(user);
+                    status = user + " moved to another device · the safety code changed";
+                }
+            }
             case "joined" -> {
                 addPeer(fields.get("userId"));
                 if (state == State.RINGING_OUT) {
