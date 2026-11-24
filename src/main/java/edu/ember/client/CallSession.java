@@ -155,11 +155,25 @@ public final class CallSession {
                 peers.values().forEach(this::sendRelayInfo);
                 status = fields.get("userId") + " left";
             }
-            case "key" -> onKey(fields.get("from"), fields.getOrDefault("data", ""));
-            case "relay" -> onRelay(fields.get("from"), fields.getOrDefault("data", ""));
+            // Keys and audio only after this side answered, and only from people the server said are in the call:
+            // nothing can switch the microphone on while the call is still ringing here.
+            case "key" -> {
+                if (answered() && peers.containsKey(fields.get("from"))) {
+                    onKey(fields.get("from"), fields.getOrDefault("data", ""));
+                }
+            }
+            case "relay" -> {
+                if (answered() && peers.containsKey(fields.get("from"))) {
+                    onRelay(fields.get("from"), fields.getOrDefault("data", ""));
+                }
+            }
             default -> { } // "sdp" and "ice" are for browsers' direct links; the desktop always relays
         }
         changed.run();
+    }
+
+    private boolean answered() {
+        return state == State.CONNECTING || state == State.ACTIVE;
     }
 
     private static String reason(String reason) {
@@ -194,9 +208,6 @@ public final class CallSession {
 
     private void onKey(String from, String data) {
         Peer peer = peers.get(from);
-        if (peer == null) {
-            peer = addPeer(from);
-        }
         if (peer == null || peer.pairKey != null) {
             return; // one key per pair
         }
@@ -286,7 +297,9 @@ public final class CallSession {
             }
             Object key = MiniJson.path(message, "key");
             Object tag = MiniJson.path(message, "tag");
-            if (key instanceof String keyText && tag instanceof String tagText) {
+            if (key instanceof String keyText && tag instanceof String tagText
+                    && E2eCrypto.decode(keyText).length == 16 && E2eCrypto.decode(tagText).length == 4
+                    && (!byTag.containsKey(tagText) || byTag.get(tagText) == peer)) {
                 if (peer.tag != null) {
                     byTag.remove(peer.tag);
                 }
@@ -339,6 +352,14 @@ public final class CallSession {
      * it is only used with that person's own sender key, so nobody can speak as someone else.
      */
     void onMedia(byte[] stamped) {
+        try {
+            receive(stamped);
+        } catch (RuntimeException malformed) {
+            // A broken packet is dropped; it must never stop the network reader.
+        }
+    }
+
+    private void receive(byte[] stamped) {
         if (stamped.length < 2 || state == State.ENDED) {
             return;
         }
@@ -362,6 +383,9 @@ public final class CallSession {
             plain = E2eCrypto.aesGcm(false, peer.senderKey, Arrays.copyOf(head, 12), head,
                     Arrays.copyOfRange(packet, 8, packet.length));
         } catch (GeneralSecurityException tampered) {
+            return;
+        }
+        if (plain.length < 6) {
             return;
         }
         peer.lastCounter = counter;
