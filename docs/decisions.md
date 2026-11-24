@@ -1,0 +1,11 @@
+# Decisions (calls v2)
+
+Each entry: decision / why / alternative rejected.
+
+1. **Desktop stays JDK-only; audio behind an `AudioCodec` interface.** / Zero-dependency laptop demo, explainable viva; Opus can be added later behind the same interface. / Concentus (pure-Java Opus) now: deferred to STRETCH.
+2. **Desktop calls are voice-only; a video button hands the call to the website.** / The JDK has no camera API or video codec. / Native camera + codec libraries.
+3. **Feature flag `calls.v2` = server flag AND client setting.** The server enables it with `--calls-v2` or `EMBER_CALLS_V2=1` and tells clients in `AUTH_OK` (`callsV2=true`); each client has a "Calls v2" setting (default on). v2 behaviour runs only when both are on; otherwise every legacy path runs unchanged. / Lets the demo fall back by flipping one switch on either side. / Client-only flag (server hand-off endpoints would still be live); server-only flag (no per-device escape hatch).
+4. **Jitter-buffer sequence numbers reuse the existing per-sender packet counter** (already authenticated inside the encrypted header, strictly increasing per sender key). / No wire change, no new plaintext metadata. / A new sequence field inside the payload.
+5. **Jitter buffer: `synchronized` methods over a sequence-ordered `TreeMap`, no blocking.** The network thread inserts; the mixer thread must produce a frame every 20 ms whether or not one arrived (then it conceals), so it must never block. / Ordering by sequence plus non-blocking take. / `BlockingQueue` (FIFO only, `take()` blocks the mixer); `wait/notify` (the mixer is clock-driven, not data-driven).
+6. **JavaScript logic is tested with Node's built-in runner (`node --test`), no packages.** The quality-limit calculation and ladder live in a DOM-free `quality.js` shared by the page and the tests. `run-tests` runs them when `node` is installed and says "skipped" otherwise. / The web logic is where the video rules live; the Java runner cannot load it. / Porting the rules to Java just to test them (two copies drift); a JS test framework (dependency).
+7. **Web stats log: in-memory ring of the last 300 samples with a "download" button; nothing persisted.** The desktop writes a rotating file log. / No personal data, no storage growth in the browser. / IndexedDB persistence.
