@@ -45,7 +45,7 @@ public final class ChatWorkspacePanel extends JPanel implements ClientModelListe
         split.setResizeWeight(0.28);
         split.setBorder(null);
         content.add(split, "CHATS");
-        settings = new SettingsPanel(themeChanged, readReceipts, simulateNetworkDrop);
+        settings = new SettingsPanel(themeChanged, readReceipts, simulateNetworkDrop, controller.callSettings());
         content.add(settings, "SETTINGS");
         campusPulse = new CampusPulsePanel(controller);
         content.add(campusPulse, "PULSE");

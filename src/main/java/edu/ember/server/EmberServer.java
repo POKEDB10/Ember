@@ -26,6 +26,8 @@ public final class EmberServer implements AutoCloseable {
     private volatile int maxFrameBytes = 25 * 1024 * 1024;
     /** Off by default: only a server that sits behind a known proxy may believe X-Forwarded-For. */
     private volatile boolean trustForwardedFor;
+    /** Calls v2 feature flag (server half): --calls-v2 or EMBER_CALLS_V2=1. Off = legacy calls only. */
+    private volatile boolean callsV2 = "1".equals(System.getenv("EMBER_CALLS_V2"));
     /** Chosen status per user: away, dnd or invisible (online when absent). Kept while the
      * server runs; devices send it again after they reconnect. */
     private final java.util.concurrent.ConcurrentMap<String, String> statuses =
@@ -135,6 +137,7 @@ public final class EmberServer implements AutoCloseable {
         boolean tls = true;
         boolean rootz = false;
         boolean trustProxy = false;
+        boolean callsV2Flag = false;
         int storyTtlSec = 86_400;
         java.util.Set<String> adminUsernames = new java.util.HashSet<>();
         String bindAddress = "0.0.0.0";
@@ -153,6 +156,7 @@ public final class EmberServer implements AutoCloseable {
                 case "--bind" -> bindAddress = args[++index];
                 case "--no-tls" -> tls = false;
                 case "--trust-proxy" -> trustProxy = true;
+                case "--calls-v2" -> callsV2Flag = true;
                 case "--rootz" -> rootz = true;
                 case "--max-frame-mb" -> maxFrameMb = Integer.parseInt(args[++index]);
                 case "--demo-seed" -> demoSeed = true;
@@ -203,6 +207,9 @@ public final class EmberServer implements AutoCloseable {
                 dataDirectory.resolve("media"), storyTtlSec, adminUsernames, bindAddress);
         server.setMaxFrameBytes(maxFrameMb * 1024 * 1024);
         server.setTrustForwardedFor(trustProxy);
+        if (callsV2Flag) {
+            server.setCallsV2(true);
+        }
         server.setPushContact(readOptionalSecret(secrets, "EMBER_PUBLIC_URL"));
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
@@ -269,6 +276,10 @@ public final class EmberServer implements AutoCloseable {
     }
 
     /** Call only when the plain-HTTP listener is reachable solely through your own proxy. */
+    public void setCallsV2(boolean enabled) {
+        callsV2 = enabled;
+    }
+
     public void setTrustForwardedFor(boolean trust) {
         trustForwardedFor = trust;
     }
@@ -545,6 +556,7 @@ public final class EmberServer implements AutoCloseable {
             response.put("admin", Boolean.toString(isAdminUser(user.username())));
             response.put("globalSeq", "0");
             response.put("ice", ICE_SERVERS);
+            response.put("callsV2", Boolean.toString(callsV2));
             supportsCalls = "1".equals(fields.values.get("calls"));
             String sinceRevision = syncStart(fields, response);
             send(edu.ember.common.protocol.FrameFactory.event(
@@ -573,6 +585,7 @@ public final class EmberServer implements AutoCloseable {
             response.put("admin", Boolean.toString(isAdminUserId(userId)));
             response.put("globalSeq", "0");
             response.put("ice", ICE_SERVERS);
+            response.put("callsV2", Boolean.toString(callsV2));
             supportsCalls = "1".equals(fields.values.get("calls"));
             String sinceRevision = syncStart(fields, response);
             send(edu.ember.common.protocol.FrameFactory.event(

@@ -114,6 +114,9 @@ public final class CallDialog extends JDialog {
         if (text.length() > 0) {
             text.append("Same codes on both screens = private call. Use headphones to avoid echo.");
         }
+        if (controller.callSettings().statsOverlay() && shown.stats() != null) {
+            text.append("\n\n").append(shown.stats().line());
+        }
         codes.setText(text.toString());
         accept.setVisible(shown.state() == CallSession.State.RINGING_IN);
         mute.setText(shown.muted() ? "Unmute" : "Mute");

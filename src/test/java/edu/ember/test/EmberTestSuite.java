@@ -106,6 +106,11 @@ public final class EmberTestSuite {
                 this::testWebPush);
         runTest("calls: ringing, answer, encrypted relay, busy, block, and origin check", this::testCalls);
         runTest("wideband desktop voice: 64 kbit/s frames decode cleanly", this::testWidebandVoice);
+        runTest("calls v2: codec negotiation, shared ADPCM vectors, legacy compatibility", this::testCallsV2Codecs);
+        runTest("calls v2: anti-aliasing resampler passband, stopband and length", this::testResampler);
+        runTest("calls v2: jitter buffer order, concealment, steady delay, stall recovery", this::testJitterBuffer);
+        runTest("calls v2: settings persist, microphone unplug falls back, devices released", this::testCallSettingsAndDevices);
+        runTest("calls v2: feature flag reported in AUTH_OK, off by default", this::testCallsV2Flag);
         runTest("end-to-end chats: tamper, impostor and outsider refused; server sees only ciphertext", this::testEndToEndChat);
         runTest("theme palettes, wrapped message bodies, and EDT notifications",
                 this::testUiBasics);
@@ -1889,6 +1894,337 @@ public final class EmberTestSuite {
             }
         }
         assertTrue(10 * Math.log10(signal / noise) > 18, "Wideband voice lost too much quality");
+    }
+
+    // ---- calls v2 (P1: voice) ----
+
+    /** Codec choice per call, shared ADPCM vectors (16 and 32 kHz), and compatibility with the legacy encoder. */
+    private void testCallsV2Codecs() throws Exception {
+        var auto = edu.ember.client.call.QualityMode.AUTO.policy();
+        var saver = edu.ember.client.call.QualityMode.DATA_SAVER.policy();
+        assertEquals(4, edu.ember.client.call.CodecFactory.negotiate(auto.desktopCodecPreference(), List.of(1, 4, 3, 2)).id(),
+                "Auto should send 32 kHz ADPCM to a v2 website");
+        assertEquals(3, edu.ember.client.call.CodecFactory.negotiate(saver.desktopCodecPreference(), List.of(1, 4, 3, 2)).id(),
+                "Data saver should send 16 kHz ADPCM");
+        assertEquals(3, edu.ember.client.call.CodecFactory.negotiate(auto.desktopCodecPreference(), List.of(3, 2)).id(),
+                "An older build that only plays 16 kHz must get 16 kHz");
+        assertEquals(2, edu.ember.client.call.CodecFactory.negotiate(auto.desktopCodecPreference(), List.of(2)).id(),
+                "G.711 is the last resort");
+        boolean refused = false;
+        try {
+            edu.ember.client.call.CodecFactory.negotiate(auto.desktopCodecPreference(), List.of(1));
+        } catch (edu.ember.client.call.CodecNegotiationException expected) {
+            refused = true;
+        }
+        assertTrue(refused, "Negotiation without a shared codec must fail loudly");
+        for (var mode : edu.ember.client.call.QualityMode.values()) {
+            assertEquals(mode, edu.ember.client.call.QualityMode.fromKey(mode.key()), "Mode key does not round-trip");
+        }
+        assertEquals(edu.ember.client.call.QualityMode.AUTO, edu.ember.client.call.QualityMode.fromKey("bogus"),
+                "Unknown modes must fall back to Auto");
+
+        List<String> vectors = Files.readAllLines(Path.of("src", "test", "resources", "adpcm-vectors.txt"));
+        for (int rate : new int[] {16_000, 32_000}) {
+            var codec = new edu.ember.client.call.AdpcmCodec(rate);
+            int[] legacyState = {0};
+            int samples = rate / 50;
+            double signal = 0;
+            double noise = 0;
+            for (int frame = 0; frame < 3; frame++) {
+                short[] pcm = new short[samples];
+                for (int index = 0; index < samples; index++) {
+                    double time = (frame * samples + index) / (double) rate;
+                    pcm[index] = (short) Math.round((0.5 * Math.sin(2 * Math.PI * 440 * time)
+                            + 0.2 * Math.sin(2 * Math.PI * 3100 * time)) * 32767);
+                }
+                byte[] encoded = codec.encode(pcm);
+                assertEquals(3 + samples / 2, encoded.length, "ADPCM frame size changed");
+                String expected = null;
+                for (String line : vectors) {
+                    if (line.startsWith(rate + " " + frame + " ")) {
+                        expected = line.split(" ")[2];
+                    }
+                }
+                assertEquals(expected, hex(encoded), "ADPCM " + rate + " frame " + frame + " differs from the shared vector");
+                if (rate == 16_000) {
+                    assertEquals(hex(edu.ember.client.CallSession.adpcmEncode(pcm, legacyState)), hex(encoded),
+                            "v2 16 kHz ADPCM must stay byte-identical with the legacy encoder");
+                }
+                short[] decoded = codec.decode(encoded);
+                for (int index = 0; index < samples; index++) {
+                    signal += (double) pcm[index] * pcm[index];
+                    noise += Math.pow(decoded[index] - pcm[index], 2);
+                }
+            }
+            double snr = 10 * Math.log10(signal / noise);
+            assertTrue(snr > 18, "ADPCM " + rate + " round trip too lossy: " + snr + " dB");
+            assertEquals(0, codec.decode(new byte[5]).length, "A wrong-size frame must count as lost");
+        }
+    }
+
+    private static String hex(byte[] bytes) {
+        StringBuilder out = new StringBuilder();
+        for (byte value : bytes) {
+            out.append(String.format("%02x", value & 0xFF));
+        }
+        return out.toString();
+    }
+
+    /** Anti-aliasing resampler: flat passband, deep stopband, correct output length across chunks. */
+    private void testResampler() {
+        // Passband sweep 200 Hz - 12 kHz: within 1 dB; stopband 17 - 23 kHz: at least 50 dB down (48 -> 32 kHz).
+        for (int frequency = 200; frequency <= 23_000; frequency += 400) {
+            if (frequency > 12_000 && frequency < 17_000) {
+                continue; // transition band
+            }
+            double gainDb = toneGainDb(48_000, 32_000, frequency);
+            if (frequency <= 12_000) {
+                assertTrue(Math.abs(gainDb) < 1.0, frequency + " Hz passband gain " + gainDb + " dB");
+            } else {
+                assertTrue(gainDb < -50, frequency + " Hz stopband only " + gainDb + " dB");
+            }
+        }
+        assertTrue(Math.abs(toneGainDb(44_100, 32_000, 1_000)) < 1.0, "44.1 kHz microphones must resample cleanly");
+        assertTrue(Math.abs(toneGainDb(32_000, 48_000, 3_000)) < 1.0, "Playback up-sampling must keep the voice band");
+        var resampler = new edu.ember.client.call.Resampler(48_000, 32_000);
+        long produced = 0;
+        for (int chunk = 0; chunk < 500; chunk++) {
+            produced += resampler.process(new float[chunk % 7 == 0 ? 961 : 960]).length;
+        }
+        long expected = (500L * 960 + 500 / 7 + 1) * 2 / 3;
+        assertTrue(Math.abs(produced - expected) <= 2, "Resampler drifted: " + produced + " vs " + expected);
+    }
+
+    private static double toneGainDb(int inRate, int outRate, double frequency) {
+        var resampler = new edu.ember.client.call.Resampler(inRate, outRate);
+        float[] input = new float[inRate / 2];
+        for (int index = 0; index < input.length; index++) {
+            input[index] = (float) (0.5 * Math.sin(2 * Math.PI * frequency * index / inRate));
+        }
+        float[] output = resampler.process(input);
+        double inPower = 0;
+        double outPower = 0;
+        for (int index = input.length / 4; index < input.length; index++) {
+            inPower += input[index] * input[index];
+        }
+        inPower /= input.length - input.length / 4;
+        int skip = output.length / 4;
+        for (int index = skip; index < output.length; index++) {
+            outPower += output[index] * output[index];
+        }
+        outPower /= output.length - skip;
+        return 10 * Math.log10(Math.max(outPower, 1e-20) / inPower);
+    }
+
+    /** A fake clock the test moves by hand. */
+    private static final class FakeClock implements edu.ember.client.call.Clock {
+        long now;
+
+        @Override
+        public long nowMs() {
+            return now;
+        }
+    }
+
+    /** Jitter buffer: order, duplicates, concealment, steady delay, and recovery after a 500 ms stall. */
+    private void testJitterBuffer() {
+        FakeClock clock = new FakeClock();
+        var buffer = new edu.ember.client.call.JitterBuffer(clock, 4);
+        buffer.put(3, new short[] {3, 3, 3, 3});
+        buffer.put(1, new short[] {1, 1, 1, 1});
+        buffer.put(2, new short[] {2, 2, 2, 2});
+        buffer.put(2, new short[] {9, 9, 9, 9});
+        assertEquals(1, (int) buffer.poll()[0], "Frames must play in sequence order");
+        assertEquals(2, (int) buffer.poll()[0], "Second frame out of order");
+        assertEquals(3, (int) buffer.poll()[0], "Duplicate replaced the original");
+        buffer.put(1, new short[] {7, 7, 7, 7});
+        assertEquals(2, (int) buffer.stats().lateDropped(), "Late and duplicate frames must be counted as dropped");
+        short[] concealed = buffer.poll();
+        assertEquals(2, (int) concealed[0], "Concealment must repeat the last frame, faded (3 * 0.7 = 2)");
+        buffer.poll();
+        buffer.poll();
+        assertEquals(0, (int) buffer.poll()[0], "After three concealed frames it must go quiet");
+
+        // Simulated transport on a fake clock: 20 ms frames, 2 ms network, then a 500 ms stall and a TCP burst.
+        FakeClock time = new FakeClock();
+        var jb = new edu.ember.client.call.JitterBuffer(time, 160);
+        java.util.TreeMap<Long, List<Long>> deliveries = new java.util.TreeMap<>();
+        for (long sequence = 1; sequence <= 400; sequence++) {
+            long sent = sequence * 20;
+            long arrive = sent + 2;
+            if (sent >= 3000 && sent < 3500) {
+                arrive = 3500 + 2; // stalled: everything arrives together when the connection recovers
+            }
+            deliveries.computeIfAbsent(arrive, ignored -> new java.util.ArrayList<>()).add(sequence);
+        }
+        int steadyMax = 0;
+        int afterStall = 0;
+        long recoveredAt = -1;
+        for (time.now = 0; time.now <= 8000; time.now++) {
+            for (long sequence : deliveries.getOrDefault(time.now, List.of())) {
+                jb.put(sequence, new short[160]);
+            }
+            if (time.now % 20 == 10) {
+                jb.poll();
+                int depth = jb.depthMs();
+                if (time.now > 1000 && time.now < 3000) {
+                    steadyMax = Math.max(steadyMax, depth);
+                }
+                if (time.now > 3500 && time.now < 3600) {
+                    afterStall = Math.max(afterStall, depth);
+                }
+                if (time.now > 3600 && recoveredAt < 0 && depth <= 80) {
+                    recoveredAt = time.now;
+                }
+            }
+        }
+        assertTrue(steadyMax <= 80, "Steady-state delay on a good network is above 80 ms: " + steadyMax);
+        assertTrue(afterStall > 100, "The stall burst should have filled the buffer (sanity check): " + afterStall);
+        assertTrue(recoveredAt > 0 && recoveredAt - 3500 <= 3000,
+                "Delay did not return to <= 80 ms within 3 s of the stall (recovered at " + recoveredAt + ")");
+
+        // Loss and reordering: never plays a frame twice or goes backwards.
+        java.util.Random random = new java.util.Random(7);
+        FakeClock lossy = new FakeClock();
+        var jl = new edu.ember.client.call.JitterBuffer(lossy, 2);
+        java.util.TreeMap<Long, List<Long>> arrivals = new java.util.TreeMap<>();
+        for (long sequence = 1; sequence <= 500; sequence++) {
+            if (random.nextInt(100) < 3) {
+                continue; // 3% lost
+            }
+            long arrive = sequence * 20 + 20 + random.nextInt(60);
+            arrivals.computeIfAbsent(arrive, ignored -> new java.util.ArrayList<>()).add(sequence);
+        }
+        long lastPlayed = 0;
+        for (lossy.now = 0; lossy.now <= 11_000; lossy.now++) {
+            for (long sequence : arrivals.getOrDefault(lossy.now, List.of())) {
+                jl.put(sequence, new short[] {(short) sequence, 30_000}); // 30000 marks a real (not concealed) frame
+            }
+            if (lossy.now % 20 == 0) {
+                short[] played = jl.poll();
+                short value = played[0];
+                if (played[1] == 30_000) {
+                    assertTrue(value > lastPlayed, "Played out of order: " + value + " after " + lastPlayed);
+                    lastPlayed = value;
+                }
+            }
+        }
+        assertTrue(jl.stats().targetMs() > 40, "Jitter of up to 60 ms must raise the target delay");
+    }
+
+    /** Settings persist; a damaged file falls back to defaults; a microphone that unplugs is replaced. */
+    private void testCallSettingsAndDevices() throws Exception {
+        Path directory = Files.createTempDirectory("ember-call-settings");
+        Path file = directory.resolve("call-settings.properties");
+        var settings = edu.ember.client.call.CallSettings.load(file);
+        assertEquals(edu.ember.client.call.QualityMode.AUTO, settings.mode(), "Default mode must be Auto");
+        assertTrue(!settings.speakerMode(), "Speaker mode must be off by default");
+        assertTrue(settings.callsV2(), "The device half of the v2 flag defaults on");
+        settings.setMode(edu.ember.client.call.QualityMode.MAX);
+        settings.setMicrophone("USB Mic");
+        var reloaded = edu.ember.client.call.CallSettings.load(file);
+        assertEquals(edu.ember.client.call.QualityMode.MAX, reloaded.mode(), "Mode was not saved");
+        assertEquals("USB Mic", reloaded.microphone(), "Microphone choice was not saved");
+        Files.writeString(file, "mode=\\u12");
+        assertEquals(edu.ember.client.call.QualityMode.AUTO, edu.ember.client.call.CallSettings.load(file).mode(),
+                "A damaged settings file must fall back to defaults");
+
+        AtomicInteger microphonesOpened = new AtomicInteger();
+        AtomicInteger closed = new AtomicInteger();
+        var devices = new edu.ember.client.call.AudioDevices.Provider() {
+            @Override
+            public edu.ember.client.call.AudioDevices.Microphone openMicrophone(String preferred) {
+                int which = microphonesOpened.incrementAndGet();
+                return new edu.ember.client.call.AudioDevices.Microphone() {
+                    int reads;
+
+                    @Override public int sampleRate() { return which == 1 ? 48_000 : 44_100; }
+                    @Override public String name() { return "mic" + which; }
+
+                    @Override
+                    public void read(short[] samples) throws edu.ember.client.call.AudioDeviceException {
+                        sleepQuietly(20);
+                        if (which == 1 && ++reads > 5) {
+                            throw new edu.ember.client.call.AudioDeviceException("unplugged");
+                        }
+                        java.util.Arrays.fill(samples, (short) 1000);
+                    }
+
+                    @Override public void close() { closed.incrementAndGet(); }
+                };
+            }
+
+            @Override
+            public edu.ember.client.call.AudioDevices.Speaker openSpeaker(String preferred) {
+                return new edu.ember.client.call.AudioDevices.Speaker() {
+                    @Override public int sampleRate() { return 48_000; }
+                    @Override public String name() { return "speaker"; }
+                    @Override public void write(short[] samples) { sleepQuietly(20); }
+                    @Override public void close() { closed.incrementAndGet(); }
+                };
+            }
+        };
+        List<String> statuses = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AtomicInteger framesAfterSwitch = new AtomicInteger();
+        var engine = new edu.ember.client.call.VoiceEngine(devices, settings, edu.ember.client.call.Clock.SYSTEM,
+                (sequence, codec, frame) -> {
+                    if (microphonesOpened.get() > 1) {
+                        framesAfterSwitch.incrementAndGet();
+                    }
+                    assertEquals(4, codec, "Engine must send the negotiated codec");
+                    assertEquals(323, frame.length, "32 kHz ADPCM frames are 323 bytes");
+                },
+                statuses::add);
+        engine.setSendCodec(new edu.ember.client.call.AdpcmCodec(32_000));
+        engine.start();
+        waitFor(() -> framesAfterSwitch.get() >= 5, "Audio did not continue on the fallback microphone");
+        engine.stop();
+        waitFor(() -> closed.get() >= 3, "Devices were not released after stop (closed " + closed.get() + ")");
+        assertTrue(statuses.stream().anyMatch(message -> message.contains("disconnected")),
+                "The user was not told the microphone dropped");
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** The v2 flag is off unless the server enables it, and AUTH_OK reports it either way. */
+    private void testCallsV2Flag() throws Exception {
+        Path temporary = Files.createTempDirectory("ember-flag");
+        EmberServer server = new EmberServer(null, null, 0, new InMemoryStorageEngine(),
+                new SecurityAuditLogger(temporary.resolve("audit.json")), temporary.resolve("media"),
+                86_400, java.util.Set.of(), "127.0.0.1");
+        try {
+            server.start();
+            int port = server.startHttp(0);
+            for (boolean enabled : new boolean[] {false, true}) {
+                server.setCallsV2(enabled);
+                try (java.net.Socket socket = new java.net.Socket("127.0.0.1", port)) {
+                    socket.setSoTimeout(10_000);
+                    var in = new java.io.BufferedInputStream(socket.getInputStream());
+                    var out = socket.getOutputStream();
+                    out.write(("GET / HTTP/1.1\r\nHost: 127.0.0.1:" + port + "\r\nUpgrade: websocket\r\n"
+                            + "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                            + "Sec-WebSocket-Version: 13\r\n\r\n").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                    StringBuilder head = new StringBuilder();
+                    while (!head.toString().endsWith("\r\n\r\n")) {
+                        head.append((char) in.read());
+                    }
+                    String user = enabled ? "flagon" : "flagoff";
+                    wsSend(out, FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                            Map.of("user", user, "pass", user + "-pass-42", "displayName", user, "calls", "1")));
+                    assertEquals(Boolean.toString(enabled),
+                            KvPayloadCodec.decode(wsRead(in, WireOpcodes.EVT_AUTH_OK).payload()).get("callsV2"),
+                            "AUTH_OK did not report the calls v2 flag");
+                }
+            }
+        } finally {
+            server.close();
+        }
     }
 
     private void testUiBasics() throws Exception {

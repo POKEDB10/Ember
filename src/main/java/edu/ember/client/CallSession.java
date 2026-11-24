@@ -94,9 +94,24 @@ public final class CallSession {
     private volatile SourceDataLine speaker;
     private Thread captureThread;
     private Thread mixerThread;
+    /** Calls v2 voice pipeline, or null for the legacy path (flag off, or a group call). */
+    private final edu.ember.client.call.VoiceEngine engine;
+    private final edu.ember.client.call.QualityPolicy policy;
+    private int framesSincePing;
 
     CallSession(String me, String conversationId, String title, boolean incoming, String callId,
             BiConsumer<String, Map<String, String>> sendCall, Consumer<byte[]> sendMedia, Runnable changed) {
+        this(me, conversationId, title, incoming, callId, sendCall, sendMedia, changed, null, null, null);
+    }
+
+    /**
+     * With calls v2 (1:1 only): the {@link edu.ember.client.call.VoiceEngine} pipeline replaces the
+     * legacy capture/mixer threads; everything else (keys, signals, relay packets) is shared.
+     */
+    CallSession(String me, String conversationId, String title, boolean incoming, String callId,
+            BiConsumer<String, Map<String, String>> sendCall, Consumer<byte[]> sendMedia, Runnable changed,
+            edu.ember.client.call.CallSettings settings, edu.ember.client.call.AudioDevices.Provider devices,
+            edu.ember.client.call.CallStatsListener statsLog) {
         this.me = me;
         this.conversationId = conversationId;
         this.title = title;
@@ -107,6 +122,41 @@ public final class CallSession {
         state = incoming ? State.RINGING_IN : State.RINGING_OUT;
         status = incoming ? "incoming call" : "calling…";
         rotateSenderKey();
+        if (settings != null && conversationId.startsWith("dm:")) {
+            policy = settings.mode().policy();
+            engine = new edu.ember.client.call.VoiceEngine(devices, settings, edu.ember.client.call.Clock.SYSTEM,
+                    (sequence, codecId, frame) -> {
+                        int now = (int) (System.nanoTime() / 1_000_000);
+                        if (++framesSincePing >= 100) { // every 2 s: measures round-trip time for the stats
+                            framesSincePing = 0;
+                            sendPacket(PING, (byte) 0, new byte[0], now);
+                        }
+                        sendPacket(AUDIO, (byte) codecId, frame, now);
+                    },
+                    message -> {
+                        status = message;
+                        changed.run();
+                    });
+            if (statsLog != null) {
+                engine.addStatsListener(statsLog);
+            }
+            engine.addStatsListener(stats -> lastStats = stats);
+        } else {
+            policy = null;
+            engine = null;
+        }
+    }
+
+    private volatile edu.ember.client.call.CallStats lastStats;
+
+    /** Latest stats snapshot (calls v2 only), or null. */
+    public edu.ember.client.call.CallStats stats() {
+        return lastStats;
+    }
+
+    /** True when this call runs the calls v2 voice pipeline. */
+    public boolean v2() {
+        return engine != null;
     }
 
     public State state() { return state; }
@@ -125,6 +175,9 @@ public final class CallSession {
 
     public void setMuted(boolean value) {
         muted = value;
+        if (engine != null) {
+            engine.setMuted(value);
+        }
         changed.run();
     }
 
@@ -159,6 +212,9 @@ public final class CallSession {
             }
             case "left" -> {
                 Peer gone = peers.remove(fields.get("userId"));
+                if (engine != null) {
+                    engine.removePeer(fields.get("userId"));
+                }
                 if (gone != null && gone.tag != null) {
                     byTag.remove(gone.tag);
                 }
@@ -290,7 +346,8 @@ public final class CallSession {
         }
         try {
             sendSignal(peer, "relay", "{\"key\":" + MiniJson.quote(E2eCrypto.encode(senderKey)) + ",\"tag\":"
-                    + MiniJson.quote(E2eCrypto.encode(senderTag)) + ",\"opus\":false,\"adpcm\":true,\"video\":[]}");
+                    + MiniJson.quote(E2eCrypto.encode(senderTag)) + ",\"opus\":false,\"adpcm\":true,\"video\":[]"
+                    + (engine == null ? "" : ",\"v\":2,\"codecs\":[4,3,2]") + "}");
         } catch (GeneralSecurityException exception) {
             status = "could not secure the call";
         }
@@ -317,6 +374,9 @@ public final class CallSession {
                 peer.senderKey = E2eCrypto.decode(keyText);
                 peer.tag = tagText;
                 peer.adpcm = Boolean.TRUE.equals(MiniJson.path(message, "adpcm"));
+                if (engine != null && engine.sendCodec() == null) {
+                    chooseSendCodec(message, peer.adpcm);
+                }
                 peer.lastCounter = -1;
                 byTag.put(tagText, peer);
                 startAudio();
@@ -408,8 +468,13 @@ public final class CallSession {
         } else if (plain[0] == PONG) {
             if (Arrays.equals(body, senderTag)) {
                 pingMs = (int) (System.nanoTime() / 1_000_000) - time;
+                if (engine != null) {
+                    engine.setRttMs(pingMs);
+                }
                 changed.run();
             }
+        } else if (plain[0] == AUDIO && engine != null) {
+            engine.receive(peer.user, counter, plain[1], body); // ordered and concealed in its jitter buffer
         } else if (plain[0] == AUDIO && (plain[1] == MULAW || plain[1] == ADPCM)) {
             short[] pcm;
             if (plain[1] == ADPCM) {
@@ -427,8 +492,47 @@ public final class CallSession {
         }
     }
 
+    /**
+     * Calls v2: the voice codec this side sends, fixed for the call. Uses the codecs the other side
+     * announced; an older build that only says "adpcm" can play ADPCM 16 kHz and G.711.
+     */
+    private void chooseSendCodec(Object message, boolean legacyAdpcm) {
+        java.util.List<Integer> theirs = new java.util.ArrayList<>();
+        if (MiniJson.path(message, "codecs") instanceof java.util.List<?> listed) {
+            for (Object id : listed) {
+                if (id instanceof Number number && number.intValue() >= 1 && number.intValue() <= 16) {
+                    theirs.add(number.intValue());
+                }
+            }
+        } else {
+            if (legacyAdpcm) {
+                theirs.add(edu.ember.client.call.AdpcmCodec.ID_16K);
+            }
+            theirs.add(edu.ember.client.call.MulawCodec.ID);
+        }
+        try {
+            engine.setSendCodec(edu.ember.client.call.CodecFactory.negotiate(policy.desktopCodecPreference(), theirs));
+        } catch (edu.ember.client.call.CodecNegotiationException none) {
+            status = none.getMessage();
+        }
+    }
+
     /** Opens the microphone and speaker once the first person's key arrives. */
     private synchronized void startAudio() {
+        if (engine != null) {
+            if (state != State.ENDED && !engine.running()) {
+                try {
+                    engine.start();
+                    state = State.ACTIVE;
+                    startedMs = System.currentTimeMillis();
+                    status = "relay · encrypted · " + (engine.sendCodec() == null ? "" : engine.sendCodec().name());
+                } catch (edu.ember.client.call.AudioDeviceException failure) {
+                    status = "no microphone or speaker found";
+                }
+                changed.run();
+            }
+            return;
+        }
         if (captureThread != null || state == State.ENDED) {
             return;
         }
@@ -613,6 +717,9 @@ public final class CallSession {
         }
         state = State.ENDED;
         status = why;
+        if (engine != null) {
+            engine.stop(); // its threads close the devices in finally
+        }
         if (microphone != null) {
             microphone.stop();
             microphone.close();

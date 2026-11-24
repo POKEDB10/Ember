@@ -84,6 +84,10 @@ public final class ClientController implements AutoCloseable {
     private volatile long ringCorrelation;
     private volatile long acceptCorrelation;
     private volatile Runnable callListener = () -> { };
+    /** Server half of the calls v2 flag, from AUTH_OK. */
+    private volatile boolean serverCallsV2;
+    private final edu.ember.client.call.CallSettings callSettings;
+    private volatile edu.ember.client.call.AudioDevices.Provider audioDevices = edu.ember.client.call.AudioDevices.JAVA_SOUND;
 
     private volatile String activeConversationId;
     private volatile String sessionToken;
@@ -105,6 +109,7 @@ public final class ClientController implements AutoCloseable {
     /** Works over any link: a direct TLS socket or the website's WebSocket. */
     public ClientController(ServerLink link, Path clientDataRoot) throws IOException {
         this.clientDataRoot = clientDataRoot;
+        callSettings = edu.ember.client.call.CallSettings.load(clientDataRoot.resolve("call-settings.properties"));
         socket = link;
         outbound = new OutboundSenderThread(link.output());
         inbound = new InboundReceiverThread(link.input(), this);
@@ -417,6 +422,7 @@ public final class ClientController implements AutoCloseable {
         String[] parts = conversationId.split(":");
         String title = parts.length == 3 ? (parts[1].equals(model.userId()) ? parts[2] : parts[1])
                 : java.util.Optional.ofNullable(model.groupDetails(parts[1])).map(g -> "#" + g.name()).orElse("group");
+        boolean v2 = serverCallsV2 && callSettings.callsV2();
         return new CallSession(model.userId(), conversationId, title, incoming, callId,
                 (kind, fields) -> {
                     Map<String, String> all = new HashMap<>(fields);
@@ -424,7 +430,24 @@ public final class ClientController implements AutoCloseable {
                     sendCommand(WireOpcodes.CMD_CALL, all);
                 },
                 packet -> outbound.enqueue(new WireFrame.Builder(WireOpcodes.CMD_CALL_MEDIA).payload(packet).build()),
-                this::callChanged);
+                this::callChanged,
+                v2 ? callSettings : null, audioDevices,
+                v2 ? new edu.ember.client.call.StatsLog(clientDataRoot.resolve("call-stats.log")) : null);
+    }
+
+    /** This device's call settings (quality mode, devices, Speaker mode, overlay, v2 switch). */
+    public edu.ember.client.call.CallSettings callSettings() {
+        return callSettings;
+    }
+
+    /** True when the server offers calls v2 (the device setting must also be on). */
+    public boolean serverCallsV2() {
+        return serverCallsV2;
+    }
+
+    /** Tests replace the real microphone and speaker. */
+    public void setAudioDevices(edu.ember.client.call.AudioDevices.Provider devices) {
+        audioDevices = devices;
     }
 
     /** Starts a voice call in a direct or group chat. */
@@ -588,6 +611,7 @@ public final class ClientController implements AutoCloseable {
         }
         if (frame.opcode() == WireOpcodes.EVT_AUTH_OK) {
             sessionToken = fields.get("token");
+            serverCallsV2 = Boolean.parseBoolean(fields.getOrDefault("callsV2", "false"));
             String userId = fields.get("userId");
             initializeOutbox(userId);
             setUpIdentity(userId);
