@@ -8,8 +8,28 @@ The current build provides a website (installable as an app) and a Swing desktop
 
 ## Requirements
 
-- JDK 21 toolchain (compiled with `--release 17`)
+Nothing but a JDK: no Maven, no Gradle, no libraries.
+
+- JDK 17 or newer (21 recommended; the code compiles with `--release 17`).
+- Optional: Node.js, only to run the website's 9 JavaScript tests (built-in `node --test`, no packages). Without Node, the test script says "skipped".
 - Windows scripts are provided in `.bat` form; matching `.sh` scripts are also included.
+
+## Quick start
+
+```text
+scripts\build.bat                 compile everything into build\classes
+scripts\run-tests.bat             46 Java tests, then the 9 JavaScript tests
+scripts\run-demo.bat              TLS server with demo data + three desktop windows
+```
+
+Calls with the website and the desktop app, on one laptop (see `docs/DEMO.md`):
+
+```text
+scripts\run-server.bat --no-tls --http-port 8090 --storage demo_calls_data --demo-seed --calls-v2
+scripts\run-client.bat --url http://localhost:8090 --profile bob
+```
+
+Then open `http://localhost:8090` and log in as `alice` / `alice-demo-42`.
 
 ## Build and run
 
@@ -31,12 +51,13 @@ On Unix-like systems, use the matching `scripts/build.sh`, `scripts/run.sh`, `sc
 
 All messages live on the server, so an account can sign in on any number of devices at once (website, installed web app, Swing desktop app) and every device sees the full history plus live messages, including ones the same account sent from another device.
 
-- **Website.** The server also serves a web client (plain HTML/CSS/JS, about 60 KB, gzipped, ETag-revalidated and cached by a service worker). It speaks the same binary protocol over a compressed WebSocket (`permessage-deflate`), so every server rule applies unchanged. Features: direct and group chat, replies, reactions, edit/delete, pins and stars (synced to every device), disappearing messages, a single Read more button on long messages, typing indicators, statuses (online, away, automatic idle, do not disturb, invisible), group polls, in-chat search, Campus Pulse photo posts with likes and comments, 24-hour stories, profiles with follow requests you can approve or decline, block and report, and seven retro themes in a picker. New messages in another chat pop up as a card with a quick-reply box; in a background tab they become system notifications with Reply and Mark read buttons; with no tab open they arrive as Web Push notifications (encrypted per browser, RFC 8291/8292). Do not disturb silences all of them. Chats are cached in the browser (IndexedDB) and a returning device downloads only the changes since its last visit; logging out deletes the cache. Photos are shrunk in the browser (max 1600 px JPEG) before upload, and images load over plain HTTP with a one-year private cache, so each one downloads once per device. Browsers can install it as an app ("Install app" / "Add to Home screen").
+- **Website.** The server also serves a web client (plain HTML/CSS/JS, about 170 KB, 56 KB gzipped, ETag-revalidated and cached by a service worker). It speaks the same binary protocol over a compressed WebSocket (`permessage-deflate`), so every server rule applies unchanged. Features: direct and group chat, replies, reactions, edit/delete, pins and stars (synced to every device), disappearing messages, a single Read more button on long messages, typing indicators, statuses (online, away, automatic idle, do not disturb, invisible), group polls, in-chat search, Campus Pulse photo posts with likes and comments, 24-hour stories, profiles with follow requests you can approve or decline, block and report, and seven retro themes in a picker. New messages in another chat pop up as a card with a quick-reply box; in a background tab they become system notifications with Reply and Mark read buttons; with no tab open they arrive as Web Push notifications (encrypted per browser, RFC 8291/8292). Do not disturb silences all of them. Chats are cached in the browser (IndexedDB) and a returning device downloads only the changes since its last visit; logging out deletes the cache. Photos are shrunk in the browser (max 1600 px JPEG) before upload, and images load over plain HTTP with a one-year private cache, so each one downloads once per device. Browsers can install it as an app ("Install app" / "Add to Home screen").
 - **End-to-end encrypted chats.** Every browser and desktop app has its own key pair; messages are encrypted on the sending device for every device in the chat, so the server stores only ciphertext. New devices are announced, and profiles show device codes to compare. See `docs/CODEBASE_GUIDE.md` section 7b.
 - **Presence privacy.** Only contacts (chat partners, group mates, accepted follows) see whether you are online.
-- **Voice and video calls.** One-to-one and group calls (up to 8) from any chat; the desktop app joins with voice. They connect peer-to-peer when the network allows (lowest delay). Otherwise, within about 6 s, they fall back to a relay inside the site's own HTTPS WebSocket, so they still work where VoIP or UDP is blocked. Either way they are end-to-end encrypted: the browsers agree a key with ECDH P-256 and both screens show a safety code, so the server only forwards unreadable packets and never sees the other person's IP address. "Hide my IP in calls" (ME tab) always uses the relay. Quality adapts to the connection: fullband Opus voice and up to 720p at 30 fps video (direct links use the browser's congestion control; the relay climbs a 180p–720p ladder and steps down at once when the line backs up). The desktop app uses 16 kHz wideband voice.
+- **Voice and video calls.** One-to-one and group calls (up to 8) from any chat; the desktop app joins with voice. They connect peer-to-peer when the network allows (lowest delay). Otherwise, within about 6 s, they fall back to a relay inside the site's own HTTPS WebSocket, so they still work where VoIP or UDP is blocked. Either way they are end-to-end encrypted: the browsers agree a key with ECDH P-256 and both screens show a safety code, so the server only forwards unreadable packets and never sees the other person's IP address. "Hide my IP in calls" (ME tab) always uses the relay. Quality adapts to the connection: fullband Opus voice and up to 720p at 30 fps video (direct links use the browser's congestion control; the relay climbs a 180p–720p ladder and steps down at once when the line backs up). The desktop app uses wideband ADPCM voice.
+- **Calls v2 (one-to-one calls, behind a flag).** Start the server with `--calls-v2` (or `EMBER_CALLS_V2=1`); each device also has a "Calls v2" setting, on by default. Both must be on, otherwise the older call code runs unchanged; group calls always use it. Adds: quality modes (Data saver / Auto / Max), video limited by camera, mode, the other side's window size and the network (the stats overlay, Ctrl+Shift+D, names the limit), pause when a window is hidden, 32 kHz voice on the desktop with a jitter buffer and device fallback, opt-in Speaker mode, and **Video on website**: the desktop hands a voice call to the browser to add video (two-phase, single-use 30 s ticket, the other side re-keys). What was measured, and what was not, is in `docs/results.md`; design choices in `docs/decisions.md`, limits in `docs/ladder.md`.
 - **Desktop app.** `scripts/run-client.bat --url https://ember.example.com` connects the Swing app to a hosted website over the same WebSocket (no local keys needed). Without `--url` it uses the direct TLS socket as before.
-- **Server options.** `--bind` (TLS listener address, default `0.0.0.0`), `--no-tls` (web-only), `--http-port` / `--http-bind` (plain-HTTP web listener for an HTTPS proxy; default bind `127.0.0.1`), `--max-frame-mb` (largest message or upload after login, default 25), `--rootz` (off-server storage, below), `--new-storage-key` (prints a fresh encryption key), `--trust-proxy` (believe the proxy's `X-Forwarded-For`; use only when the HTTP listener is reachable solely through your own proxy).
+- **Server options.** `--calls-v2` (calls v2, above), `--bind` (TLS listener address, default `0.0.0.0`), `--no-tls` (web-only), `--http-port` / `--http-bind` (plain-HTTP web listener for an HTTPS proxy; default bind `127.0.0.1`), `--max-frame-mb` (largest message or upload after login, default 25), `--rootz` (off-server storage, below), `--new-storage-key` (prints a fresh encryption key), `--trust-proxy` (believe the proxy's `X-Forwarded-For`; use only when the HTTP listener is reachable solely through your own proxy).
 - **Health check.** `GET /health` returns `ok` without touching data, for uptime monitors.
 - **Self-hosting with TLS.** The TLS port also serves the website at `https://<host>:7443/`. `gen-keys` makes a self-signed certificate for `localhost`/`127.0.0.1`; add names with `EMBER_HOSTS=ip:192.168.1.20,dns:mypc` (delete `config/ember-server.p12` first) and copy the new `config/ember-client-trust.p12` to desktop-client machines.
 
@@ -46,7 +67,7 @@ All messages live on the server, so an account can sign in on any number of devi
 
 The server runs on Render's free plan, and all data is kept in your rootz.so account instead of on Render's disk (which is wiped on every restart). Everything sent to rootz is batched, GZIP-compressed and AES-256-GCM encrypted; rootz only ever holds unreadable files named `ember-*`.
 
-How it works: each change is appended to the write-ahead log and uploaded in a batch every 2 seconds. After about 1 MB of changes, a compressed snapshot replaces the older log files. On startup (including every wake-up after Render's free plan sleeps) the server downloads the newest snapshot plus later logs and rebuilds its state. Images are uploaded once and fetched back only when someone views them. Idle memory use is about 40 MB.
+How it works: each change is appended to the write-ahead log and uploaded in a batch every 2 seconds. After about 1 MB of changes, a compressed snapshot replaces the older log files. On startup (including every wake-up after Render's free plan sleeps) the server downloads the newest snapshot plus later logs and rebuilds its state. Images are uploaded once and fetched back only when someone views them. Idle memory use measured on a laptop with the Docker image's Java settings: about 64 MB for the whole process (not measured on Render).
 
 1. **Make an encryption key** (keep it secret; without it the data cannot be read):
    ```text
@@ -68,6 +89,19 @@ Run only one server against the same rootz files at a time. `java -cp build\clas
 ## Local demo
 
 Run `scripts\run-demo.bat` (Windows) or `scripts/run-demo.sh` (Linux/macOS) to build and start a server plus three clients on `localhost:7443`. If keys are missing, the script runs `gen-keys`; `--demo-seed` adds Alice, Bob, Charlie, a study group, a poll, and sample Campus Pulse content to an empty demo data directory. Seeded credentials are `alice` / `alice-demo-42`, `bob` / `bob-demo-42`, and `charlie` / `charlie-demo-42`. Alice receives the administrator role only in this demo launch, which explicitly passes `--admin-user alice`. The seed skips when Alice already exists and does not reset server data.
+
+## Documents
+
+| File | What it is |
+|---|---|
+| `docs/CODEBASE_GUIDE.md` | The whole codebase in plain words |
+| `docs/DEMO.md` | Demo script with fallbacks |
+| `docs/VIVA_NOTES.md` | Concept → class → file → why, and 20 likely questions |
+| `docs/results.md` | Calls v2 measurements against the targets, including what was not measured |
+| `docs/decisions.md` | Each design decision, why, and what was rejected |
+| `docs/ladder.md` | Call quality modes, video ladder and limits |
+| `docs/report/Ember_Report.pdf` | The course report |
+| `docs/SUBMISSION_CHECKLIST.md` | What is left to do by hand before submission and the demo |
 
 ## How the code works
 

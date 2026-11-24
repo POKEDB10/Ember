@@ -191,6 +191,18 @@ In the UAE, voice and video calling services are regulated by the TDRA, and unli
 
 ---
 
+### Calls v2 (one-to-one calls, behind a flag)
+Everything above still describes the default. With the server started with `--calls-v2` and the device's "Calls v2" setting on (both are needed), one-to-one calls get the upgrade below; group calls never do. All new messages travel inside the encrypted `ice` signal with `v: 2`, so the server learns nothing new. Decisions: `docs/decisions.md`. Numbers: `docs/results.md`. Limits: `docs/ladder.md`.
+
+- **Quality modes** (website Settings, desktop Settings): Data saver, Auto (default), Max. `QualityPolicy.java` (abstract, one subclass per mode) and `quality.js` hold the same table.
+- **Send limit** = the lowest of: camera (measured from the frames it really delivers), mode, the other side's video window (reported in device pixels), network. Ctrl+Shift+D shows which one is limiting.
+- **Relay ladder** (`Ladder` in `quality.js`): checked every second (pings every second too). Trouble (skipped frames, round trip up more than 150 ms, or the other side reporting more than 10 % late) steps down at once from the rung in use; 6 s calm steps up; a rung that failed waits 12 s, 24 s … 60 s.
+- **Pause:** a hidden window asks the other side to stop sending video (`vpause`); the state is re-sent every 2 s if it changed, so a lost message cannot stop video for good.
+- **Desktop voice** (`client/call/`): `VoiceEngine` opens the best microphone rate (48/44.1/32/16 kHz), cleans and resamples (`Resampler`, windowed sinc), encodes 32 kHz ADPCM (16 kHz in Data saver); `JitterBuffer` holds 40–200 ms, conceals a lost frame and trims after a stall; a lost device is reopened (falls back to the default). Speaker mode (off by default) turns the mic down while the other person is heard.
+- **Video on website (hand-off):** the desktop button opens `/?join=<callId>`; the page only shows **Join call**. Phase 1 `handoff-prepare` returns a single-use 30 s ticket and the browser opens camera and mic (a refusal leaves the desktop untouched). Phase 2 `handoff-commit` swaps the device in one step (first commit wins); the desktop gets `end reason=elsewhere`, the other side gets `moved` and makes new keys, so the safety code changes. The call continues on the relay.
+
+---
+
 ## 7b. End-to-end encrypted chats
 
 Every device (each browser, each desktop app) has its own key pair (ECDH P-256). The private key never leaves the device: in the browser it is a non-extractable key in IndexedDB, on the desktop a file in the user's folder. The server only stores public keys (`DeviceKeys.java`) and hands out the keys of the people in a chat.

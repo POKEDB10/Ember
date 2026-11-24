@@ -7,3 +7,6 @@
 /logs/
 /cloudflared.exe
 /docs/report/build/node_modules/
+/demo_calls_data/
+/Start cmd.txt
+/.claude/

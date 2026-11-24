@@ -11,7 +11,7 @@
 - Added `scripts/run-demo.bat`, `scripts/run-demo.sh`, `scripts/package-demo.bat`, and `scripts/package-demo.sh`.
 - Updated `scripts/gen-keys.bat` and `.sh` to refresh a stale client truststore through an intermediate file under ignored `build/`.
 - Added five PlantUML diagrams and `docs/uml/README.md`.
-- Updated `README.md`, `docs/DEMO_SCRIPT.md`, `docs/PROGRESS.md`, `docs/ARCHITECTURE.md`, `docs/CONCEPT_MAP.md`, `docs/VIVA_NOTES.md`, and report drafts 04–06.
+- Updated `README.md`, `docs/DEMO.md`, `docs/PROGRESS.md`, `docs/ARCHITECTURE.md`, `docs/CONCEPT_MAP.md`, `docs/VIVA_NOTES.md`, and report drafts 04–06.
 - Added `/config/ember-client-trust.p12` to `.gitignore` and removed that generated file from the Git index. The local truststore remains available for this checkout.
 
 ## Build and run
@@ -252,7 +252,7 @@ The tracked-path filter and `git diff --check` produced no findings (Git emitted
 
 ## Documentation and viva pack
 
-Updated `ARCHITECTURE.md`, `CONCEPT_MAP.md`, `VIVA_NOTES.md`, `README.md`, `DEMO_SCRIPT.md`, and report drafts 04–06. Added five PlantUML sources for use case, class, send/deliver/read sequence, message/connection state, and login/image upload activity. No new frozen interface was created in this phase.
+Updated `ARCHITECTURE.md`, `CONCEPT_MAP.md`, `VIVA_NOTES.md`, `README.md`, `DEMO.md`, and report drafts 04–06. Added five PlantUML sources for use case, class, send/deliver/read sequence, message/connection state, and login/image upload activity. No new frozen interface was created in this phase.
 
 Viva questions and model answers are appended under Phase 8 in `docs/VIVA_NOTES.md`:
 

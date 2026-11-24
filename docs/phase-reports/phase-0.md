@@ -11,7 +11,7 @@ Assumptions: the starting workspace was empty; interface responsibilities were f
 - `src/main/java/edu/ember/common/util/AppInfo.java`, `AppLog.java`
 - `src/test/java/edu/ember/test/EmberTestSuite.java`
 - `scripts/build.bat`, `build.sh`, `run.bat`, `run.sh`, `run-tests.bat`, `run-tests.sh`, `gen-keys.bat`, `gen-keys.sh`
-- `docs/ARCHITECTURE.md`, `CONCEPT_MAP.md`, `DEMO_SCRIPT.md`, `OWNERSHIP.md`, `PROTOCOL.md`, `SECURITY.md`, `VIVA_NOTES.md`
+- `docs/ARCHITECTURE.md`, `CONCEPT_MAP.md`, `DEMO.md`, `OWNERSHIP.md`, `PROTOCOL.md`, `SECURITY.md`, `VIVA_NOTES.md`
 - `docs/uml/README.md`
 - `docs/report/01-cover.md` through `07-references.md`
 - `docs/PROGRESS.md`, `docs/phase-reports/phase-0.md`
