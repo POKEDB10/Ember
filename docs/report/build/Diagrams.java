@@ -169,17 +169,18 @@ public class Diagrams {
             {"react", "Reply, react, edit, pin, star"}, {"group", "Create groups and polls"},
             {"pulse", "Publish posts and stories"}, {"social", "Follow, approve requests, block, report"},
             {"status", "Set status (online / away / DND / invisible)"}, {"notify", "Get notifications, quick reply"},
+            {"call", "Voice / video call, move it to the website"},
             {"admin", "Review reports, unlock accounts"}};
         Map<String, double[]> pos = new HashMap<>();
         double y = 110;
-        for (String[] c : cases) { pos.put(c[0], ellipse(430, y, 170, 24, c[1], FILL)); y += 68; }
-        double[] store = ellipse(780, 110 + 68, 110, 26, "Keep data off-server", IFACE);
-        double[] authz = ellipse(780, 110 + 68 * 3.5, 110, 26, "Authorize object access", IFACE);
+        for (String[] c : cases) { pos.put(c[0], ellipse(430, y, 170, 24, c[1], FILL)); y += 60; }
+        double[] store = ellipse(780, 110 + 60, 110, 26, "Keep data off-server", IFACE);
+        double[] authz = ellipse(780, 110 + 60 * 4.5, 110, 26, "Authorize object access", IFACE);
         actor(95, 300, "Student");
         actor(95, 600, "Administrator");
         actor(1040, 160, "rootz.so");
-        actor(1040, 110 + 68 * 7 - 20, "Push service");
-        for (String c : List.of("auth", "msg", "react", "group", "pulse", "social", "status", "notify")) {
+        actor(1040, 110 + 60 * 7 - 20, "Push service");
+        for (String c : List.of("auth", "msg", "react", "group", "pulse", "social", "status", "notify", "call")) {
             double[] p = pos.get(c);
             assocLine(120, 300, p[0] - p[2], p[1]);
         }
@@ -190,7 +191,7 @@ public class Diagrams {
         assocLine(store[0] + store[2], store[1], 1015, store[1]);
         edgeAt(msg[0] + msg[2] - 8, msg[1] + 6, store[0] - store[2] + 4, store[1] - 4, Kind.DEPEND, "«include»");
         boolean first = true;
-        for (String c : List.of("react", "group", "pulse", "social")) {
+        for (String c : List.of("react", "group", "pulse", "social", "call")) {
             double[] p = pos.get(c);
             edgeAt(p[0] + p[2] - 4, p[1], authz[0] - authz[2] + 2, authz[1], Kind.DEPEND, first ? "«include»" : "");
             first = false;
@@ -233,7 +234,7 @@ public class Diagrams {
         title("Figure 2 · Deployment: one server, every device, data off-server", W);
         node(40, 70, 300, 150, "Phone / laptop browser", "Website (HTML, CSS, JS)|Service worker: offline shell, push|IndexedDB chat cache (delta sync)|Installable as an app (PWA)");
         node(40, 300, 300, 120, "Swing desktop app", "ClientController + ServerLink|--url → WebSocket to the website|or direct TLS 1.3 socket (local)");
-        node(430, 160, 330, 260, "Render free web service (Docker)", "EmberServer (web-only, --no-tls)|WebGateway: files, /media, /health, WSS|ConnectionHandler per device|WebPush (RFC 8291 + VAPID)|WalStorageEngine + local cache disk|BlobStoreReplica (batch every 2 s)|JRE 21, ~40 MB RAM idle");
+        node(430, 160, 330, 260, "Render free web service (Docker)", "EmberServer (web-only, --no-tls)|WebGateway: files, /media, /health, WSS|ConnectionHandler per device|WebPush (RFC 8291 + VAPID)|WalStorageEngine + local cache disk|BlobStoreReplica (batch every 2 s)|JRE 21, ~64 MB RAM idle (measured locally)");
         node(850, 70, 270, 120, "rootz.so  ·  folder \"ember\"", "ember/data: log + snapshots|ember/media: images|AES-256-GCM encrypted, GZIP");
         node(850, 260, 270, 100, "Browser push services", "FCM · Mozilla · WNS · APNs|wake the browser's service worker|when no Ember tab is open");
         node(850, 430, 270, 90, "UptimeRobot (free)", "GET /health every 5 minutes|keeps the free service awake");
@@ -354,9 +355,19 @@ public class Diagrams {
 
     static void sequence(String dir) throws Exception {
         String[] who = {"Alice (website)", "ConnectionHandler", "StorageEngine", "BlobStoreReplica", "rootz.so", "Bob's online device", "WebPush", "Push service"};
-        int W = 1240, H = 700;
+        Object[][] steps = {
+            {0, 1, "CMD_MSG_SEND (WSS frame)", false}, {1, 2, "appendMessage(): seq + revision", false},
+            {2, 3, "appendLog(record)", false}, {1, 0, "EVT_MSG_ACK (sent)", true},
+            {1, 5, "EVT_MSG_DELIVER (every device)", true}, {5, 1, "CMD_MSG_RECEIPT READ", false},
+            {1, 0, "EVT_RECEIPT_UPDATE (read)", true}, {1, 6, "pushIfAway(offline recipient)", false},
+            {6, 7, "POST aes128gcm + VAPID", false}, {7, 7, "shows notification|Reply / Mark read", true},
+            {3, 4, "every 2 s: encrypted batch upload", false}};
+        sequenceDiagram(who, steps, 1240, 700, 50, dir + "/fig5-sequence.png");
+    }
+
+    /** A sequence diagram: lifelines, then numbered messages (a self-message is drawn as a note). */
+    static void sequenceDiagram(String[] who, Object[][] steps, int W, int H, double step, String file) throws Exception {
         BufferedImage img = canvas(W, H);
-        title("Figure 5 · Send → deliver → read, with off-server copy and push", W);
         double gap = (W - 180) / (double) (who.length - 1);
         double[] x = new double[who.length];
         for (int i = 0; i < who.length; i++) {
@@ -372,26 +383,24 @@ public class Diagrams {
             g.draw(new Line2D.Double(x[i], 78, x[i], H - 20));
             g.setStroke(new BasicStroke(1.1f));
         }
-        Object[][] steps = {
-            {0, 1, "CMD_MSG_SEND (WSS frame)", false}, {1, 2, "appendMessage(): seq + revision", false},
-            {2, 3, "appendLog(record)", false}, {1, 0, "EVT_MSG_ACK (sent)", true},
-            {1, 5, "EVT_MSG_DELIVER (every device)", true}, {5, 1, "CMD_MSG_RECEIPT READ", false},
-            {1, 0, "EVT_RECEIPT_UPDATE (read)", true}, {1, 6, "pushIfAway(offline recipient)", false},
-            {6, 7, "POST aes128gcm + VAPID", false}, {7, 7, "notification: Reply / Mark read", true},
-            {3, 4, "every 2 s: encrypted batch upload", false}};
         double y = 115;
         int n = 1;
         for (Object[] s : steps) {
             int a = (int) s[0], b = (int) s[1];
             boolean reply = (boolean) s[3];
             if (a == b) {
-                g.setColor(NOTE);
-                g.fill(new RoundRectangle2D.Double(x[a] - 130, y - 14, 125, 34, 8, 8));
-                g.setColor(INK);
-                g.draw(new RoundRectangle2D.Double(x[a] - 130, y - 14, 125, 34, 8, 8));
+                String[] note = ((String) s[2]).split("\\|");
                 g.setFont(LABEL);
-                g.drawString(n++ + ". shows notification", (float) (x[a] - 124), (float) (y));
-                g.drawString("Reply / Mark read", (float) (x[a] - 124), (float) (y + 13));
+                double nw = 0;
+                for (String t : note) nw = Math.max(nw, g.getFontMetrics().stringWidth(t) + 26);
+                double nx = x[a] + 8 + nw > W - 4 ? x[a] - 8 - nw : x[a] + 8;
+                g.setColor(NOTE);
+                g.fill(new RoundRectangle2D.Double(nx, y - 14, nw, 8 + 13 * note.length, 8, 8));
+                g.setColor(INK);
+                g.draw(new RoundRectangle2D.Double(nx, y - 14, nw, 8 + 13 * note.length, 8, 8));
+                for (int i = 0; i < note.length; i++) {
+                    g.drawString((i == 0 ? n++ + ". " : "    ") + note[i], (float) (nx + 6), (float) (y + i * 13));
+                }
             } else {
                 line(new Point2D.Double(x[a], y), new Point2D.Double(x[b], y), reply ? Kind.DEPEND : Kind.ASSOC, null);
                 g.setFont(LABEL);
@@ -400,10 +409,141 @@ public class Diagrams {
                 double tx = Math.min(x[a], x[b]) + 8;
                 g.drawString(text, (float) tx, (float) (y - 5));
             }
-            y += 50;
+            y += step;
         }
-        save(img, dir + "/fig5-sequence.png");
+        save(img, file);
     }
+
+    static void callSequence(String dir) throws Exception {
+        String[] who = {"Alice (website)", "EmberServer + CallRegistry", "Bob (desktop app)", "Bob (website tab)"};
+        Object[][] steps = {
+            {0, 1, "CALL ring (dm:alice:bob)", false}, {1, 2, "ring", true},
+            {2, 1, "accept", false}, {1, 0, "joined (bob)", true},
+            {0, 2, "key: fresh ECDH P-256 public half (the server only forwards it)", false},
+            {2, 0, "relay info sealed with the pair key: sender key, codecs [4, 3, 2], v: 2", false},
+            {0, 2, "voice packets, sender-key encrypted; the server stamps the sender", false},
+            {2, 2, "Video on website|opens ?join=<callId>", false},
+            {3, 1, "handoff-prepare (callId)", false}, {1, 3, "handoff-ready: single-use ticket, 30 s", true},
+            {3, 3, "Join call clicked|camera + mic allowed", false},
+            {3, 1, "handoff-commit (ticket): first commit wins", false}, {1, 3, "roster (alice)", true},
+            {1, 2, "end, reason = elsewhere", true}, {1, 0, "moved (bob)", true},
+            {0, 3, "new pair key + new sender key; new safety code on both screens", false},
+            {3, 0, "voice + video over the relay (ladder 180p to 720p)", false}};
+        sequenceDiagram(who, steps, 1180, 760, 37, dir + "/fig6-call-sequence.png");
+    }
+
+    static void state(double x, double y, double w, String name, String sub) {
+        double h = sub.isEmpty() ? 34 : 46;
+        g.setColor(FILL);
+        g.fill(new RoundRectangle2D.Double(x, y, w, h, 18, 18));
+        g.setColor(INK);
+        g.setStroke(new BasicStroke(1.3f));
+        g.draw(new RoundRectangle2D.Double(x, y, w, h, 18, 18));
+        center(name, NAME, x + w / 2, y + 21);
+        if (!sub.isEmpty()) center(sub, LABEL, x + w / 2, y + 36);
+    }
+
+    static void dot(double x, double y, boolean end) {
+        g.setColor(INK);
+        if (end) {
+            g.draw(new Ellipse2D.Double(x - 10, y - 10, 20, 20));
+            g.fill(new Ellipse2D.Double(x - 6, y - 6, 12, 12));
+        } else {
+            g.fill(new Ellipse2D.Double(x - 8, y - 8, 16, 16));
+        }
+    }
+
+    static void callStates(String dir) throws Exception {
+        int W = 1180, H = 640;
+        BufferedImage img = canvas(W, H);
+        g.setColor(INK);
+        center("Call lifecycle (desktop CallSession.State)", NAME, 300, 30);
+        dot(300, 70, false);
+        state(60, 120, 180, "RINGING_OUT", "caller, ringing");
+        state(360, 120, 180, "RINGING_IN", "callee, ringing");
+        state(210, 260, 180, "CONNECTING", "pair keys, relay info");
+        state(210, 400, 180, "ACTIVE", "voice flows");
+        state(420, 530, 140, "ENDED", "");
+        edgeAt(292, 76, 160, 120, Kind.ASSOC, "ring");
+        edgeAt(308, 76, 450, 120, Kind.ASSOC, "incoming ring");
+        edgeAt(150, 166, 260, 260, Kind.ASSOC, "joined");
+        edgeAt(450, 166, 340, 260, Kind.ASSOC, "accept");
+        edgeAt(300, 306, 300, 400, Kind.ASSOC, "first voice frame");
+        edgeAt(330, 446, 440, 532, Kind.ASSOC, "hang up / end / elsewhere");
+        g.setColor(EDGE);
+        g.setStroke(new BasicStroke(1.1f));
+        g.draw(new Line2D.Double(70, 166, 70, 547));
+        edgeAt(70, 547, 420, 547, Kind.ASSOC, "no answer (45 s)");
+        edgeAt(520, 166, 520, 530, Kind.ASSOC, "declined");
+        dot(490, 610, true);
+        edgeAt(490, 564, 490, 598, Kind.ASSOC, "");
+        g.setFont(ITAL);
+        g.setColor(INK);
+        g.drawString("on moved: re-key,", 88f, 420f);
+        g.drawString("stays ACTIVE", 88f, 434f);
+
+        double lx = 720;
+        center("Relay video ladder (quality.js Ladder, checked every second)", NAME, 920, 30);
+        String[][] rungs = {{"720p / 30 fps", "1800 kbit/s"}, {"540p / 30 fps", "1100 kbit/s"}, {"360p / 25 fps", "600 kbit/s (start)"},
+                {"270p / 20 fps", "300 kbit/s"}, {"180p / 15 fps", "150 kbit/s (floor)"}};
+        for (int i = 0; i < rungs.length; i++) {
+            state(lx, 60 + i * 100, 200, rungs[i][0], rungs[i][1]);
+            if (i > 0) {
+                edgeAt(lx + 55, 60 + i * 100, lx + 55, 60 + (i - 1) * 100 + 46, Kind.ASSOC, "6 s calm");
+                edgeAt(lx + 145, 60 + (i - 1) * 100 + 46, lx + 145, 60 + i * 100, Kind.ASSOC, "trouble");
+            }
+        }
+        dot(lx - 40, 283, false);
+        edgeAt(lx - 32, 283, lx, 283, Kind.ASSOC, "");
+        g.setFont(BODY);
+        g.setColor(INK);
+        String[] notes = {"Trouble = frames skipped for a backed-up", "socket, round trip up > 150 ms, or", "> 10 % of frames late or lost.", "",
+            "Down: at once, from the rung in use.", "Up: one rung after 6 s without trouble.", "A rung that failed waits 12 s, 24 s,", "... up to 60 s before another try.", "",
+            "Never above min(camera, mode,", "the other side's display)."};
+        for (int i = 0; i < notes.length; i++) g.drawString(notes[i], (float) (lx + 225), (float) (80 + i * 17));
+        save(img, dir + "/fig7-call-states.png");
+    }
+
+    static void crc(double x, double y, double w, double h, String name, String[] resp, String[] collab) {
+        g.setColor(Color.WHITE);
+        g.fill(new Rectangle2D.Double(x, y, w, h));
+        g.setColor(FILL);
+        g.fill(new Rectangle2D.Double(x, y, w, 26));
+        g.setColor(INK);
+        g.setStroke(new BasicStroke(1.3f));
+        g.draw(new Rectangle2D.Double(x, y, w, h));
+        center(name, NAME, x + w / 2, y + 18);
+        g.draw(new Line2D.Double(x, y + 26, x + w, y + 26));
+        double split = x + w * 0.6;
+        g.draw(new Line2D.Double(split, y + 26, split, y + h));
+        g.setFont(ITAL);
+        g.drawString("Responsibilities", (float) (x + 6), (float) (y + 41));
+        g.drawString("Collaborators", (float) (split + 6), (float) (y + 41));
+        g.setFont(BODY);
+        for (int i = 0; i < resp.length; i++) g.drawString(resp[i], (float) (x + 6), (float) (y + 58 + i * 15));
+        for (int i = 0; i < collab.length; i++) g.drawString(collab[i], (float) (split + 6), (float) (y + 58 + i * 15));
+    }
+
+    static void callCrc(String dir) throws Exception {
+        int W = 1180, H = 360;
+        BufferedImage img = canvas(W, H);
+        double w = 280, h = 148, gx = 12, gy = 14;
+        Object[][] cards = {
+            {"CallSession (desktop)", new String[] {"ring, accept, end", "pair keys, sender key", "safety codes", "hand-off link; re-key on moved"}, new String[] {"ClientController", "VoiceEngine", "E2eCrypto", "CallDialog"}},
+            {"VoiceEngine", new String[] {"capture, clean, resample", "encode, send 20 ms frames", "mix everyone's voice", "reopen a lost device"}, new String[] {"AudioDevices", "AudioCodec", "JitterBuffer", "Resampler", "Transport"}},
+            {"JitterBuffer", new String[] {"order frames by sequence", "adapt delay 40-200 ms", "conceal a missing frame", "trim a backlog (25 max)"}, new String[] {"AudioFrame", "Clock", "VoiceEngine"}},
+            {"AudioCodec (interface)", new String[] {"encode / decode a frame", "sample rate, frame size", "fresh copy per call"}, new String[] {"AdpcmCodec", "MulawCodec", "CodecFactory"}},
+            {"CodecFactory", new String[] {"choose the send codec:", "my preference that the", "other side can decode"}, new String[] {"QualityPolicy", "AudioCodec"}},
+            {"QualityPolicy (abstract)", new String[] {"per mode: voice rate,", "Opus bitrate, video ceiling,", "follow the display or not"}, new String[] {"DataSaver", "Auto, Max", "QualityMode", "CodecFactory"}},
+            {"CallRegistry (server)", new String[] {"who is in which call", "ring timeout, one call each", "hand-off tickets (30 s)", "media and signal limits"}, new String[] {"EmberServer", "TokenBucket"}},
+            {"Ladder (website)", new String[] {"network estimate each second", "step down at once", "step up after calm", "back off failed rungs"}, new String[] {"relayLimit", "call.js"}}};
+        for (int i = 0; i < cards.length; i++) {
+            double x = 20 + (i % 4) * (w + gx), y = 20 + (i / 4) * (h + gy);
+            crc(x, y, w, h, (String) cards[i][0], (String[]) cards[i][1], (String[]) cards[i][2]);
+        }
+        save(img, dir + "/fig8-call-crc.png");
+    }
+
 
     public static void main(String[] args) throws Exception {
         String dir = args[0];
@@ -413,5 +553,8 @@ public class Diagrams {
         serverClasses(dir);
         clientClasses(dir);
         sequence(dir);
+        callSequence(dir);
+        callStates(dir);
+        callCrc(dir);
     }
 }
