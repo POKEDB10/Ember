@@ -89,6 +89,36 @@ public final class AuthService {
         return user.get();
     }
 
+    /** An email nobody uses: spends the same hashing time as a real check, then fails the same way. */
+    public void failLogin(char[] password) throws AuthenticationException, RateLimitedException {
+        acquireHashSlot();
+        try {
+            passwordHasher.verify(password, passwordHasher.dummyHash());
+        } finally {
+            hashSlots.release();
+        }
+        throw new AuthenticationException(LOGIN_ERROR);
+    }
+
+    /** Sets a new password after the owner proved their email with a one-time code. */
+    public UserRecord resetPassword(String username, char[] newPassword)
+            throws IOException, ValidationException, AuthenticationException, RateLimitedException {
+        char[] checkedPassword = InputValidator.validatePassword(newPassword);
+        UserRecord user = storage.findUser(username).orElseThrow(() -> new AuthenticationException(LOGIN_ERROR));
+        String passwordHash;
+        acquireHashSlot();
+        try {
+            passwordHash = passwordHasher.hash(checkedPassword);
+        } finally {
+            hashSlots.release();
+        }
+        UserRecord updated = new UserRecord(user.userId(), user.username(), user.displayName(), passwordHash);
+        storage.updateUser(updated);
+        locks.unlock(username);
+        log("authn_password_reset", username, "email_code");
+        return updated;
+    }
+
     public boolean unlock(String username) { return locks.unlock(username); }
 
     public java.util.List<String> lockedUsers() { return locks.lockedUsers(); }

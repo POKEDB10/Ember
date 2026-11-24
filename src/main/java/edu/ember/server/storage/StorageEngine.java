@@ -88,6 +88,12 @@ public interface StorageEngine extends AutoCloseable {
      */
     default java.util.Set<String> contactsOf(String userId) throws IOException { return java.util.Set.of(); }
     default void saveSetting(String key, String value) throws IOException { }
+    /** Replaces an existing account (a new password hash after a reset). */
+    default void updateUser(UserRecord user) throws IOException { throw new IOException("Updating accounts is not supported"); }
+    /** Removes a post with its likes and comments. */
+    default void deletePost(String postId) throws IOException { throw new IOException("Deleting posts is not supported"); }
+    /** Removes a story before it expires. */
+    default void deleteStory(String storyId) throws IOException { throw new IOException("Deleting stories is not supported"); }
     default Optional<String> setting(String key) throws IOException { return Optional.empty(); }
     /** Copies a stored media file off-server, when the engine has a replica. */
     default void mirrorMedia(String name, byte[] bytes) { }

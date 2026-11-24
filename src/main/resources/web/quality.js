@@ -239,7 +239,7 @@ function parseControl(msg) {
   const num = (x, lo, hi) => (typeof x === 'number' && Number.isFinite(x) ? Math.round(Math.max(lo, Math.min(hi, x))) : null);
   switch (msg.t) {
     case 'caps': {
-      const features = Array.isArray(msg.features) ? msg.features.filter((f) => ['disp', 'vstat', 'vpause', 'vkey'].includes(f)).slice(0, 8) : [];
+      const features = Array.isArray(msg.features) ? msg.features.filter((f) => ['disp', 'vstat', 'vpause', 'vkey', 'state'].includes(f)).slice(0, 8) : [];
       return { t: 'caps', codecs: peerDecodes(msg), features, maxVideo: num(msg.maxVideo, 0, 4320) || 0 };
     }
     case 'disp': {
@@ -253,12 +253,41 @@ function parseControl(msg) {
     }
     case 'vpause': return typeof msg.paused === 'boolean' ? { t: 'vpause', paused: msg.paused } : null;
     case 'vkey': return { t: 'vkey' };
+    // What the others should show for me: camera on or off, microphone, raised hand.
+    case 'state': return typeof msg.cam === 'boolean' && typeof msg.mic === 'boolean' && typeof msg.hand === 'boolean'
+      ? { t: 'state', cam: msg.cam, mic: msg.mic, hand: msg.hand } : null;
     default: return null;
   }
 }
 
 /** Minimum gap between control messages of one type from one peer (anything faster is dropped). */
-const CONTROL_GAP_MS = { caps: 1000, disp: 200, vstat: 1000, vpause: 200, vkey: 1000 };
+const CONTROL_GAP_MS = { caps: 1000, disp: 200, vstat: 1000, vpause: 200, vkey: 1000, state: 150 };
+
+/**
+ * Relay queue guard. Over the relay, a proxy or tunnel on the way (Cloudflare, for one) can hold
+ * seconds of video in its buffers, and the sender's own socket never shows it. The relay round
+ * trip does: anything above the call's best round trip is time spent queued. Past HIGH_MS the
+ * sender stops video (voice keeps going) until the queue is down to LOW_MS, then resumes one rung
+ * lower with a key frame. Returns 'drain', 'resume' or null.
+ */
+const GUARD = { HIGH_MS: 400, LOW_MS: 150, CALM_MS: 10000, MAX_HOLD_MS: 8000 };
+function queueGuard(state, rttMs, minRttMs, nowMs = 0) {
+  if (!(rttMs > 0) || !(minRttMs > 0)) return null;
+  const queued = rttMs - minRttMs;
+  if (!state.draining && queued > GUARD.HIGH_MS) {
+    // Backed up again soon after resuming: the link cannot carry video right now, so wait longer
+    // before the next try (2, 4, then 8 s). A calm spell resets the wait.
+    const soon = state.resumedAt != null && nowMs - state.resumedAt < GUARD.CALM_MS;
+    state.holdMs = soon ? Math.min(GUARD.MAX_HOLD_MS, Math.max(2000, (state.holdMs || 0) * 2)) : 0;
+    state.draining = true; state.drainedAt = nowMs;
+    return 'drain';
+  }
+  if (state.draining && queued < GUARD.LOW_MS && nowMs - state.drainedAt >= state.holdMs) {
+    state.draining = false; state.resumedAt = nowMs;
+    return 'resume';
+  }
+  return null;
+}
 
 function allowControl(last, type, now) {
   if (now - (last[type] ?? -Infinity) < (CONTROL_GAP_MS[type] ?? 1000)) return false;
@@ -268,5 +297,5 @@ function allowControl(last, type, now) {
 
 if (typeof module !== 'undefined') {
   module.exports = { AC, LADDER, QUALITY, qualityFor, pickVoiceCodec, peerDecodes, adpcmEncode, adpcmDecode, makeResampler,
-    rungAtMost, rungAtLeast, relayLimit, directLimit, directBitrate, Ladder, relayTrouble, parseControl, allowControl };
+    rungAtMost, rungAtLeast, relayLimit, directLimit, directBitrate, Ladder, relayTrouble, parseControl, allowControl, queueGuard, GUARD };
 }

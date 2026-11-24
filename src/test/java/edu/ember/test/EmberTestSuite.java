@@ -115,6 +115,13 @@ public final class EmberTestSuite {
         runTest("calls v2: hand-off is single-use, short-lived, same person only, first commit wins", this::testCallHandoff);
         runTest("calls v2: Speaker mode ducks the mic only while the other person is heard", this::testSpeakerMode);
         runTest("end-to-end chats: tamper, impostor and outsider refused; server sees only ciphertext", this::testEndToEndChat);
+        runTest("account key backup: opens with the password only, reads the account's messages", this::testKeyBackupCrypto);
+        runTest("email codes: single use, 5 guesses, 10 minutes, throttled, hashed addresses", this::testEmailCodes);
+        runTest("SMTP client: envelope, dot-stuffing, no header injection, no password without TLS", this::testSmtpMailer);
+        runTest("email accounts: sign-up code, sign-in by email, reset signs out others, key backup rules",
+                this::testEmailAccountsAndKeyBackup);
+        runTest("owners delete posts and stories; others cannot; deleted media stops loading", this::testDeletePostsAndStories);
+        runTest("post and story deletes and password changes survive a restart", this::testDeleteSurvivesRestart);
         runTest("theme palettes, wrapped message bodies, and EDT notifications",
                 this::testUiBasics);
         runTest("WAL restart recovers Arabic and emoji records and trims torn tail",
@@ -1987,6 +1994,349 @@ public final class EmberTestSuite {
             if (aliceApp != null) { aliceApp.close(); }
             if (bobApp != null) { bobApp.close(); }
             server.close();
+        }
+    }
+
+    /** Sends one command over a plain WebSocket and returns the reply with the same correlation id. */
+    private static WireFrame wsAsk(java.net.Socket socket, int opcode, long corr, Map<String, String> fields) throws Exception {
+        wsSend(socket.getOutputStream(), FrameFactory.command(opcode, corr, fields));
+        var in = socket.getInputStream();
+        while (true) {
+            int first = in.read();
+            long length = in.read() & 0x7F;
+            if (first < 0) {
+                throw new IOException("WebSocket closed");
+            }
+            if (length == 126) {
+                length = (in.read() << 8) | in.read();
+            } else if (length == 127) {
+                length = 0;
+                for (int index = 0; index < 8; index++) {
+                    length = (length << 8) | in.read();
+                }
+            }
+            WireFrame frame = FrameCodec.readFrame(new ByteArrayInputStream(in.readNBytes((int) length)), Integer.MAX_VALUE);
+            if (frame.correlationId() == corr) {
+                return frame;
+            }
+        }
+    }
+
+    private static Map<String, String> fieldsOf(WireFrame frame) {
+        return KvPayloadCodec.decode(frame.payload());
+    }
+
+    private static String codeIn(String[] mail) {
+        var matcher = java.util.regex.Pattern.compile("\\b(\\d{6})\\b").matcher(mail[2]);
+        assertTrue(matcher.find(), "No 6-digit code in the email: " + mail[1]);
+        return matcher.group(1);
+    }
+
+    /** One-time codes: single use, 5 guesses, 10 minutes, one email a minute per purpose; hashes only. */
+    private void testEmailCodes() throws Exception {
+        var codes = new edu.ember.server.EmailCodes(new byte[32]);
+        String email = edu.ember.server.EmailCodes.normalize("  Alice@Example.COM ");
+        assertEquals("alice@example.com", email, "Email was not normalized");
+        assertTrue(!codes.hash(email).contains("alice"), "The stored form contains the address");
+        for (String bad : new String[] {"alice", "a@b", "a b@c.de", "@c.de", "a@@c.de", "x".repeat(250) + "@c.de"}) {
+            boolean refused = false;
+            try {
+                edu.ember.server.EmailCodes.normalize(bad);
+            } catch (edu.ember.common.exceptions.ValidationException expected) {
+                refused = true;
+            }
+            assertTrue(refused, "A bad email was accepted: " + bad);
+        }
+        String code = codes.issue("reset", email, 0);
+        assertTrue(code.matches("\\d{6}"), "Code is not 6 digits");
+        boolean throttled = false;
+        try {
+            codes.issue("reset", email, 30_000);
+        } catch (edu.ember.common.exceptions.RateLimitedException expected) {
+            throttled = true;
+        }
+        assertTrue(throttled, "A second code within a minute was sent");
+        String other = String.format("%06d", (Integer.parseInt(code) + 1) % 1_000_000);
+        assertTrue(!codes.verify("register", email, code, 1000), "A code worked for another purpose");
+        assertTrue(!codes.verify("reset", email, other, 1000), "A wrong code was accepted");
+        assertTrue(codes.verify("reset", email, code, 2000), "The right code was refused");
+        assertTrue(!codes.verify("reset", email, code, 3000), "A code worked twice");
+        String fresh = codes.issue("reset", email, 70_000);
+        String wrong = String.format("%06d", (Integer.parseInt(fresh) + 1) % 1_000_000);
+        for (int guess = 0; guess < 5; guess++) {
+            assertTrue(!codes.verify("reset", email, wrong, 71_000), "A wrong guess was accepted");
+        }
+        assertTrue(!codes.verify("reset", email, fresh, 72_000), "The code still worked after 5 wrong guesses");
+        String late = codes.issue("reset", email, 200_000);
+        assertTrue(!codes.verify("reset", email, late, 200_000 + 10 * 60_000 + 1), "An expired code was accepted");
+    }
+
+    /** The SMTP client against a local fake server: the conversation, dot-stuffing, header injection refused. */
+    private void testSmtpMailer() throws Exception {
+        try (java.net.ServerSocket fake = new java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+            List<String> heard = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+            Thread smtp = new Thread(() -> {
+                try (java.net.Socket client = fake.accept()) {
+                    var reader = new java.io.BufferedReader(new java.io.InputStreamReader(client.getInputStream(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+                    var writer = client.getOutputStream();
+                    java.util.function.Consumer<String> say = line -> {
+                        try {
+                            writer.write((line + "\r\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                            writer.flush();
+                        } catch (IOException ignored) {
+                            // the test fails on its own if this happens
+                        }
+                    };
+                    say.accept("220 fake ESMTP");
+                    boolean data = false;
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        heard.add(line);
+                        if (data) {
+                            if (line.equals(".")) {
+                                data = false;
+                                say.accept("250 queued");
+                            }
+                        } else if (line.startsWith("EHLO")) {
+                            say.accept("250-fake");
+                            say.accept("250 8BITMIME");
+                        } else if (line.equals("DATA")) {
+                            data = true;
+                            say.accept("354 go");
+                        } else if (line.equals("QUIT")) {
+                            say.accept("221 bye");
+                            return;
+                        } else {
+                            say.accept("250 ok");
+                        }
+                    }
+                } catch (IOException ignored) {
+                    // checked below through what was heard
+                }
+            });
+            smtp.start();
+            new edu.ember.server.SmtpMailer("127.0.0.1", fake.getLocalPort(), edu.ember.server.SmtpMailer.Security.NONE,
+                    null, null, "ember@example.com").send("alice@example.com", "Your Ember code: 123456",
+                    "line one\n.starts with a dot\nend");
+            smtp.join(5000);
+            assertTrue(heard.contains("MAIL FROM:<ember@example.com>") && heard.contains("RCPT TO:<alice@example.com>"),
+                    "Envelope was wrong: " + heard);
+            assertTrue(heard.contains("Subject: Your Ember code: 123456"), "Subject missing");
+            assertTrue(heard.contains("..starts with a dot") && heard.contains("QUIT"), "Dot-stuffing or QUIT missing: " + heard);
+        }
+        boolean injected = false;
+        try {
+            new edu.ember.server.SmtpMailer("127.0.0.1", 1, edu.ember.server.SmtpMailer.Security.NONE, null, null,
+                    "ember@example.com").send("alice@example.com", "hi\r\nBcc: everyone@example.com", "x");
+        } catch (IOException expected) {
+            injected = expected.getMessage().contains("Line breaks");
+        }
+        assertTrue(injected, "A header with a line break was not refused");
+        boolean plainPassword = false;
+        try {
+            new edu.ember.server.SmtpMailer("127.0.0.1", 25, edu.ember.server.SmtpMailer.Security.NONE, "user", "pass", "a@b.cd");
+        } catch (IllegalArgumentException expected) {
+            plainPassword = true;
+        }
+        assertTrue(plainPassword, "An SMTP password could be sent without TLS");
+    }
+
+    /**
+     * Email accounts end to end over the web protocol: sign-up needs the emailed code, sign-in by
+     * email, an email already in use gets a notice (never a code), password reset by code signs out
+     * the other devices, and the account key backup is only set by a password sign-in.
+     */
+    private void testEmailAccountsAndKeyBackup() throws Exception {
+        Path temporary = Files.createTempDirectory("ember-email");
+        InMemoryStorageEngine storage = new InMemoryStorageEngine();
+        EmberServer server = new EmberServer(null, null, 0, storage,
+                new SecurityAuditLogger(temporary.resolve("audit.json")), temporary.resolve("media"),
+                86_400, java.util.Set.of(), "127.0.0.1");
+        java.util.concurrent.BlockingQueue<String[]> mails = new java.util.concurrent.LinkedBlockingQueue<>();
+        server.setMailer((to, subject, body) -> mails.add(new String[] {to, subject, body}));
+        try {
+            server.start();
+            int port = server.startHttp(0);
+            try (java.net.Socket a = webSocket(port); java.net.Socket b = webSocket(port)) {
+                assertEquals(WireOpcodes.EVT_EMAIL, wsAsk(a, WireOpcodes.CMD_EMAIL_CODE, 1,
+                        Map.of("purpose", "register", "email", "Alice@Example.com")).opcode(), "No reply to a code request");
+                String[] mail = mails.poll(5, TimeUnit.SECONDS);
+                assertTrue(mail != null && mail[0].equals("alice@example.com"), "No sign-up code was emailed");
+                String code = codeIn(mail);
+                String wrong = String.format("%06d", (Integer.parseInt(code) + 1) % 1_000_000);
+                var refused = fieldsOf(wsAsk(a, WireOpcodes.CMD_AUTH_REGISTER, 2, Map.of("user", "alice",
+                        "pass", "alice-pass-42", "displayName", "Alice", "email", "alice@example.com", "code", wrong)));
+                assertEquals("400", refused.get("code"), "Sign-up with a wrong code was not refused");
+                var ok = fieldsOf(wsAsk(a, WireOpcodes.CMD_AUTH_REGISTER, 3, Map.of("user", "alice",
+                        "pass", "alice-pass-42", "displayName", "Alice", "email", " alice@example.COM", "code", code)));
+                assertEquals("alice", ok.get("userId"), "Sign-up with the emailed code failed");
+                assertEquals("true", ok.get("email"), "AUTH_OK did not say an email is linked");
+                assertTrue(!storage.setting("useremail:alice").orElse("@").contains("@"), "The server stored the address");
+
+                // The same email again within a minute: throttled. Bob (no email) asks to link Alice's: a notice, no code.
+                assertEquals("429", fieldsOf(wsAsk(b, WireOpcodes.CMD_EMAIL_CODE, 4,
+                        Map.of("purpose", "register", "email", "alice@example.com"))).get("code"), "Codes were not throttled");
+                assertEquals("bob", fieldsOf(wsAsk(b, WireOpcodes.CMD_AUTH_REGISTER, 5,
+                        Map.of("user", "bob", "pass", "bob-pass-42", "displayName", "Bob"))).get("userId"),
+                        "Sign-up without an email (desktop app) stopped working");
+                wsAsk(b, WireOpcodes.CMD_EMAIL_CODE, 6, Map.of("purpose", "link", "email", "alice@example.com"));
+                String[] notice = mails.poll(5, TimeUnit.SECONDS);
+                assertTrue(notice != null && !notice[1].contains("code") && !notice[2].matches("(?s).*\\b\\d{6}\\b.*"),
+                        "An email in use received a code for someone else");
+
+                // Sign in by email; a wrong password and an unknown email fail the same way.
+                try (java.net.Socket c = webSocket(port)) {
+                    assertEquals("401", fieldsOf(wsAsk(c, WireOpcodes.CMD_AUTH_LOGIN, 7,
+                            Map.of("user", "nobody@example.com", "pass", "whatever-42"))).get("code"), "Unknown email not refused");
+                    assertEquals("401", fieldsOf(wsAsk(c, WireOpcodes.CMD_AUTH_LOGIN, 8,
+                            Map.of("user", "alice@example.com", "pass", "wrong-pass-42"))).get("code"), "Wrong password not refused");
+                    assertEquals("alice", fieldsOf(wsAsk(c, WireOpcodes.CMD_AUTH_LOGIN, 9,
+                            Map.of("user", "ALICE@example.com", "pass", "alice-pass-42"))).get("userId"), "Sign-in by email failed");
+                }
+
+                // Key backup: set once by a password sign-in, then only replaced on request.
+                String backup = "kb1." + "d".repeat(22) + "." + "p".repeat(87) + "." + "s".repeat(22) + "." + "i".repeat(16)
+                        + "." + "c".repeat(206);
+                assertEquals(WireOpcodes.EVT_KEYS, wsAsk(a, WireOpcodes.CMD_DEVICE_KEY, 10, Map.of("deviceId", "d".repeat(22),
+                        "action", "backup", "backup", backup)).opcode(), "The key backup was not stored");
+                assertEquals("409", fieldsOf(wsAsk(a, WireOpcodes.CMD_DEVICE_KEY, 11, Map.of("deviceId", "d".repeat(22),
+                        "action", "backup", "backup", backup.replace('c', 'e')))).get("code"), "A backup was overwritten silently");
+                assertEquals("400", fieldsOf(wsAsk(a, WireOpcodes.CMD_DEVICE_KEY, 12, Map.of("deviceId", "d".repeat(22),
+                        "action", "backup", "backup", "kb1.not-a-backup"))).get("code"), "A malformed backup was accepted");
+                assertEquals(backup, storage.setting("keybackup:alice").orElse(""), "The backup changed");
+                String token = ok.get("token");
+                try (java.net.Socket resumed = webSocket(port)) {
+                    var again = fieldsOf(wsAsk(resumed, WireOpcodes.CMD_AUTH_RESUME, 13,
+                            Map.of("token", token, "lastGlobalSeq", "0")));
+                    assertEquals(backup, again.get("keyBackup"), "AUTH_OK did not carry the key backup");
+                    assertEquals("403", fieldsOf(wsAsk(resumed, WireOpcodes.CMD_DEVICE_KEY, 14, Map.of("deviceId", "d".repeat(22),
+                            "action", "backup", "backup", backup, "replace", "1"))).get("code"),
+                            "A resumed session (no password) replaced the key backup");
+                }
+
+                // Password reset: unknown address gets nothing; the right code sets the password and signs out others.
+                assertEquals(WireOpcodes.EVT_EMAIL, wsAsk(b, WireOpcodes.CMD_EMAIL_CODE, 15,
+                        Map.of("purpose", "reset", "email", "nobody@example.com")).opcode(), "Reset for an unknown email told apart");
+                assertTrue(mails.poll(400, TimeUnit.MILLISECONDS) == null, "A reset email went to an address with no account");
+                try (java.net.Socket d = webSocket(port)) {
+                    wsAsk(d, WireOpcodes.CMD_EMAIL_CODE, 16, Map.of("purpose", "reset", "email", "alice@example.com"));
+                    String resetCode = codeIn(mails.poll(5, TimeUnit.SECONDS));
+                    assertEquals("400", fieldsOf(wsAsk(d, WireOpcodes.CMD_PASSWORD_RESET, 17, Map.of("email", "alice@example.com",
+                            "code", String.format("%06d", (Integer.parseInt(resetCode) + 1) % 1_000_000),
+                            "pass", "brand-new-pass-1"))).get("code"), "A wrong reset code was accepted");
+                    assertEquals("alice", fieldsOf(wsAsk(d, WireOpcodes.CMD_PASSWORD_RESET, 18, Map.of("email", "alice@example.com",
+                            "code", resetCode, "pass", "brand-new-pass-1", "calls", "1"))).get("userId"), "Reset did not sign in");
+                    boolean closed = false;
+                    try {
+                        wsAsk(a, WireOpcodes.CMD_PING, 19, Map.of());
+                    } catch (IOException expected) {
+                        closed = true;
+                    }
+                    assertTrue(closed, "A device signed in with the old password stayed connected");
+                    assertEquals(WireOpcodes.EVT_KEYS, wsAsk(d, WireOpcodes.CMD_DEVICE_KEY, 20, Map.of("deviceId", "e".repeat(22),
+                            "action", "backup", "backup", backup.replace('d', 'e'), "replace", "1")).opcode(),
+                            "After a reset the new key could not replace the backup");
+                }
+                try (java.net.Socket e = webSocket(port)) {
+                    assertEquals("401", fieldsOf(wsAsk(e, WireOpcodes.CMD_AUTH_LOGIN, 21,
+                            Map.of("user", "alice", "pass", "alice-pass-42"))).get("code"), "The old password still worked");
+                    assertEquals("alice", fieldsOf(wsAsk(e, WireOpcodes.CMD_AUTH_LOGIN, 22,
+                            Map.of("user", "alice@example.com", "pass", "brand-new-pass-1"))).get("userId"), "The new password failed");
+                }
+            }
+        } finally {
+            server.close();
+        }
+    }
+
+    /** The account key backup: Java seals, Java opens, a wrong password or another account is refused. */
+    private void testKeyBackupCrypto() throws Exception {
+        var identity = edu.ember.common.security.E2eCrypto.newIdentity();
+        String backup = edu.ember.common.security.E2eCrypto.sealBackup("pass-word-42".toCharArray(), "alice", identity);
+        assertTrue(backup.matches("kb1\\.[A-Za-z0-9_-]{16,43}\\.[A-Za-z0-9_-]{87}\\.[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{100,400}"),
+                "Backup format does not match what the server accepts: " + backup.length());
+        var opened = edu.ember.common.security.E2eCrypto.openBackup("pass-word-42".toCharArray(), "alice", backup);
+        assertEquals(identity.deviceId(), opened.deviceId(), "Device id changed");
+        var bob = edu.ember.common.security.E2eCrypto.newIdentity();
+        var keys = List.of(new edu.ember.common.security.E2eCrypto.DeviceKey("alice", identity.deviceId(), identity.publicKey(), true),
+                new edu.ember.common.security.E2eCrypto.DeviceKey("bob", bob.deviceId(), bob.publicKey(), true));
+        String sealed = edu.ember.common.security.E2eCrypto.seal(bob, "dm:alice:bob", "bob", "m1", "hello all devices", keys);
+        assertEquals("hello all devices", edu.ember.common.security.E2eCrypto.open(opened, "dm:alice:bob", "bob", "m1", sealed, keys),
+                "A device that opened the backup could not read the account's messages");
+        for (String[] attempt : new String[][] {{"wrong-pass-42", "alice"}, {"pass-word-42", "mallory"}}) {
+            boolean refused = false;
+            try {
+                edu.ember.common.security.E2eCrypto.openBackup(attempt[0].toCharArray(), attempt[1], backup);
+            } catch (java.security.GeneralSecurityException expected) {
+                refused = true;
+            }
+            assertTrue(refused, "The backup opened with " + attempt[0] + " for " + attempt[1]);
+        }
+    }
+
+    /** Owners delete posts and stories; others cannot; deleted media stops loading, even by signed link. */
+    private void testDeletePostsAndStories() throws Exception {
+        Path temporary = Files.createTempDirectory("ember-delete");
+        InMemoryStorageEngine storage = new InMemoryStorageEngine();
+        EmberServer server = new EmberServer(null, null, 0, storage,
+                new SecurityAuditLogger(temporary.resolve("audit.json")), temporary.resolve("media"),
+                86_400, java.util.Set.of(), "127.0.0.1");
+        try {
+            server.start();
+            int port = server.startHttp(0);
+            try (java.net.Socket a = webSocket(port); java.net.Socket b = webSocket(port)) {
+                wsAsk(a, WireOpcodes.CMD_AUTH_REGISTER, 1, Map.of("user", "owner", "pass", "owner-pass-42", "displayName", "O"));
+                wsAsk(b, WireOpcodes.CMD_AUTH_REGISTER, 2, Map.of("user", "other", "pass", "other-pass-42", "displayName", "X"));
+                ByteArrayOutputStream jpeg = new ByteArrayOutputStream();
+                javax.imageio.ImageIO.write(new java.awt.image.BufferedImage(40, 30, java.awt.image.BufferedImage.TYPE_INT_RGB), "jpeg", jpeg);
+                String[] ids = new String[2];
+                for (int index = 0; index < 2; index++) {
+                    ids[index] = fieldsOf(wsAsk(a, WireOpcodes.CMD_MEDIA_UPLOAD, 3 + index, Map.of("fileName", "p.jpg",
+                            "data", java.util.Base64.getEncoder().encodeToString(jpeg.toByteArray())))).get("mediaId");
+                }
+                var post = fieldsOf(wsAsk(a, WireOpcodes.CMD_POST_CREATE, 5, Map.of("mediaId", ids[0], "caption", "bye soon")));
+                var story = fieldsOf(wsAsk(a, WireOpcodes.CMD_STORY_CREATE, 6, Map.of("mediaId", ids[1], "caption", "")));
+                String postId = post.get("post.0");
+                String storyId = story.get("story.0");
+                String link = post.get("src.0");
+                assertTrue(httpGet(port, link, "").startsWith("HTTP/1.1 200"), "The post picture did not load");
+                assertEquals("403", fieldsOf(wsAsk(b, WireOpcodes.CMD_POST_INTERACT, 7,
+                        Map.of("postId", postId, "action", "delete", "text", ""))).get("code"), "Someone else deleted a post");
+                assertEquals("403", fieldsOf(wsAsk(b, WireOpcodes.CMD_STORY_VIEW, 8,
+                        Map.of("action", "delete", "storyId", storyId))).get("code"), "Someone else deleted a story");
+                assertEquals(postId, fieldsOf(wsAsk(a, WireOpcodes.CMD_POST_INTERACT, 9,
+                        Map.of("postId", postId, "action", "delete", "text", ""))).get("deleted"), "The owner could not delete");
+                assertEquals("0", fieldsOf(wsAsk(a, WireOpcodes.CMD_STORY_VIEW, 10,
+                        Map.of("action", "delete", "storyId", storyId))).get("story.n"), "The story was still listed");
+                assertTrue(storage.findPost(postId, "owner").isEmpty(), "The post is still stored");
+                assertTrue(httpGet(port, link, "").startsWith("HTTP/1.1 404"), "A deleted post's signed link still loads");
+                assertEquals("404", fieldsOf(wsAsk(a, WireOpcodes.CMD_POST_INTERACT, 11,
+                        Map.of("postId", postId, "action", "like", "text", ""))).get("code"), "A deleted post can still be liked");
+            }
+        } finally {
+            server.close();
+        }
+    }
+
+    /** POST_DELETE and STORY_DELETE survive a restart (the WAL replays them). */
+    private void testDeleteSurvivesRestart() throws Exception {
+        Path directory = Files.createTempDirectory("ember-wal-delete");
+        try (WalStorageEngine wal = new WalStorageEngine(directory, true)) {
+            wal.init();
+            wal.saveUser(new edu.ember.common.model.UserRecord("u", "u", "U", "hash"));
+            wal.savePost(new edu.ember.common.model.SocialPost("p1", "u", "m1", "c", 1, 0, 0, false));
+            wal.savePost(new edu.ember.common.model.SocialPost("p2", "u", "m2", "c", 2, 0, 0, false));
+            wal.saveStory(new edu.ember.common.model.StoryItem("s1", "u", "m3", "", 1, Long.MAX_VALUE));
+            wal.deletePost("p1");
+            wal.deleteStory("s1");
+            wal.updateUser(new edu.ember.common.model.UserRecord("u", "u", "U", "new-hash"));
+        }
+        try (WalStorageEngine wal = new WalStorageEngine(directory, true)) {
+            wal.init();
+            assertTrue(wal.findPost("p1", "u").isEmpty() && wal.findPost("p2", "u").isPresent(), "Post delete not replayed");
+            assertTrue(wal.findStory("s1").isEmpty(), "Story delete not replayed");
+            assertEquals("new-hash", wal.findUser("u").orElseThrow().passwordHash(), "Password change not replayed");
         }
     }
 

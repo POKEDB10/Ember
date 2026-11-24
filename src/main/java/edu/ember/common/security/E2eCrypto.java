@@ -69,6 +69,56 @@ public final class E2eCrypto {
         return identity.privateKey().getEncoded();
     }
 
+    // ---- the account key backup: one key pair for all of an account's devices ----
+    /** PBKDF2 rounds for the backup key (OWASP 2023 figure for PBKDF2-HMAC-SHA256). */
+    public static final int BACKUP_ROUNDS = 600_000;
+    public static final String BACKUP_PREFIX = "kb1.";
+
+    /**
+     * Seals the account key with the password: {@code kb1.<device>.<public>.<salt>.<iv>.<sealed PKCS#8>}.
+     * The key is PBKDF2-SHA256(password, salt); account, device and public key are bound in as
+     * associated data. Same format as e2e.js, so the website and the desktop open each other's backups.
+     */
+    public static String sealBackup(char[] password, String userId, Identity identity) throws GeneralSecurityException {
+        byte[] salt = random(16);
+        byte[] iv = random(12);
+        byte[] sealed = aesGcm(true, backupKey(password, salt), iv, backupData(userId, identity.deviceId(),
+                identity.publicKey()), privateKeyBytes(identity));
+        return BACKUP_PREFIX + String.join(".", identity.deviceId(), identity.publicKey(), encode(salt), encode(iv),
+                encode(sealed));
+    }
+
+    /** Opens a backup; throws when the password is wrong or the backup was changed. */
+    public static Identity openBackup(char[] password, String userId, String backup) throws GeneralSecurityException {
+        String[] parts = backup == null || !backup.startsWith(BACKUP_PREFIX) ? new String[0]
+                : backup.substring(BACKUP_PREFIX.length()).split("\\.");
+        if (parts.length != 5) {
+            throw new GeneralSecurityException("Not a key backup");
+        }
+        byte[] pkcs8 = aesGcm(false, backupKey(password, decode(parts[2])), decode(parts[3]),
+                backupData(userId, parts[0], parts[1]), decode(parts[4]));
+        return loadIdentity(parts[0], pkcs8, parts[1]);
+    }
+
+    /** The device id inside a backup (null when it is not one), without opening it. */
+    public static String backupDeviceId(String backup) {
+        return backup == null || !backup.startsWith(BACKUP_PREFIX) ? null
+                : backup.substring(BACKUP_PREFIX.length()).split("\\.")[0];
+    }
+
+    private static byte[] backupKey(char[] password, byte[] salt) throws GeneralSecurityException {
+        var spec = new javax.crypto.spec.PBEKeySpec(password, salt, BACKUP_ROUNDS, 256);
+        try {
+            return javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+        } finally {
+            spec.clearPassword();
+        }
+    }
+
+    private static byte[] backupData(String userId, String deviceId, String publicKey) {
+        return ("ember-keybackup-v1|" + userId + "|" + deviceId + "|" + publicKey).getBytes(StandardCharsets.UTF_8);
+    }
+
     public static byte[] random(int length) {
         byte[] bytes = new byte[length];
         RANDOM.nextBytes(bytes);

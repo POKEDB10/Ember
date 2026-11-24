@@ -11,6 +11,7 @@ const OP = {
   STATUS_SET: 0x24, PUSH_SUBSCRIBE: 0x25, CALL: 0x26, CALL_MEDIA: 0x27, DEVICE_KEY: 0x28, KEYS_GET: 0x29,
   PROFILE_UPDATE: 0x30, FOLLOW: 0x31, MEDIA_UPLOAD: 0x32, POST_CREATE: 0x33, POST_INTERACT: 0x34,
   STORY_CREATE: 0x35, STORY_VIEW: 0x36, BLOCK: 0x37, REPORT: 0x38, FEED_PULL: 0x3A, PROFILE_GET: 0x3B,
+  EMAIL_CODE: 0x3D, PASSWORD_RESET: 0x3E, EMAIL_LINK: 0x3F, EMAIL_EVT: 0x5C,
   AUTH_OK: 0x40, PONG: 0x41, ACK: 0x42, DELIVER: 0x43, RECEIPT_UPDATE: 0x44, UPDATE: 0x45,
   TYPING_EVT: 0x46, PRESENCE: 0x47, SYNC_ITEM: 0x48, SYNC_DONE: 0x49, HISTORY: 0x4A,
   GROUP_UPDATE: 0x4B, MEDIA_OK: 0x50, FEED_PAGE: 0x52, PROFILE_DATA: 0x53, NOTIFY: 0x54,
@@ -248,8 +249,10 @@ function onAuth(f) {
   S.me = f.userId; S.token = f.token; S.vapidKey = f.vapidKey || null;
   try { S.ice = JSON.parse(f.ice || '[]'); } catch { S.ice = []; }
   S.callsV2 = f.callsV2 === 'true'; // server half of the calls v2 flag
+  S.emailLinked = f.email === 'true';
   if (typeof renderHideIp === 'function') renderHideIp();
-  e2eStart();
+  e2eStart(S.pendingPass, f.keyBackup); // with the password just typed, this browser opens the account key
+  S.pendingPass = null;
   store.set('ember.token', f.token); store.set('ember.user', f.userId);
   showApp(); setStatus('syncing…');
   // The server remembers a status set on another device; otherwise restore this device's choice.
@@ -460,7 +463,9 @@ function ask({ title, text = '', fields = [], ok = 'OK', danger = false, validat
         return { f, el: box, node: h('label', { class: 'sheet-check' }, box, h('span', {}, f.label)) };
       }
       const el = h(f.multiline ? 'textarea' : 'input', { name: f.name, maxLength: f.max || 500, placeholder: f.placeholder || '',
-        autocomplete: 'off', spellcheck: !!f.multiline });
+        autocomplete: f.autocomplete || 'off', spellcheck: !!f.multiline });
+      if (!f.multiline && f.type) el.type = f.type;
+      if (f.inputMode) el.inputMode = f.inputMode;
       if (f.multiline) el.rows = 4;
       el.value = f.value || '';
       const count = h('span', { class: 'sheet-count' });
@@ -479,11 +484,15 @@ function ask({ title, text = '', fields = [], ok = 'OK', danger = false, validat
     cancel.onclick = () => finish(null);
     dlg.addEventListener('cancel', (e) => { e.preventDefault(); finish(null); });
     dlg.addEventListener('click', (e) => { if (e.target === dlg) finish(null); });
-    form.onsubmit = (e) => {
+    form.onsubmit = async (e) => {
       e.preventDefault();
-      const values = Object.fromEntries(inputs.map(({ f, el }) => [f.name, f.type === 'check' ? el.checked : el.value.trim()]));
+      if (okBtn.disabled) return;
+      // Passwords are taken exactly as typed; everything else is trimmed.
+      const values = Object.fromEntries(inputs.map(({ f, el }) => [f.name, f.type === 'check' ? el.checked : f.type === 'password' ? el.value : el.value.trim()]));
       const missing = inputs.find(({ f, el }) => f.required && !el.value.trim());
-      const problem = missing ? missing.f.label.toLowerCase() + ' is needed' : validate && validate(values);
+      okBtn.disabled = true;
+      const problem = missing ? missing.f.label.toLowerCase() + ' is needed' : validate && await validate(values);
+      okBtn.disabled = false;
       if (problem) { err.textContent = '⚠ ' + problem; (missing ? missing.el : inputs[0] && inputs[0].el)?.focus(); return; }
       finish(values);
     };
@@ -878,10 +887,9 @@ function bodyNode(m) {
 }
 
 function messageNode(c, m) {
-  const mine = m.from === S.me, reacts = Object.entries(m.reacts).filter(([, n]) => n > 0);
-  const myR = S.myReacts.get(m.id) || new Set();
-  return h('article', { class: 'msg' + (mine ? ' mine' : '') + (m.pending ? ' pending' : '') + (m.pinned ? ' pinned' : ''), id: 'm-' + m.id,
-    onclick: (e) => { if (e.target.tagName !== 'BUTTON') e.currentTarget.classList.toggle('sel'); } },
+  const mine = m.from === S.me, reacts = Object.entries(m.reacts).filter(([, n]) => n > 0), selected = S.selMsg === m.id;
+  return h('article', { class: 'msg' + (mine ? ' mine' : '') + (m.pending ? ' pending' : '') + (m.pinned ? ' pinned' : '') + (selected ? ' sel' : ''), id: 'm-' + m.id,
+    onclick: (e) => { if (e.target.tagName !== 'BUTTON') selectMsg(e.currentTarget, c, m); } },
   !mine && c.id.startsWith('grp:') ? h('button', { class: 'who link', onclick: () => openProfile(m.from) }, name(m.from)) : null,
   replyText(c, m) ? h('div', { class: 'quote' }, '↳ ' + replyText(c, m)) : null,
   bodyNode(m),
@@ -889,15 +897,32 @@ function messageNode(c, m) {
   h('div', { class: 'meta', title: m.e2e === 'true' ? 'end-to-end encrypted' : m.e2e ? '' : 'not end-to-end encrypted (sent before encryption was set up)' },
     (m.e2e === 'true' || m.pending ? '' : m.e2e ? '' : '🔓 ') + (m.pinned ? '📌 ' : '') + (m.starred ? '★ ' : '') + (m.expires ? '⏱ ' : '') + (m.edited ? 'edited · ' : '') + when(m.ts)
     + (mine ? (m.read ? ' ✓✓' : ' ✓') : '')),
-  h('div', { class: 'actions' },
+  selected ? actionsNode(c, m) : null);
+}
+
+/**
+ * The action buttons are built only for the selected message: a long chat used to carry a dozen
+ * hidden buttons per message, all rebuilt on every update. The selection survives re-renders.
+ */
+function selectMsg(el, c, m) {
+  const again = S.selMsg === m.id;
+  document.querySelectorAll('.msg.sel').forEach((x) => { x.classList.remove('sel'); x.querySelector('.actions')?.remove(); });
+  S.selMsg = again ? null : m.id;
+  if (!again) { el.classList.add('sel'); el.append(actionsNode(c, m)); }
+}
+
+function actionsNode(c, m) {
+  const mine = m.from === S.me, myR = S.myReacts.get(m.id) || new Set();
+  return h('div', { class: 'actions' },
     h('button', { onclick: () => startReply(m) }, 'reply'),
+    h('button', { onclick: () => copyText(m.body), title: 'copy the text' }, 'copy'),
     ...REACTIONS.map((e) => h('button', { onclick: () => send(OP.REACT, { clientMsgId: m.id, emoji: e, remove: String(myR.has(e)) }),
       'aria-pressed': String(myR.has(e)), title: 'react ' + e }, e)),
     h('button', { onclick: () => send(OP.PIN, { clientMsgId: m.id, pinned: String(!m.pinned) }), title: m.pinned ? 'unpin' : 'pin for everyone' }, m.pinned ? 'unpin' : '📌'),
     h('button', { onclick: () => send(OP.STAR, { clientMsgId: m.id, starred: String(!m.starred) }), title: m.starred ? 'unstar' : 'star (only you see it)' }, m.starred ? '☆' : '★'),
     mine ? h('button', { onclick: () => editMsg(m) }, 'edit') : null,
     mine ? h('button', { onclick: async () => { if (await confirmBox('DELETE MESSAGE', 'Delete this message for everyone in the chat?', 'DELETE', true)) send(OP.DELETE, { clientMsgId: m.id }); } }, 'del') : null,
-    mine ? null : h('button', { onclick: () => report('message', m.id), title: 'report' }, '⚑')));
+    mine ? null : h('button', { onclick: () => report('message', m.id), title: 'report' }, '⚑'));
 }
 
 /** The quoted text of a reply: from the server, or (for encrypted chats) from our own copy. */
@@ -998,15 +1023,28 @@ function postNode(p) {
     p.kind === 'video' ? mediaNode(p) : mediaNode(p, () => viewMedia(p, p.caption)),
     p.caption ? h('p', {}, p.caption) : null,
     h('div', { class: 'row gap tight' }, likeBtn, h('button', { onclick: showComments }, '💬 ' + p.comments),
-      p.owner !== S.me ? h('button', { onclick: () => report('post', p.id), title: 'report' }, '⚑') : h('span')),
+      p.owner !== S.me ? h('button', { onclick: () => report('post', p.id), title: 'report' }, '⚑')
+        : h('button', { class: 'danger-text', title: 'delete this post', onclick: async (e) => {
+          if (!await confirmBox('DELETE POST', 'Delete this post with its likes and comments? This cannot be undone.', 'DELETE', true)) return;
+          try { await request(OP.POST_INTERACT, { postId: p.id, action: 'delete', text: '' }); e.target.closest('.post').remove(); toast('post deleted'); } catch (x) { toast('⚠ ' + x.message); }
+        } }, '🗑')),
     commentBox);
+}
+
+/** Copies text to the clipboard (with a fallback for older browsers and plain-HTTP pages). */
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); } catch {
+    const t = h('textarea', { value: text, readOnly: true });
+    document.body.append(t); t.select(); document.execCommand('copy'); t.remove();
+  }
+  toast('copied');
 }
 
 async function loadStories() {
   try {
     const f = await request(OP.STORY_VIEW);
     S.stories = Array.from({ length: +f['story.n'] || 0 }, (_, i) => ({
-      owner: f['owner.' + i], media: f['media.' + i], caption: f['caption.' + i], created: +f['created.' + i],
+      id: f['story.' + i], owner: f['owner.' + i], media: f['media.' + i], caption: f['caption.' + i], created: +f['created.' + i],
       kind: f['kind.' + i] || 'image', src: f['src.' + i] || '', thumb: f['thumb.' + i] || '' }));
     const owners = [...new Set(S.stories.map((s) => s.owner))];
     await ensureNames(owners);
@@ -1026,6 +1064,14 @@ function playStories(owner) {
     i++;
     clearTimeout(playStories.timer);
     viewMedia(item, name(owner) + (item.caption ? ' — ' + item.caption : ''), next);
+    const del = $('overlayDel');
+    del.hidden = owner !== S.me || !item.id;
+    del.onclick = async () => {
+      clearTimeout(playStories.timer); $('overlayVid').pause();
+      if (!await confirmBox('DELETE STORY', 'Delete this story now? This cannot be undone.', 'DELETE', true)) { next(); return; }
+      try { await request(OP.STORY_VIEW, { action: 'delete', storyId: item.id }); toast('story deleted'); } catch (x) { toast('⚠ ' + x.message); }
+      closeOverlay(); loadStories();
+    };
     if (item.kind !== 'video') playStories.timer = setTimeout(next, 5000); // a video story moves on when it ends
   };
   next();
@@ -1051,6 +1097,7 @@ function viewMedia(item, caption, onEnded) {
 
 function closeOverlay() {
   clearTimeout(playStories.timer);
+  $('overlayDel').hidden = true;
   const vid = $('overlayVid');
   vid.onended = null; vid.pause(); vid.removeAttribute('src'); vid.load();
   $('overlay').hidden = true;
@@ -1165,13 +1212,35 @@ async function report(targetType, targetId) {
 }
 
 function renderMe() {
-  const p = S.profiles.get(S.me);
-  $('meCard').replaceChildren(h('p', {}, h('strong', {}, p ? p.displayName : S.me)), h('p', { class: 'dim' }, '@' + S.me),
-    p && p.bio ? h('p', {}, p.bio) : null, h('button', { onclick: () => openProfile(S.me) }, 'VIEW MY PROFILE'));
+  const p = S.profiles.get(S.me), shown = (p && p.displayName) || S.me;
+  $('meCard').replaceChildren(
+    h('div', { class: 'avatar', 'aria-hidden': 'true' }, shown.slice(0, 1).toUpperCase()),
+    h('div', { class: 'who' }, h('strong', { class: 'ellipsis' }, shown), h('span', { class: 'dim small' }, '@' + S.me),
+      p && p.bio ? h('span', { class: 'bio small' }, p.bio) : null),
+    h('button', { class: 'small', onclick: () => openProfile(S.me) }, 'PROFILE'));
   $('requests').replaceChildren(requestsNode());
   const blocked = 'Notification' in window && Notification.permission === 'denied';
-  $('notifyBtn').textContent = '🔔 NOTIFICATIONS: ' + (blocked ? 'BLOCKED IN BROWSER' : S.notify ? 'ON' : 'OFF');
+  $('notifyBtn').setAttribute('aria-checked', String(!!S.notify && !blocked));
+  $('notifyNote').textContent = blocked ? 'blocked in the browser settings' : 'even when Ember is closed · do not disturb mutes';
+  $('emailVal').textContent = S.emailLinked ? 'LINKED ✓' : 'ADD';
+  $('unlockBtn').hidden = typeof e2eCanUnlock !== 'function' || !e2eCanUnlock();
 }
+
+/** Links an email to the signed-in account (proven with a code sent to it). */
+async function linkEmail() {
+  const a = await ask({ title: S.emailLinked ? 'CHANGE EMAIL' : 'ADD EMAIL', ok: 'SEND CODE',
+    text: 'Sign in with it and get back into your account if you forget the password. The server keeps only a scrambled form of it.',
+    fields: [{ name: 'email', label: 'EMAIL', type: 'email', autocomplete: 'email', max: 254, required: true }] });
+  if (!a) return;
+  try {
+    const code = await emailCode('link', a.email, 'CHECK YOUR EMAIL', 'CONFIRM');
+    if (!code) return;
+    await request(OP.EMAIL_LINK, { email: a.email, code });
+    S.emailLinked = true; renderMe(); toast('✉ email linked');
+  } catch (x) { toast('⚠ ' + x.message); }
+}
+$('emailBtn').onclick = linkEmail;
+$('unlockBtn').onclick = () => e2eUnlock().then(renderMe);
 
 // ---- navigation and actions ----
 function setView(view, arg) {
@@ -1249,23 +1318,65 @@ function showApp() { $('login').hidden = true; $('app').hidden = false; $('me').
 let registering = false;
 $('modeBtn').onclick = () => {
   registering = !registering;
-  $('nameRow').hidden = !registering;
+  $('nameRow').hidden = !registering; $('emailRow').hidden = !registering; $('email').required = registering;
+  $('userLabel').textContent = registering ? 'USERNAME' : 'USERNAME OR EMAIL';
+  $('user').maxLength = registering ? 20 : 254;
   $('loginBtn').textContent = registering ? '> CREATE ACCOUNT' : '> LOG IN';
   $('modeBtn').textContent = registering ? 'Have an account? Log in' : 'New here? Create an account';
+  $('forgotBtn').hidden = registering;
   $('pass').autocomplete = registering ? 'new-password' : 'current-password';
 };
+/** The socket is opened on demand on the sign-in screen (codes are asked for before any account exists). */
+const linkUp = () => new Promise((resolve) => { if (S.ws && S.ws.readyState === 1) resolve(); else connect(resolve); });
+const CODE_FIELD = { name: 'code', label: '6-DIGIT CODE', max: 6, required: true, inputMode: 'numeric', autocomplete: 'one-time-code', placeholder: '123456' };
+const codeRule = (x) => (/^\d{6}$/.test(x.code) ? null : 'the code is 6 digits');
+
+/** Emails a code and asks for it. Resolves with the code, or null when cancelled. */
+async function emailCode(purpose, email, title, ok) {
+  await linkUp();
+  await request(OP.EMAIL_CODE, { purpose, email });
+  const v = await ask({ title, ok, fields: [CODE_FIELD], validate: codeRule,
+    text: 'A code is on its way to ' + email + '. It works once, for 10 minutes. No email? Check spam, or wait a minute and try again.' });
+  return v && v.code;
+}
+
 $('loginForm').onsubmit = async (e) => {
   e.preventDefault();
   $('loginError').textContent = ''; $('loginBtn').disabled = true;
   const user = $('user').value.trim(), pass = $('pass').value;
-  // A returning user's saved chats load now; the server then sends only what changed.
-  if (!registering && await restoreCache(user.toLowerCase())) { S.synced = true; }
-  connect(() => {
+  try {
+    let extra = {};
+    if (registering) {
+      if (USERNAME_RULE(user.toLowerCase())) throw new Error(USERNAME_RULE(user.toLowerCase()));
+      const email = $('email').value.trim();
+      const code = await emailCode('register', email, 'CHECK YOUR EMAIL', 'CREATE ACCOUNT');
+      if (!code) { $('loginBtn').disabled = false; return; }
+      extra = { email, code };
+    } else if (!user.includes('@') && await restoreCache(user.toLowerCase())) {
+      S.synced = true; // a returning user's saved chats load now; the server then sends only what changed
+    }
+    await linkUp();
+    S.pendingPass = pass;
     S.pendingAuth = registering
-      ? send(OP.REGISTER, { user, pass, calls: '1', displayName: $('displayName').value.trim() || user })
+      ? send(OP.REGISTER, { user, pass, calls: '1', displayName: $('displayName').value.trim() || user, ...extra })
       : send(OP.LOGIN, { user, pass, calls: '1', ...syncFields() });
-    $('pass').value = ''; $('loginBtn').disabled = false;
-  });
+    $('pass').value = '';
+  } catch (err) { $('loginError').textContent = err.message === 'offline' ? 'cannot reach the server' : err.message; }
+  $('loginBtn').disabled = false;
+};
+$('forgotBtn').onclick = async () => {
+  $('loginError').textContent = '';
+  const a = await ask({ title: 'RESET PASSWORD', ok: 'SEND CODE', text: 'Enter the email on your account and we will send you a code.',
+    fields: [{ name: 'email', label: 'EMAIL', type: 'email', autocomplete: 'email', max: 254, required: true }] });
+  if (!a) return;
+  try { await linkUp(); await request(OP.EMAIL_CODE, { purpose: 'reset', email: a.email }); } catch (err) { $('loginError').textContent = err.message; return; }
+  const b = await ask({ title: 'NEW PASSWORD', ok: 'SET PASSWORD',
+    text: 'If ' + a.email + ' belongs to an account, a code is on its way. Your chats stay; messages from before the reset stay readable on devices that were already signed in.',
+    fields: [CODE_FIELD, { name: 'pass', label: 'NEW PASSWORD (8+ CHARACTERS)', type: 'password', autocomplete: 'new-password', max: 128, required: true }],
+    validate: (x) => codeRule(x) || (x.pass.length < 8 ? 'the password needs at least 8 characters' : null) });
+  if (!b) return;
+  S.pendingPass = b.pass;
+  S.pendingAuth = send(OP.PASSWORD_RESET, { email: a.email, code: b.code, pass: b.pass, calls: '1' });
 };
 $('composer').onsubmit = (e) => { e.preventDefault(); sendCurrent(); };
 $('input').onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendCurrent(); } };

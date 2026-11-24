@@ -12,14 +12,15 @@ import java.util.concurrent.BlockingQueue;
 
 /**
  * A bad network for testing the call relay: a TCP proxy with a bandwidth limit, extra delay and a
- * small router queue (about 64 KB per direction), following a timed profile. JDK only.
- * Usage: {@code ThrottleProxy <listenPort> <targetPort> <profile>}, where the profile is
- * {@code seconds:kbps:delayMs,...}, e.g. {@code 0:20000:0,20:400:40,50:20000:0}.
+ * router queue (64 KB per direction unless given), following a timed profile. JDK only.
+ * Usage: {@code ThrottleProxy <listenPort> <targetPort> <profile> [queueKB]}, where the profile is
+ * {@code seconds:kbps:delayMs,...}, e.g. {@code 0:20000:0,20:400:40,50:20000:0}. A queue of a few
+ * MB behaves like a tunnel or proxy that buffers seconds of data (bufferbloat).
  * shortcut: TCP only (the WebSocket relay); direct WebRTC uses UDP and needs an OS-level tool.
  */
 public final class ThrottleProxy {
     private static final int CHUNK = 4096;
-    private static final int QUEUE_CHUNKS = 16;
+    private static int queueChunks = 16;
     private static long startMs;
     private static int[][] profile;
 
@@ -31,6 +32,9 @@ public final class ThrottleProxy {
         int target = Integer.parseInt(args[1]);
         profile = Arrays.stream(args[2].split(",")).map(step -> Arrays.stream(step.split(":"))
                 .mapToInt(Integer::parseInt).toArray()).toArray(int[][]::new);
+        if (args.length > 3) {
+            queueChunks = Math.max(1, Integer.parseInt(args[3]) * 1024 / CHUNK);
+        }
         startMs = System.currentTimeMillis();
         try (ServerSocket server = new ServerSocket(listen, 50, InetAddress.getLoopbackAddress())) {
             System.out.println("throttle proxy " + listen + " -> " + target + " profile " + args[2] + " start " + java.time.Instant.ofEpochMilli(startMs));
@@ -60,7 +64,7 @@ public final class ThrottleProxy {
     private record Chunk(byte[] data, long arrivedMs) { }
 
     private static void pipe(Socket from, Socket to) {
-        BlockingQueue<Chunk> queue = new ArrayBlockingQueue<>(QUEUE_CHUNKS); // full queue = TCP back-pressure
+        BlockingQueue<Chunk> queue = new ArrayBlockingQueue<>(queueChunks); // full queue = TCP back-pressure
         Thread reader = new Thread(() -> {
             byte[] buffer = new byte[CHUNK];
             try (InputStream in = from.getInputStream()) {

@@ -41,6 +41,11 @@ public final class SessionStore {
         sessions.remove(token);
     }
 
+    /** Signs the user out everywhere (after a password reset). */
+    public void removeUser(String userId) {
+        sessions.values().removeIf(session -> session.userId.equals(userId));
+    }
+
     /** Stores a token's user and timeout timestamps. @concept inner classes, encapsulation */
     private static final class Session {
         private final String userId;

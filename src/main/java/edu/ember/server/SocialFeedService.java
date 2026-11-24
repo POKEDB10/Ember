@@ -177,6 +177,58 @@ public final class SocialFeedService {
         return post;
     }
 
+    /** The owner deletes a post: it, its likes and comments, and its picture or video are gone. */
+    public void deletePost(String requester, String postId)
+            throws IOException, ResourceNotFoundException, AuthorizationException {
+        SocialPost post = storage.findPost(postId, requester).orElseThrow(
+                () -> new ResourceNotFoundException("Post not found"));
+        if (!post.ownerUserId().equals(requester)) {
+            throw new AuthorizationException("Only the owner can delete a post");
+        }
+        storage.deletePost(postId);
+        deleteMediaFiles(post.mediaId());
+    }
+
+    /** The owner deletes a story before it expires. */
+    public void deleteStory(String requester, String storyId)
+            throws IOException, ResourceNotFoundException, AuthorizationException {
+        StoryItem story = storage.findStory(storyId).orElseThrow(
+                () -> new ResourceNotFoundException("Story not found"));
+        if (!story.ownerUserId().equals(requester)) {
+            throw new AuthorizationException("Only the owner can delete a story");
+        }
+        storage.deleteStory(storyId);
+        deleteMediaFiles(story.mediaId());
+    }
+
+    /** Local copies go at once; links stop working because the media is no longer referenced. */
+    private void deleteMediaFiles(String mediaId) throws IOException {
+        if (referenced(mediaId)) {
+            return;
+        }
+        Optional<MediaAsset> asset = storage.findMedia(mediaId);
+        if (asset.isPresent()) {
+            Files.deleteIfExists(safePath(asset.get().fileName()));
+            Files.deleteIfExists(safePath(asset.get().thumbnailFileName()));
+        }
+    }
+
+    /** True while a post or a live story still shows this media. */
+    private boolean referenced(String mediaId) throws IOException {
+        for (SocialPost post : storage.listPosts(null, null, Integer.MAX_VALUE)) {
+            if (post.mediaId().equals(mediaId)) {
+                return true;
+            }
+        }
+        long now = System.currentTimeMillis();
+        for (StoryItem story : storage.listStories()) {
+            if (story.mediaId().equals(mediaId) && story.expiresAtMs() > now) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public SocialPost interact(String requester, String postId, String action, String text)
             throws IOException, ValidationException, ResourceNotFoundException,
             AuthorizationException {
@@ -285,6 +337,9 @@ public final class SocialFeedService {
     /** The local file behind a media id, for a signed link that was checked when it was issued. */
     public Path mediaPathForLink(String mediaId, boolean thumbnail) throws IOException, ResourceNotFoundException {
         MediaAsset asset = storage.findMedia(mediaId).orElseThrow(() -> new ResourceNotFoundException("Media not found"));
+        if (!referenced(mediaId)) {
+            throw new ResourceNotFoundException("Media not found"); // a signed link to a deleted post or story
+        }
         return localFile(asset, thumbnail);
     }
 

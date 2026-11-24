@@ -266,3 +266,51 @@ button.ghost { background: transparent; }
 .progress { height: 12px; border: 2px solid var(--line); background: var(--bg); }
 .progress-fill { height: 100%; width: 0; background: repeating-linear-gradient(90deg, var(--accent) 0 8px, transparent 8px 11px); transition: width .15s; }
 @media (prefers-reduced-motion: reduce) { dialog.sheet[open] { animation: none; } .pic, .progress-fill { transition: none; } }
+
+/* ---- settings (ME tab): compact grouped rows with switches ---- */
+.tabpane.me { padding: 10px 10px 14px; gap: 6px; }
+.mecard { display: grid; grid-template-columns: 44px 1fr auto; gap: 10px; align-items: center; padding: 10px;
+  border: 2px solid var(--line); background: var(--raised); box-shadow: 3px 3px 0 var(--line); }
+.mecard .avatar, .tile-off .avatar { display: grid; place-items: center; width: 44px; height: 44px; font-size: 22px; font-weight: 700;
+  color: var(--bg); background: var(--accent); text-shadow: none; }
+.mecard .who { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+.mecard .bio { color: var(--text); opacity: .85; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.mecard button { padding: 4px 8px; }
+.sect { margin: 10px 2px 2px; font-size: 11px; font-weight: 400; letter-spacing: .18em; color: var(--dim); }
+.setlist { display: flex; flex-direction: column; border: 2px solid var(--line); background: var(--panel); }
+.setrow { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 48px; padding: 8px 10px;
+  border: 0; border-bottom: 1px solid var(--line); box-shadow: none; background: transparent; color: var(--text);
+  text-align: left; text-transform: none; letter-spacing: 0; cursor: pointer; }
+.setrow:last-child { border-bottom: 0; }
+button.setrow:hover:not(:disabled) { background: var(--raised); color: var(--text); text-shadow: var(--glow); }
+button.setrow:active:not(:disabled) { transform: none; }
+button.setrow[aria-pressed="true"] { background: transparent; color: var(--text); }
+.setname { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.setname small { font-size: 11px; color: var(--dim); letter-spacing: .02em; }
+.setrow .val { font-size: 11px; letter-spacing: .12em; color: var(--accent); white-space: nowrap; }
+.setrow select { flex: 0 0 auto; width: auto; padding: 4px 6px; background: var(--bg); color: var(--text); border: 2px solid var(--line); font: inherit; }
+.sw { position: relative; flex: 0 0 auto; width: 38px; height: 20px; border: 2px solid var(--line); background: var(--bg); }
+.sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; background: var(--dim); transition: transform .15s, background .15s; }
+[aria-checked="true"] > .sw { border-color: var(--accent); }
+[aria-checked="true"] > .sw::after { transform: translateX(18px); background: var(--accent); box-shadow: var(--glow); }
+.tiny { font-size: 11px; line-height: 1.4; margin: 6px 0 0; }
+.row.between { justify-content: space-between; gap: 8px; }
+.row.between > * { flex: 0 1 auto; }
+button.danger-text { color: var(--err); }
+.overlay .overlaydel { position: absolute; left: 16px; top: 12px; }
+
+/* ---- calls: full screen, camera-off tiles, raised hands ---- */
+.callbox.full { inset: 0; right: 0; bottom: 0; width: 100vw; height: 100dvh; max-height: none; display: flex; flex-direction: column; box-shadow: none; }
+.callbox.full .callstage { flex: 1; aspect-ratio: auto; min-height: 0; }
+.callbox.full .tiles { grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); grid-auto-rows: 1fr; }
+.callbox.full .callstage.lots .tiles { grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); }
+.callbox.full .selfview { width: min(22%, 240px); }
+.callstage.selfoff .selfview { display: none; }
+.tile-off { position: absolute; inset: 0; display: none; place-items: center; background: var(--panel); }
+.tile.camoff .tile-off { display: grid; }
+.tile.camoff video, .tile.camoff canvas { visibility: hidden; }
+.tile-off .avatar { width: 64px; height: 64px; font-size: 30px; border-radius: 50%; }
+.tile.hand { outline: 3px solid var(--accent); outline-offset: -3px; }
+.tile.hand .who::before { content: "✋ "; }
+.tile.muted .who::after { content: " 🔇"; }
+#callBox .titlebar .tools { display: flex; align-items: center; gap: 8px; }

@@ -15,6 +15,12 @@
 //      compute that key, which also proves which device sent the message.
 // The server stores and forwards only: e2e1.<sender device>.<salt>.<iv>.<ciphertext>.<wraps>.
 //
+// One key for the whole account: the first device that signs in with the password makes a key
+// pair, seals the private half with a key derived from the password (PBKDF2-SHA256, 600,000
+// rounds, AES-GCM) and stores only that sealed copy on the server. Every later sign-in with the
+// password opens it, so all of the account's browsers and desktop apps read the same messages. The
+// key this browser used before is kept, to read what was sealed for it.
+//
 // Trust: the first time we see a person's devices we remember them. If a new device appears
 // later, the chat shows a notice, and the profile shows a safety number that both people can
 // compare (same digits on both screens = no one, not even the server, is in between).
@@ -40,26 +46,115 @@ function keyStore(mode, fn) {
   });
 }
 
-/** Loads this browser's device key for the account, or makes one, and registers it with the server. */
-function e2eStart() {
+const KB = { PREFIX: 'kb1.', ROUNDS: 600000 };
+const ECDH = { name: 'ECDH', namedCurve: 'P-256' };
+
+async function backupKey(password, salt) {
+  const base = await crypto.subtle.importKey('raw', utf8.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: KB.ROUNDS }, base,
+    { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+const backupData = (dev, pub) => utf8.encode('ember-keybackup-v1|' + S.me + '|' + dev + '|' + pub);
+const BACKUP_RE = /^kb1\.[A-Za-z0-9_-]{16,43}\.[A-Za-z0-9_-]{87}\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{100,400}$/;
+
+/** Opens the account key backup with the password (throws when the password does not fit it). */
+async function openBackup(password, backup) {
+  if (!BACKUP_RE.test(backup)) throw new Error('not a key backup');
+  const [id, pub, salt, iv, sealed] = backup.slice(KB.PREFIX.length).split('.');
+  const pkcs8 = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: dec(iv), additionalData: backupData(id, pub) },
+    await backupKey(password, dec(salt)), dec(sealed));
+  return { id, pub, priv: await crypto.subtle.importKey('pkcs8', pkcs8, ECDH, false, ['deriveBits']), shared: true };
+}
+
+/** A new account key: sealed with the password and stored on the server (replacing an old one only after a reset). */
+async function newAccountKey(password, replace) {
+  const pair = await crypto.subtle.generateKey(ECDH, true, ['deriveBits']);
+  const pkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', pair.privateKey));
+  const id = enc(rand(16)), pub = enc(await crypto.subtle.exportKey('raw', pair.publicKey)), salt = rand(16), iv = rand(12);
+  const sealed = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: backupData(id, pub) }, await backupKey(password, salt), pkcs8);
+  await request(OP.DEVICE_KEY, { deviceId: id, action: 'backup', replace: replace ? '1' : '0',
+    backup: KB.PREFIX + [id, pub, enc(salt), enc(iv), enc(new Uint8Array(sealed))].join('.') });
+  const dev = { id, pub, priv: await crypto.subtle.importKey('pkcs8', pkcs8, ECDH, false, ['deriveBits']), shared: true };
+  pkcs8.fill(0);
+  return dev;
+}
+
+/** Switches to the account key; this browser's previous key is kept for older messages and retired on the server. */
+async function adopt(old, account) {
+  account.olds = (old && old.olds) || [];
+  if (old && old.priv && old.id !== account.id) {
+    account.olds = [...account.olds, { id: old.id, pub: old.pub, priv: old.priv }];
+    send(OP.DEVICE_KEY, { deviceId: old.id, action: 'retire' });
+  }
+  await keyStore('readwrite', (st) => st.put(account, S.me));
+  return account;
+}
+
+/**
+ * Loads this browser's key, or adopts the account key with the password just typed. Without a
+ * password (a resumed session) a browser that does not have the account key yet keeps its own
+ * key, and the profile offers to unlock the account key.
+ */
+function e2eStart(password, backup) {
+  e2e.backup = backup || '';
   e2e.ready = (async () => {
-    let dev = await keyStore('readonly', (s) => s.get(S.me)).catch(() => null);
-    if (!dev || !dev.priv) {
-      const pair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+    let dev = await keyStore('readonly', (st) => st.get(S.me)).catch(() => null);
+    if (dev && !dev.priv) dev = null;
+    if (password && !(dev && dev.shared && (!backup || backup.startsWith(KB.PREFIX + dev.id + '.')))) {
+      let account = null;
+      if (backup) account = await openBackup(password, backup).catch(() => null);
+      // No backup yet: this is the account's first device. A backup the password cannot open was
+      // sealed before a password reset: a new account key replaces it.
+      if (!account) account = await newAccountKey(password, !!backup).catch(() => null);
+      if (account) { const before = dev; dev = await adopt(dev, account); e2e.backup = ''; if (before && S.rev) e2e.resync = true; }
+    }
+    if (!dev) {
+      const pair = await crypto.subtle.generateKey(ECDH, false, ['deriveBits']);
       dev = { id: enc(rand(16)), priv: pair.privateKey, pub: enc(await crypto.subtle.exportKey('raw', pair.publicKey)) };
-      await keyStore('readwrite', (s) => s.put(dev, S.me));
+      await keyStore('readwrite', (st) => st.put(dev, S.me));
     }
     e2e.dev = dev;
+    e2e.olds = dev.olds || [];
     await request(OP.DEVICE_KEY, { deviceId: dev.id, pub: dev.pub }).catch(() => {});
+    if (e2e.resync) { e2e.resync = false; setTimeout(e2eResync, 0); }
     return dev;
   })();
   e2e.ready.catch(() => toast('⚠ encryption is unavailable in this browser'));
 }
 
-/** On logout: the server stops encrypting for this device, and the key is deleted here. */
+/** True when this browser could read more after unlocking the account key with the password. */
+const e2eCanUnlock = () => !!(e2e.backup && e2e.dev && !(e2e.dev.shared && e2e.backup.startsWith(KB.PREFIX + e2e.dev.id + '.')));
+
+/** Asks for the password and opens the account key (from the profile, after a resumed session). */
+async function e2eUnlock() {
+  const v = await ask({ title: 'UNLOCK ALL MESSAGES', ok: 'UNLOCK',
+    text: 'Your password opens the key your other devices use, so this browser can read the same chats. It never leaves this browser.',
+    fields: [{ name: 'pass', label: 'PASSWORD', type: 'password', max: 128, required: true }],
+    validate: async (x) => { try { e2e.unlocked = await openBackup(x.pass, e2e.backup); return null; } catch { return 'wrong password'; } } });
+  if (!v || !e2e.unlocked) return;
+  e2e.dev = await adopt(e2e.dev, e2e.unlocked);
+  e2e.olds = e2e.dev.olds; e2e.unlocked = null; e2e.backup = '';
+  e2e.ready = Promise.resolve(e2e.dev);
+  await request(OP.DEVICE_KEY, { deviceId: e2e.dev.id, pub: e2e.dev.pub }).catch(() => {});
+  e2e.secrets.clear();
+  toast('🔑 unlocked');
+  e2eResync();
+}
+
+/**
+ * Messages saved on this device as unreadable are fetched again now that a new key can open them:
+ * the saved copy is dropped and the connection restarts with a full sync.
+ */
+function e2eResync() {
+  cache.clear(S.me);
+  S.rev = 0; S.lastSeq = 0;
+  if (S.ws) S.ws.close(); // reconnects by itself and syncs everything
+}
+
+/** On logout: the key is deleted here. A browser's own key is retired; the shared account key stays active. */
 async function e2eRetire(user) {
-  if (e2e.dev) send(OP.DEVICE_KEY, { deviceId: e2e.dev.id, action: 'retire' });
-  await keyStore('readwrite', (s) => s.delete(user)).catch(() => {});
+  if (e2e.dev && !e2e.dev.shared) send(OP.DEVICE_KEY, { deviceId: e2e.dev.id, action: 'retire' });
+  await keyStore('readwrite', (st) => st.delete(user)).catch(() => {});
 }
 
 // ---- keys of the people in a conversation ----
@@ -129,16 +224,17 @@ async function publicKey(pub) {
   return e2e.pubs.get(pub);
 }
 
-/** ECDH between this device and another device; cached, since it never changes. */
-async function sharedWith(pub) {
-  if (!e2e.secrets.has(pub)) {
-    e2e.secrets.set(pub, (async () => new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: await publicKey(pub) }, e2e.dev.priv, 256)))());
+/** ECDH between one of this browser's keys and another device; cached, since it never changes. */
+async function sharedWith(pub, me = e2e.dev) {
+  const key = me.id + '|' + pub;
+  if (!e2e.secrets.has(key)) {
+    e2e.secrets.set(key, (async () => new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: await publicKey(pub) }, me.priv, 256)))());
   }
-  return e2e.secrets.get(pub);
+  return e2e.secrets.get(key);
 }
 
-async function wrapKey(pub, salt, from, to) {
-  const ikm = await crypto.subtle.importKey('raw', await sharedWith(pub), 'HKDF', false, ['deriveKey']);
+async function wrapKey(pub, salt, from, to, me) {
+  const ikm = await crypto.subtle.importKey('raw', await sharedWith(pub, me), 'HKDF', false, ['deriveKey']);
   return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt, info: utf8.encode('ember-msg-v1|' + from + '|' + to) },
     ikm, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
@@ -195,19 +291,24 @@ async function openBody(convId, sender, msgId, body) {
   if (parts.length !== 5) throw new Error('bad');
   const [from, salt, iv, ct, wraps] = parts;
   await e2e.ready;
-  const mine = wraps.split(',').find((w) => w.startsWith(e2e.dev.id + ':'));
+  // The account key first, then keys this browser used before (older messages were sealed for those).
+  let me = null, mine = null;
+  for (const k of [e2e.dev, ...(e2e.olds || [])]) {
+    mine = wraps.split(',').find((w) => w.startsWith(k.id + ':'));
+    if (mine) { me = k; break; }
+  }
   if (!mine) throw new Error('not for this device');
   let list = await keysFor(convId);
   let senderKey = list.find((k) => k.user === sender && k.dev === from);
   if (!senderKey) { list = await keysFor(convId, true); senderKey = list.find((k) => k.user === sender && k.dev === from); }
   if (!senderKey) throw new Error('unknown sender device');
   const bind = await binding(convId, sender, msgId, dec(iv), dec(ct));
-  const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ZERO_IV, additionalData: bind }, await wrapKey(senderKey.pub, dec(salt), from, e2e.dev.id), dec(mine.split(':')[1]));
+  const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ZERO_IV, additionalData: bind }, await wrapKey(senderKey.pub, dec(salt), from, me.id, me), dec(mine.split(':')[1]));
   const msgKey = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
   return unutf8.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: dec(iv), additionalData: aad(convId, sender, msgId) }, msgKey, dec(ct)));
 }
 
-const LOCKED = '🔒 This message cannot be read on this device (it was sent before this device was set up, or it was tampered with).';
+const LOCKED = '🔒 This message cannot be read here: it was sealed for another device before the account key existed (or it was tampered with).';
 
 /** Replaces an encrypted body in a frame with its text, in place. */
 async function decryptFrame(f) {

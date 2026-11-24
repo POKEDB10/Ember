@@ -63,6 +63,9 @@ public final class WalStorageEngine implements StorageEngine {
     private static final byte POLL_VOTE = 20;
     private static final byte PUSH_SUBSCRIPTION = 21;
     private static final byte SETTING = 22;
+    private static final byte POST_DELETE = 23;
+    private static final byte STORY_DELETE = 24;
+    private static final byte USER_UPDATE = 25;
     private final Path walPath;
     private final Path snapshotPath;
     private final boolean strictDurability;
@@ -123,6 +126,16 @@ public final class WalStorageEngine implements StorageEngine {
 
     @Override public boolean isMediaMirrored(String name) {
         return replica == null || replica.hasMedia(name);
+    }
+
+    @Override
+    public synchronized void updateUser(UserRecord user) throws IOException {
+        if (state.findUser(user.username()).isEmpty()) {
+            throw new IOException("No such account");
+        }
+        appendRecord(USER_UPDATE, Map.of("userId", user.userId(), "username", user.username(),
+                "displayName", user.displayName(), "passwordHash", user.passwordHash()));
+        state.updateUser(user);
     }
 
     @Override
@@ -454,6 +467,16 @@ public final class WalStorageEngine implements StorageEngine {
         return state.setting(key);
     }
 
+    @Override public synchronized void deletePost(String postId) throws IOException {
+        appendRecord(POST_DELETE, Map.of("postId", postId));
+        state.deletePost(postId);
+    }
+
+    @Override public synchronized void deleteStory(String storyId) throws IOException {
+        appendRecord(STORY_DELETE, Map.of("storyId", storyId));
+        state.deleteStory(storyId);
+    }
+
     @Override public synchronized List<Message> expiredMessages(long nowMs) {
         return state.expiredMessages(nowMs);
     }
@@ -627,6 +650,9 @@ public final class WalStorageEngine implements StorageEngine {
         if (record.type() == USER_SAVE) {
             state.saveUser(new UserRecord(fields.get("userId"), fields.get("username"),
                     fields.get("displayName"), fields.get("passwordHash")));
+        } else if (record.type() == USER_UPDATE) {
+            state.updateUser(new UserRecord(fields.get("userId"), fields.get("username"),
+                    fields.get("displayName"), fields.get("passwordHash")));
         } else if (record.type() == MESSAGE_APPEND) {
             Message message = messageFrom(fields);
             long expectedConvSequence = Long.parseLong(fields.get("convSeq"));
@@ -716,6 +742,10 @@ public final class WalStorageEngine implements StorageEngine {
                     Boolean.parseBoolean(fields.get("active")));
         } else if (record.type() == SETTING) {
             state.saveSetting(fields.get("key"), fields.get("value"));
+        } else if (record.type() == POST_DELETE) {
+            state.deletePost(fields.get("postId"));
+        } else if (record.type() == STORY_DELETE) {
+            state.deleteStory(fields.get("storyId"));
         } else {
             throw new IOException("Unknown WAL record type");
         }

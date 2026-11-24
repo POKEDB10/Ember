@@ -226,7 +226,8 @@ function addPeer(c, user) {
   let done;
   const p = { user, pair: crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']),
     myPub: null, key: null, keyReady: new Promise((r) => { done = r; }), sigSend: 0, sigRecv: -1, chain: Promise.resolve(),
-    pc: null, iceQueue: [], videoSender: null, code: '', relay: null, sentRelay: false, tile: tile(user) };
+    pc: null, iceQueue: [], videoSender: null, code: '', relay: null, sentRelay: false, tile: tile(user),
+    camOff: !c.video, muted: false, hand: 0 };
   p.keyDone = done;
   c.peers.set(user, p);
   sendPairKey(c, p);
@@ -236,7 +237,9 @@ function addPeer(c, user) {
 function tile(user) {
   const video = h('video', { autoplay: true, playsInline: true });
   const canvas = h('canvas', { hidden: true });
-  const el = h('div', { class: 'tile' }, video, canvas, h('span', { class: 'who' }, name(user)));
+  // Shown instead of a frozen last frame when their camera is off (or in a voice call).
+  const off = h('div', { class: 'tile-off', 'aria-hidden': 'true' }, h('span', { class: 'avatar' }, name(user).slice(0, 1).toUpperCase()));
+  const el = h('div', { class: 'tile' }, video, canvas, off, h('span', { class: 'who' }, name(user)));
   $('callTiles').append(el);
   return { el, video, canvas };
 }
@@ -257,6 +260,14 @@ function renderPeople() {
   for (const p of call.peers.values()) if (p.pc && p.pc.connectionState === 'connected') capBitrates(call, p.pc);
   const n = call.peers.size + 1;
   $('callStage').classList.toggle('many', n > 2);
+  $('callStage').classList.toggle('lots', n > 4);
+  // Raised hands come first, in the order they were raised.
+  const raised = [...call.peers.values()].filter((p) => p.hand).sort((a, b) => a.hand - b.hand);
+  for (const p of call.peers.values()) {
+    const t = p.tile.el;
+    t.classList.toggle('camoff', !!p.camOff); t.classList.toggle('muted', !!p.muted); t.classList.toggle('hand', !!p.hand);
+    t.style.order = p.hand ? String(raised.indexOf(p)) : '100';
+  }
   $('callCode').replaceChildren(...[...call.peers.values()].filter((p) => p.code).map((p) =>
     h('div', {}, 'safety code with ' + name(p.user) + ': ' + p.code)));
   if (call.peers.size) $('callCode').append(h('div', {}, 'same codes on both screens = private call'));
@@ -323,6 +334,7 @@ async function openSignal(p, data) {
 // ---- choosing direct or relay ----
 function pairReady(c, p) {
   if (c.v2) startControls(c, p);
+  sendState(c, p);
   if (c.mode === 'relay') { c.relayStarted.then(() => sendRelayInfo(c, p)); return; }
   if (callPrefs.hideIp || !window.RTCPeerConnection || c.peers.size + 1 > CALL.MAX_DIRECT) { goRelay(c); return; }
   if (S.me < p.user) startDirect(c, p).catch(() => goRelay(c));
@@ -465,7 +477,19 @@ async function startRelay(c) {
   r.cap.port.onmessage = (e) => sendAudio(c, e.data);
   if (actx.state === 'suspended') await actx.resume().catch(() => {});
   // Every second: the round trip is one of the ladder's trouble signals (measured: 2 s pings made a step-down take 3 s).
-  c.timers.push(setInterval(() => { if (call === c && c.relay) sendPacket(c, PKT.PING, 0, new Uint8Array(0)); }, 1000));
+  // Every 500 ms (a backlog shows up sooner); every 250 ms while the queue guard drains, so video
+  // resumes as soon as the path is clear. A ping and its answer are about 60 bytes each.
+  r.lastPing = 0; r.pings = [];
+  c.timers.push(setInterval(() => {
+    if (call !== c || !c.relay) return;
+    // A ping still unanswered is a backlog already: the guard need not wait for its late answer.
+    // (Only to start draining: an unanswered ping is a lower bound, never proof the path is clear.)
+    if (!r.draining && r.pings.length && u32(nowMs() - r.pings[0]) > (c.rtt || 0)) guardQueue(c, u32(nowMs() - r.pings[0]));
+    if (!r.draining && performance.now() - r.lastPing < 500) return;
+    r.lastPing = performance.now();
+    if (r.pings.length < 40) r.pings.push(nowMs());
+    sendPacket(c, PKT.PING, 0, new Uint8Array(0), r.pings[r.pings.length - 1]);
+  }, 250));
 }
 
 async function newSenderKey(r) {
@@ -616,6 +640,7 @@ async function configureVideo(c) {
     r.videoTimer = setInterval(() => {
       if (call !== c || r.venc !== venc || venc.state !== 'configured' || !c.camOn || local.readyState < 2) return;
       if (c.v2 && [...c.peers.values()].every((x) => x.peerPaused)) return; // they cannot see us: encode nothing
+      if (r.draining) return; // the relay path is backed up: let it empty before sending more video
       // Congested: skip this frame before encoding (the stream stays decodable, voice goes first).
       if (venc.encodeQueueSize > 1 || !S.ws || S.ws.bufferedAmount > q.bps / 32) {
         if (!c.v2 || performance.now() > r.graceUntil) r.skipped++;
@@ -765,7 +790,7 @@ function onControl(c, p, msg) {
   if (!msg) return;
   if (!allowControl(p.lastControl || (p.lastControl = {}), msg.t, performance.now())) {
     // Too soon. A state (pause, display size) must not be lost: apply the newest one after the gap.
-    if (msg.t === 'vpause' || msg.t === 'disp') {
+    if (msg.t === 'vpause' || msg.t === 'disp' || msg.t === 'state') {
       const pending = p.pendingControl || (p.pendingControl = {});
       clearTimeout(pending[msg.t]);
       pending[msg.t] = setTimeout(() => { if (call === c) onControl(c, p, msg); }, CONTROL_GAP_MS[msg.t]);
@@ -773,6 +798,13 @@ function onControl(c, p, msg) {
     return;
   }
   if (msg.t === 'caps') { p.caps = msg; return; }
+  if (msg.t === 'state') {
+    if (msg.hand && !p.hand) toast('✋ ' + name(p.user) + ' raised a hand');
+    p.hand = msg.hand ? p.hand || Date.now() : 0;
+    p.camOff = !msg.cam; p.muted = !msg.mic;
+    renderPeople();
+    return;
+  }
   if (msg.t === 'disp') { p.dispH = msg.h; applyLimits(c); return; } // immediate, still bounded by the network
   if (msg.t === 'vstat') { p.vstat = msg; p.lastVstat = msg; return; }
   if (msg.t === 'vpause') {
@@ -886,7 +918,13 @@ function onCallMedia(stamped) {
 function onPacket(c, p, data) {
   const r = c.relay, pr = p.relay, type = data[0], flags = data[1], time = new DataView(data.buffer).getUint32(2), body = data.subarray(6);
   if (type === PKT.PING) { sendPacket(c, PKT.PONG, 0, pr.tagBytes || (pr.tagBytes = unb64(pr.tag)), time); return; }
-  if (type === PKT.PONG) { if (b64(body) === b64(r.sendTag)) showPing(u32(nowMs() - time)); return; }
+  if (type === PKT.PONG) {
+    if (b64(body) !== b64(r.sendTag)) return;
+    const at = r.pings.indexOf(time);
+    if (at >= 0) r.pings.splice(0, at + 1); // answered (older unanswered ones are lost, not pending)
+    showPing(u32(nowMs() - time)); guardQueue(c);
+    return;
+  }
   if (type === PKT.AUDIO) {
     if (!pr.play) {
       pr.play = new AudioWorkletNode(r.actx, 'ember-play', { outputChannelCount: [1] });
@@ -933,7 +971,11 @@ function onPacket(c, p, data) {
       pr.vdec = new VideoDecoder({ output: (vf) => drawRemote(p, vf), error: () => { pr.vdec = null; askKeyframe(c, p); } });
       pr.vdec.configure({ codec: VCODEC[codec], optimizeForLatency: true });
     }
-    if (pr.vdec.decodeQueueSize > 3 && !key) { pr.vlate = (pr.vlate || 0) + 1; return; } // behind: wait for the next key frame
+    // Behind: drop this frame and every delta after it until a key frame (decoding deltas that
+    // refer to a dropped frame is what smears the picture), and ask for that key frame now.
+    if (pr.needKey && !key) return;
+    if (pr.vdec.decodeQueueSize > 3 && !key) { pr.vlate = (pr.vlate || 0) + 1; pr.needKey = true; askKeyframe(c, p); return; }
+    pr.needKey = false;
     pr.vdec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: time * 1000, data: body }));
   }
 }
@@ -955,6 +997,17 @@ function drawRemote(p, vf) {
   vf.close();
   canvas.hidden = false; p.tile.video.hidden = true;
   $('callStage').hidden = false; // a voice call where the other side turned video on (after a hand-off)
+}
+
+/** Queue guard (calls v2 flag on): pause video while the relay path is backed up; see queueGuard. */
+function guardQueue(c, waitingMs) {
+  const r = c.relay;
+  if (!r || !S.callsV2 || !callPrefs.v2) return;
+  const step = queueGuard(r, waitingMs || c.rtt, c.minRtt, performance.now());
+  if (step === 'drain') {
+    r.drains = (r.drains || 0) + 1;
+    if (r.ladder) { r.ladder.update(performance.now(), true, r.rung); applyLimits(c); } else if (r.rung > 0) { r.rung--; configureVideo(c); }
+  } else if (step === 'resume') r.forceKey = true;
 }
 
 function stopRelay(c) {
@@ -1021,11 +1074,12 @@ function showCall(text, incoming) {
   $('callAccept').hidden = !incoming;
   $('callAccept').textContent = 'ACCEPT';
   $('callCam').hidden = !call.video;
-  $('callStage').hidden = !call.video;
+  $('callStage').hidden = !call.video && !call.group; // a group voice call still shows who is in it
+  toggleFull(call.group);
   $('callTiles').replaceChildren();
   $('callCode').replaceChildren();
   $('callInfo').textContent = '';
-  $('callMic').textContent = 'MIC ON'; $('callCam').textContent = 'CAM ON';
+  renderCallButtons(call);
   setCallStatus(text);
   $('callBox').hidden = false;
   (incoming ? $('callAccept') : $('callEnd')).focus();
@@ -1103,34 +1157,66 @@ async function toggleCam() {
   const c = call;
   if (!c || !c.video) return;
   c.camOn = !c.camOn;
-  $('callCam').textContent = c.camOn ? 'CAM ON' : 'CAM OFF';
   const old = c.stream.getVideoTracks()[0];
+  renderCallButtons(c);
+  sendState(c); // the others show "camera off" instead of a frozen last frame
   if (!c.camOn) {
     for (const p of c.peers.values()) if (p.pc && p.videoSender) await p.videoSender.replaceTrack(null);
     if (old) { old.stop(); c.stream.removeTrack(old); } // the camera light goes off
+    $('callLocal').hidden = true;
     return;
   }
   try {
     const fresh = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: CALL.W }, height: { ideal: CALL.H }, frameRate: { ideal: CALL.FPS, max: CALL.FPS }, facingMode: 'user' } });
     const track = fresh.getVideoTracks()[0];
+    if (!c.camOn || call !== c) { track.stop(); return; } // turned off again (or hung up) while the camera was starting
     c.stream.addTrack(track);
-    $('callLocal').srcObject = c.stream;
+    $('callLocal').srcObject = c.stream; $('callLocal').hidden = false;
     for (const p of c.peers.values()) if (p.pc && p.videoSender) await p.videoSender.replaceTrack(track);
     if (c.relay) c.relay.forceKey = true;
-  } catch { c.camOn = false; $('callCam').textContent = 'CAM OFF'; toast('camera unavailable'); }
+  } catch { c.camOn = false; renderCallButtons(c); sendState(c); toast('camera unavailable'); }
 }
 
 function toggleMic() {
   if (!call) return;
   call.micOn = !call.micOn;
   call.stream.getAudioTracks().forEach((t) => { t.enabled = call.micOn; });
-  $('callMic').textContent = call.micOn ? 'MIC ON' : 'MUTED';
+  renderCallButtons(call);
+  sendState(call);
+}
+
+function toggleHand() {
+  if (!call) return;
+  call.hand = !call.hand;
+  renderCallButtons(call);
+  sendState(call);
+}
+
+/** Tells one person (or everyone) what to show for me: camera, microphone, raised hand. */
+function sendState(c, only) {
+  for (const p of only ? [only] : c.peers.values()) {
+    if (p.key) sendCtl(c, p, { t: 'state', cam: !!(c.video && c.camOn), mic: !!c.micOn, hand: !!c.hand });
+  }
+}
+
+function renderCallButtons(c) {
+  $('callMic').textContent = c.micOn ? '🎙 MIC' : '🔇 MUTED'; $('callMic').setAttribute('aria-pressed', String(!c.micOn));
+  $('callCam').textContent = c.camOn ? '📷 CAM' : '🚫 CAM OFF'; $('callCam').setAttribute('aria-pressed', String(!c.camOn));
+  $('callHand').textContent = c.hand ? '✋ LOWER' : '✋ RAISE'; $('callHand').setAttribute('aria-pressed', String(!!c.hand));
+  $('callStage').classList.toggle('selfoff', !(c.video && c.camOn));
+}
+
+function toggleFull(on) {
+  const full = on ?? !$('callBox').classList.contains('full');
+  $('callBox').classList.toggle('full', full);
+  $('callFull').setAttribute('aria-pressed', String(full));
 }
 
 function renderHideIp() {
-  $('hideIpBtn').textContent = '🛡 HIDE MY IP IN CALLS: ' + (callPrefs.hideIp ? 'ON' : 'OFF');
+  $('hideIpBtn').setAttribute('aria-checked', String(callPrefs.hideIp));
   $('qualitySel').value = qualityFor(callPrefs.mode) === QUALITY[callPrefs.mode] ? callPrefs.mode : 'auto';
-  $('callsV2Btn').textContent = 'CALLS V2: ' + (callPrefs.v2 ? 'ON' : 'OFF') + (S.callsV2 ? '' : ' (server off)');
+  $('callsV2Btn').setAttribute('aria-checked', String(callPrefs.v2));
+  $('callsV2Note').textContent = S.callsV2 ? 'adaptive quality · hand-off · low delay' : 'off on the server for now';
 }
 
 $('callBtn').onclick = () => startCall(false);
@@ -1139,6 +1225,8 @@ $('callAccept').onclick = acceptCall;
 $('callEnd').onclick = hangUp;
 $('callMic').onclick = toggleMic;
 $('callCam').onclick = toggleCam;
+$('callHand').onclick = toggleHand;
+$('callFull').onclick = () => toggleFull();
 $('hideIpBtn').onclick = () => { callPrefs.hideIp = !callPrefs.hideIp; store.set('ember.hideIp', callPrefs.hideIp ? '1' : null); renderHideIp(); };
 $('qualitySel').onchange = (e) => {
   callPrefs.mode = QUALITY[e.target.value] ? e.target.value : 'auto';

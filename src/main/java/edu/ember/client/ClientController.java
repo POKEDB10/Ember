@@ -64,6 +64,12 @@ public final class ClientController implements AutoCloseable {
     private final Map<String, KeyCacheEntry> keyCache = new java.util.concurrent.ConcurrentHashMap<>();
     /** This device's end-to-end key pair; null until signed in. */
     private volatile E2eCrypto.Identity identity;
+    /** Keys this device used before it adopted the account key: kept to read older messages. */
+    private volatile java.util.List<E2eCrypto.Identity> olderIdentities = java.util.List.of();
+    /** True when {@link #identity} is the account key shared by all devices (never retired on logout). */
+    private volatile boolean sharedIdentity;
+    /** The password typed for the current sign-in, held only until the key backup is opened. */
+    private volatile char[] pendingPassword;
     static final String LOCKED_TEXT = "🔒 This message cannot be read on this device "
             + "(sent before it was set up, or tampered with).";
 
@@ -125,11 +131,13 @@ public final class ClientController implements AutoCloseable {
     public ClientStateModel model() { return model; }
 
     public void login(String username, char[] password) {
+        pendingPassword = password.clone();
         sendCommand(WireOpcodes.CMD_AUTH_LOGIN, Map.of("user", username,
                 "pass", new String(password), "calls", "1"));
     }
 
     public void register(String username, char[] password, String displayName) {
+        pendingPassword = password.clone();
         sendCommand(WireOpcodes.CMD_AUTH_REGISTER, Map.of("user", username,
                 "pass", new String(password), "displayName", displayName, "calls", "1"));
     }
@@ -521,7 +529,9 @@ public final class ClientController implements AutoCloseable {
         hangUp();
         E2eCrypto.Identity me = identity;
         if (me != null && model.userId() != null) {
-            sendCommand(WireOpcodes.CMD_DEVICE_KEY, Map.of("deviceId", me.deviceId(), "action", "retire"));
+            if (!sharedIdentity) { // the account key stays active: the other devices still use it
+                sendCommand(WireOpcodes.CMD_DEVICE_KEY, Map.of("deviceId", me.deviceId(), "action", "retire"));
+            }
             try {
                 Files.deleteIfExists(clientDataRoot.resolve(model.userId()).resolve("device-key.properties"));
             } catch (IOException exception) {
@@ -627,7 +637,7 @@ public final class ClientController implements AutoCloseable {
             serverCallsV2 = Boolean.parseBoolean(fields.getOrDefault("callsV2", "false"));
             String userId = fields.get("userId");
             initializeOutbox(userId);
-            setUpIdentity(userId);
+            setUpIdentity(userId, fields.get("keyBackup"));
             model.authenticated(userId, "ADMIN".equals(fields.get("role")));
         } else if (frame.opcode() == WireOpcodes.EVT_MSG_ACK) {
             model.updateAcknowledgement(fields.get("clientMsgId"),
@@ -822,24 +832,74 @@ public final class ClientController implements AutoCloseable {
 
     // ---- end-to-end encryption (format shared with the website; see E2eCrypto) ----
 
-    /** Loads this device's key pair for the account, or makes one, and registers the public half. */
-    private void setUpIdentity(String userId) {
+    /**
+     * Loads this device's key pair, or adopts the account key: with the password just typed, the
+     * key backup from the server is opened, so this device reads the same messages as the account's
+     * other devices. The first device of an account uploads its own key as the backup. The key used
+     * before is kept to read older messages.
+     */
+    private void setUpIdentity(String userId, String backup) {
+        char[] password = pendingPassword;
+        pendingPassword = null;
         try {
             Path file = clientDataRoot.resolve(userId).resolve("device-key.properties");
             java.util.Properties saved = new java.util.Properties();
             E2eCrypto.Identity me = null;
+            java.util.List<E2eCrypto.Identity> older = new java.util.ArrayList<>();
             if (Files.exists(file)) {
                 try (var reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
                     saved.load(reader);
                 }
                 me = E2eCrypto.loadIdentity(saved.getProperty("deviceId"),
                         E2eCrypto.decode(saved.getProperty("private")), saved.getProperty("public"));
+                for (int index = 0; saved.containsKey("older." + index + ".deviceId"); index++) {
+                    older.add(E2eCrypto.loadIdentity(saved.getProperty("older." + index + ".deviceId"),
+                            E2eCrypto.decode(saved.getProperty("older." + index + ".private")),
+                            saved.getProperty("older." + index + ".public")));
+                }
             }
+            boolean shared = "true".equals(saved.getProperty("shared"));
+            boolean changed = me == null;
             if (me == null) {
                 me = E2eCrypto.newIdentity();
+            }
+            boolean hasBackup = backup != null && !backup.isEmpty();
+            String upload = null; // "0" = store the backup, "1" = replace the old one
+            if (password != null && hasBackup && !me.deviceId().equals(E2eCrypto.backupDeviceId(backup))) {
+                try {
+                    E2eCrypto.Identity account = E2eCrypto.openBackup(password, userId, backup);
+                    if (!changed) {
+                        older.add(me);
+                        sendCommand(WireOpcodes.CMD_DEVICE_KEY, Map.of("deviceId", me.deviceId(), "action", "retire"));
+                    }
+                    me = account;
+                    shared = true;
+                    changed = true;
+                } catch (java.security.GeneralSecurityException passwordChanged) {
+                    // The backup was sealed with an older password (reset by email): this key replaces it.
+                    upload = "1";
+                    shared = true;
+                    changed = true;
+                }
+            } else if (password != null && !hasBackup) {
+                upload = "0"; // the account's first device: its key becomes the account key
+                shared = true;
+                changed = true;
+            } else if (hasBackup && me.deviceId().equals(E2eCrypto.backupDeviceId(backup))) {
+                shared = true;
+            }
+            if (changed) {
+                saved.clear();
                 saved.setProperty("deviceId", me.deviceId());
                 saved.setProperty("public", me.publicKey());
                 saved.setProperty("private", E2eCrypto.encode(E2eCrypto.privateKeyBytes(me)));
+                saved.setProperty("shared", Boolean.toString(shared));
+                for (int index = 0; index < older.size(); index++) {
+                    saved.setProperty("older." + index + ".deviceId", older.get(index).deviceId());
+                    saved.setProperty("older." + index + ".public", older.get(index).publicKey());
+                    saved.setProperty("older." + index + ".private",
+                            E2eCrypto.encode(E2eCrypto.privateKeyBytes(older.get(index))));
+                }
                 Files.createDirectories(file.getParent());
                 try (var writer = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {
                     saved.store(writer, "Ember device key: keep private, never share");
@@ -847,9 +907,32 @@ public final class ClientController implements AutoCloseable {
                 restrictToOwner(file);
             }
             identity = me;
+            olderIdentities = java.util.List.copyOf(older);
+            sharedIdentity = shared;
             sendCommand(WireOpcodes.CMD_DEVICE_KEY, Map.of("deviceId", me.deviceId(), "pub", me.publicKey()));
+            if (upload != null) {
+                // Sealing takes a moment (600,000 PBKDF2 rounds): done off the receive thread, after the key is registered.
+                E2eCrypto.Identity account = me;
+                String replace = upload;
+                char[] secret = password;
+                password = null; // the task below owns and wipes it
+                sealer.execute(() -> {
+                    try {
+                        sendCommand(WireOpcodes.CMD_DEVICE_KEY, Map.of("deviceId", account.deviceId(), "action", "backup",
+                                "backup", E2eCrypto.sealBackup(secret, userId, account), "replace", replace));
+                    } catch (java.security.GeneralSecurityException exception) {
+                        model.setError("500", "The key backup could not be made");
+                    } finally {
+                        java.util.Arrays.fill(secret, '\0');
+                    }
+                });
+            }
         } catch (IOException | java.security.GeneralSecurityException | RuntimeException exception) {
             model.setError("500", "Encryption could not be set up on this device");
+        } finally {
+            if (password != null) {
+                java.util.Arrays.fill(password, '\0');
+            }
         }
     }
 
@@ -1106,16 +1189,30 @@ public final class ClientController implements AutoCloseable {
             if (me == null || conversationId == null || sender == null) {
                 throw new java.security.GeneralSecurityException("cannot decrypt yet");
             }
-            try {
-                fields.put("body", E2eCrypto.open(me, conversationId, sender, id, fields.get("body"),
-                        keysFor(conversationId, false)));
-            } catch (java.security.GeneralSecurityException unknownDevice) {
-                fields.put("body", E2eCrypto.open(me, conversationId, sender, id, fields.get("body"),
-                        keysFor(conversationId, true)));
-            }
+            fields.put("body", openWithAnyKey(me, conversationId, sender, id, fields.get("body")));
             markEncrypted(conversationId);
         } catch (Exception exception) {
             fields.put("body", LOCKED_TEXT);
+        }
+    }
+
+    /** Tries the current key, then the keys this device used before (older messages were sealed for those). */
+    private String openWithAnyKey(E2eCrypto.Identity me, String conversationId, String sender, String id, String body)
+            throws Exception {
+        java.util.List<E2eCrypto.Identity> keys = new java.util.ArrayList<>(olderIdentities);
+        keys.add(0, me);
+        java.security.GeneralSecurityException last = null;
+        for (E2eCrypto.Identity key : keys) {
+            try {
+                return E2eCrypto.open(key, conversationId, sender, id, body, keysFor(conversationId, false));
+            } catch (java.security.GeneralSecurityException notThisKey) {
+                last = notThisKey;
+            }
+        }
+        try {
+            return E2eCrypto.open(me, conversationId, sender, id, body, keysFor(conversationId, true));
+        } catch (java.security.GeneralSecurityException stillUnknown) {
+            throw last != null ? last : stillUnknown;
         }
     }
 

@@ -51,6 +51,18 @@ What was measured, how, and against which bar. **Setup for every number below:**
 | 1.2 Mbit/s + 20 ms | 540p (1.1 Mbit/s) fits | held 540p/30, round trip 54–79 ms, no step-down |
 | Pause state lost (a "visible again" event never arrives) | the other side does not stay paused | before the fix: video stopped for good (seen live, run 1). After (decision 24): a stray "paused" cleared after 0.7 s |
 
+## Relay queue guard (tunnel-like buffering)
+
+Same proxy, now with a **4 MB** queue, so it behaves like a tunnel or proxy that holds seconds of data (the website is reached through a Cloudflare tunnel). Profile: 800 kbit/s + 30 ms, dropping to **200 kbit/s for 50 s**, then back. One browser through the proxy, one straight to the server, relay forced, synthetic 720p30 camera, Opus voice. Round trips are the sender's relay pings (24 Nov 2026).
+
+| Round trip while the link was at 200 kbit/s | Without the guard | With the guard (decision 38) |
+|---|---|---|
+| Median | 8,822 ms | 93 ms |
+| 95th percentile | 16,804 ms | 894 ms |
+| Max | 17,386 ms | 1,170 ms |
+
+What it costs: at 200 kbit/s video stays paused most of the time (voice keeps going) and is retried every 2–8 s; each try shows as a ~1 s bump. Without the guard video kept flowing, 9–17 s late. Earlier versions measured on the way there: resume as soon as clear (max 1.8 s, bumps every 2–3 s); plus the growing wait (max 5.3 s on the first backlog, because only answered pings counted); plus unanswered pings (the table). On a steady 800 kbit/s link the round trip stayed at 80–100 ms. **Not measured:** the real Cloudflare tunnel with two real people, direct (peer-to-peer) calls under loss.
+
 ## Server load
 
 | What | Measured |
@@ -61,4 +73,4 @@ What was measured, how, and against which bar. **Setup for every number below:**
 
 ## Tests
 
-`scripts\run-tests.bat`: 46 Java tests and 9 Node tests, all passing (24 Nov 2026).
+`scripts\run-tests.bat`: 53 Java tests and 11 Node tests, all passing (24 Nov 2026).

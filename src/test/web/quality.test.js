@@ -153,3 +153,27 @@ test('control messages are validated, clamped and rate-limited (fuzz)', () => {
   assert.ok(!q.allowControl(last, 'vkey', 500), 'key-frame requests at most once a second');
   assert.ok(q.allowControl(last, 'vkey', 1000));
 });
+
+test('queue guard: drains past 400 ms of queue, resumes under 150 ms, waits longer when it keeps backing up', () => {
+  const st = {};
+  assert.strictEqual(q.queueGuard(st, 0, 80, 0), null, 'no measurement yet');
+  assert.strictEqual(q.queueGuard(st, 300, 80, 0), null, '220 ms queued is jitter, not a backlog');
+  assert.strictEqual(q.queueGuard(st, 5080, 80, 1000), 'drain', 'a 5 s backlog pauses video');
+  assert.strictEqual(q.queueGuard(st, 6000, 80, 1500), null, 'already draining');
+  assert.strictEqual(q.queueGuard(st, 300, 80, 2000), null, 'still 220 ms queued: keep draining');
+  assert.strictEqual(q.queueGuard(st, 200, 80, 2500), 'resume', 'first backlog: resume as soon as it is clear');
+  assert.strictEqual(q.queueGuard(st, 900, 80, 4000), 'drain', 'backed up again 1.5 s later');
+  assert.strictEqual(q.queueGuard(st, 100, 80, 4500), null, 'clear, but held for 2 s');
+  assert.strictEqual(q.queueGuard(st, 100, 80, 6100), 'resume', 'resumes after the 2 s hold');
+  assert.strictEqual(q.queueGuard(st, 900, 80, 7000), 'drain', 'and again');
+  assert.strictEqual(st.holdMs, 4000, 'the hold doubles');
+  assert.strictEqual(q.queueGuard(st, 100, 80, 11100), 'resume');
+  assert.strictEqual(q.queueGuard(st, 900, 80, 30000), 'drain', 'after a calm spell');
+  assert.strictEqual(st.holdMs, 0, 'a calm spell resets the hold');
+});
+
+test('state control: camera, microphone and hand must all be booleans', () => {
+  assert.deepStrictEqual(q.parseControl({ v: 2, t: 'state', cam: false, mic: true, hand: true }), { t: 'state', cam: false, mic: true, hand: true });
+  assert.strictEqual(q.parseControl({ v: 2, t: 'state', cam: 'no', mic: true, hand: true }), null);
+  assert.strictEqual(q.parseControl({ v: 2, t: 'state', cam: false, mic: true }), null);
+});

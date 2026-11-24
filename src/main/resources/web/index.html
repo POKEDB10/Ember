@@ -22,12 +22,14 @@
   ║╣ ║║║╠╩╗║╣ ╠╦╝
   ╚═╝╩ ╩╚═╝╚═╝╩╚═</pre>
     <p class="dim">say it · spark it · let it fade</p>
-    <label>USERNAME<input id="user" autocomplete="username" required minlength="3" maxlength="20" pattern="[A-Za-z0-9_]+"></label>
+    <label><span id="userLabel">USERNAME OR EMAIL</span><input id="user" autocomplete="username" required minlength="3" maxlength="254" autocapitalize="none" spellcheck="false"></label>
+    <label id="emailRow" hidden>EMAIL<input id="email" type="email" autocomplete="email" maxlength="254"></label>
     <label>PASSWORD<input id="pass" type="password" autocomplete="current-password" required minlength="8"></label>
     <label id="nameRow" hidden>DISPLAY NAME<input id="displayName" autocomplete="nickname" maxlength="40"></label>
     <p id="loginError" class="error" role="alert"></p>
     <button id="loginBtn" type="submit">&gt; LOG IN</button>
-    <button id="modeBtn" type="button" class="link">New here? Create an account</button>
+    <div class="row between"><button id="modeBtn" type="button" class="link">New here? Create an account</button>
+      <button id="forgotBtn" type="button" class="link">Forgot password?</button></div>
   </form>
 </main>
 
@@ -54,15 +56,25 @@
       <p class="pad dim small">STORIES · 24 H</p>
       <ul id="stories" class="list" aria-label="Stories"></ul>
     </section>
-    <section id="tab-me" class="tabpane pad stack-s" hidden>
-      <div id="meCard"></div>
+    <section id="tab-me" class="tabpane me" hidden>
+      <div id="meCard" class="mecard"></div>
       <div id="requests"></div>
-      <button id="notifyBtn">🔔 NOTIFICATIONS: OFF</button>
-      <button id="hideIpBtn">🛡 HIDE MY IP IN CALLS: OFF</button>
-      <label class="small">CALL QUALITY <select id="qualitySel" aria-label="Call quality"><option value="auto">Auto</option><option value="max">Max</option><option value="datasaver">Data saver</option></select></label>
-      <button id="callsV2Btn">CALLS V2: ON</button>
-      <p class="dim small">Calls are end-to-end encrypted. They try a direct link first (lowest delay); with this on, every call goes through the encrypted relay so the other person never sees your IP address.</p>
-      <p class="dim small">Notifications reach this device even when Ember is closed. Do&nbsp;not&nbsp;disturb silences them.</p>
+      <h3 class="sect">ACCOUNT</h3>
+      <div class="setlist">
+        <button id="emailBtn" class="setrow"><span class="setname">✉ Email<small>sign in and recover your account</small></span><span id="emailVal" class="val">ADD</span></button>
+        <button id="unlockBtn" class="setrow" hidden><span class="setname">🔑 Unlock all messages<small>read what your other devices read</small></span><span class="val">OPEN</span></button>
+      </div>
+      <h3 class="sect">ALERTS</h3>
+      <div class="setlist">
+        <button id="notifyBtn" class="setrow" role="switch" aria-checked="false"><span class="setname">🔔 Notifications<small id="notifyNote">even when Ember is closed · do not disturb mutes</small></span><span class="sw" aria-hidden="true"></span></button>
+      </div>
+      <h3 class="sect">CALLS</h3>
+      <div class="setlist">
+        <button id="hideIpBtn" class="setrow" role="switch" aria-checked="false"><span class="setname">🛡 Hide my IP<small>always use the encrypted relay</small></span><span class="sw" aria-hidden="true"></span></button>
+        <label class="setrow"><span class="setname">▦ Video quality<small>auto follows your connection</small></span><select id="qualitySel" aria-label="Call quality"><option value="auto">Auto</option><option value="max">Max</option><option value="datasaver">Data saver</option></select></label>
+        <button id="callsV2Btn" class="setrow" role="switch" aria-checked="true"><span class="setname">⚡ Calls v2<small id="callsV2Note">adaptive quality · hand-off · low delay</small></span><span class="sw" aria-hidden="true"></span></button>
+      </div>
+      <p class="dim tiny pad">Chats and calls are end-to-end encrypted. Calls try a direct link first (lowest delay).</p>
     </section>
     <footer id="status" class="status dim">offline</footer>
   </aside>
@@ -95,10 +107,12 @@
 </div>
 <div id="overlay" class="overlay" hidden role="dialog" aria-modal="true" aria-label="Picture and video viewer">
   <figure><img id="overlayImg" alt=""><video id="overlayVid" controls playsinline hidden></video><figcaption id="overlayCap"></figcaption></figure>
+  <button id="overlayDel" class="danger overlaydel" hidden>DELETE STORY</button>
   <button id="overlayClose" class="icon" aria-label="Close">×</button>
 </div>
 <section id="callBox" class="window callbox" hidden role="dialog" aria-label="Call">
-  <header class="titlebar"><span id="callTitle" class="ellipsis">▣ CALL</span><span id="callInfo" class="dim"></span></header>
+  <header class="titlebar"><span id="callTitle" class="ellipsis">▣ CALL</span><span class="tools"><span id="callInfo" class="dim"></span>
+    <button id="callFull" class="icon" title="Full screen" aria-label="Full screen" aria-pressed="false">⛶</button></span></header>
   <div id="callStage" class="callstage">
     <div id="callTiles" class="tiles"></div>
     <video id="callLocal" class="selfview" autoplay playsinline muted></video>
@@ -111,6 +125,7 @@
     <button id="callAccept" hidden>ACCEPT</button>
     <button id="callMic" aria-label="Microphone">MIC ON</button>
     <button id="callCam" aria-label="Camera" hidden>CAM ON</button>
+    <button id="callHand" aria-label="Raise hand" aria-pressed="false">✋ RAISE</button>
     <button id="callEnd" class="danger">HANG UP</button>
   </div>
 </section>

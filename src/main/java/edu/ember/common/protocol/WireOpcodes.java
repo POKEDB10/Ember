@@ -46,6 +46,12 @@ public final class WireOpcodes {
     public static final int CMD_FEED_PULL = 0x3A;
     public static final int CMD_PROFILE_GET = 0x3B;
     public static final int CMD_MEDIA_GET = 0x3C;
+    /** Asks for a one-time code by email: purpose register, reset or link. */
+    public static final int CMD_EMAIL_CODE = 0x3D;
+    /** Email + code + new password: sets the password and signs in. */
+    public static final int CMD_PASSWORD_RESET = 0x3E;
+    /** Email + code: links (or replaces) the signed-in account's email. */
+    public static final int CMD_EMAIL_LINK = 0x3F;
     public static final int EVT_AUTH_OK = 0x40;
     public static final int EVT_PONG = 0x41;
     public static final int EVT_MSG_ACK = 0x42;
@@ -72,6 +78,8 @@ public final class WireOpcodes {
     public static final int EVT_KEYS = 0x5A;
     /** A contact added or retired a device: drop cached keys for that user. */
     public static final int EVT_KEYS_CHANGED = 0x5B;
+    /** A one-time code was emailed, or an email was linked (the reply never says whether an account exists). */
+    public static final int EVT_EMAIL = 0x5C;
     public static final int EVT_ERROR = 0x70;
 
     private WireOpcodes() {

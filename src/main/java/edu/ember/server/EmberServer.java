@@ -30,6 +30,18 @@ public final class EmberServer implements AutoCloseable {
     private volatile long handoffTtlMs = 30_000;
     private final java.util.concurrent.ConcurrentMap<String, TokenBucket> handoffBuckets =
             new java.util.concurrent.ConcurrentHashMap<>();
+    /** Sends sign-up and recovery codes; the console until SMTP is configured. */
+    private volatile Mailer mailer = Mailer.console();
+    private final ExecutorService mailSender = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "ember-mail");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private EmailCodes emailCodes;
+    /** Per client address: 5 mails, then one every 12 minutes; and 300 an hour in total. */
+    private final java.util.concurrent.ConcurrentMap<String, TokenBucket> mailBuckets =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final TokenBucket mailTotal = new TokenBucket(300, 300.0 / 3600);
     /** Calls v2 feature flag (server half): --calls-v2 or EMBER_CALLS_V2=1. Off = legacy calls only. */
     private volatile boolean callsV2 = "1".equals(System.getenv("EMBER_CALLS_V2"));
     /** Chosen status per user: away, dnd or invisible (online when absent). Kept while the
@@ -119,6 +131,12 @@ public final class EmberServer implements AutoCloseable {
         storage.init();
         PasswordHasher hasher = new Pbkdf2PasswordHasher();
         authService = new AuthService(storage, hasher, new UserLockManager(), auditLogger);
+        String pepper = storage.setting("email.pepper").orElse(null);
+        if (pepper == null) {
+            pepper = EmailCodes.newPepper();
+            storage.saveSetting("email.pepper", pepper);
+        }
+        emailCodes = new EmailCodes(java.util.Base64.getUrlDecoder().decode(pepper));
         groupService = new GroupService(storage);
         socialFeedService = new SocialFeedService(storage, mediaDirectory, storyTtlSec);
         WebPush push = null;
@@ -215,6 +233,19 @@ public final class EmberServer implements AutoCloseable {
             server.setCallsV2(true);
         }
         server.setPushContact(readOptionalSecret(secrets, "EMBER_PUBLIC_URL"));
+        String smtpHost = readOptionalSecret(secrets, "EMBER_SMTP_HOST");
+        if (smtpHost != null) {
+            int smtpPort = Integer.parseInt(java.util.Objects.requireNonNullElse(
+                    readOptionalSecret(secrets, "EMBER_SMTP_PORT"), "587"));
+            String smtpUser = readSecret(secrets, "EMBER_SMTP_USER");
+            server.setMailer(new SmtpMailer(smtpHost, smtpPort,
+                    smtpPort == 465 ? SmtpMailer.Security.TLS : SmtpMailer.Security.STARTTLS, smtpUser,
+                    readSecret(secrets, "EMBER_SMTP_PASS"),
+                    java.util.Objects.requireNonNullElse(readOptionalSecret(secrets, "EMBER_SMTP_FROM"), smtpUser)));
+            System.out.println("Email codes go out through " + smtpHost + ":" + smtpPort);
+        } else {
+            System.out.println("Email codes are printed here (no EMBER_SMTP_HOST in config/secrets.properties)");
+        }
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 server.close();
@@ -282,6 +313,10 @@ public final class EmberServer implements AutoCloseable {
     /** Call only when the plain-HTTP listener is reachable solely through your own proxy. */
     public void setCallsV2(boolean enabled) {
         callsV2 = enabled;
+    }
+
+    public void setMailer(Mailer mailer) {
+        this.mailer = mailer;
     }
 
     /** For tests: how long a hand-off ticket stays valid. */
@@ -399,6 +434,8 @@ public final class EmberServer implements AutoCloseable {
         private String token;
         /** Only browsers that said they can take calls are rung (the Swing app cannot). */
         private volatile boolean supportsCalls;
+        /** Signed in with the password on this connection (not a resumed token): may set the key backup. */
+        private boolean passwordAuthed;
         /** Who the login rate limiter sees: the socket peer, or the proxy-reported client. */
         private java.net.InetAddress clientAddress;
 
@@ -483,7 +520,9 @@ public final class EmberServer implements AutoCloseable {
         private void route(edu.ember.common.protocol.WireFrame frame) throws IOException {
             try {
                 if ((frame.opcode() == edu.ember.common.protocol.WireOpcodes.CMD_AUTH_LOGIN
-                        || frame.opcode() == edu.ember.common.protocol.WireOpcodes.CMD_AUTH_REGISTER)
+                        || frame.opcode() == edu.ember.common.protocol.WireOpcodes.CMD_AUTH_REGISTER
+                        || frame.opcode() == edu.ember.common.protocol.WireOpcodes.CMD_PASSWORD_RESET
+                        || frame.opcode() == edu.ember.common.protocol.WireOpcodes.CMD_EMAIL_CODE)
                         && !authRateLimiter.allow(clientAddress)) {
                     auditLogger.log("rate_limited", "unknown", clientAddress.getHostAddress());
                     sendError(frame.correlationId(), "429", "Too many requests");
@@ -493,6 +532,9 @@ public final class EmberServer implements AutoCloseable {
                     case edu.ember.common.protocol.WireOpcodes.CMD_AUTH_REGISTER -> authenticate(frame, true);
                     case edu.ember.common.protocol.WireOpcodes.CMD_AUTH_LOGIN -> authenticate(frame, false);
                     case edu.ember.common.protocol.WireOpcodes.CMD_AUTH_RESUME -> resume(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_EMAIL_CODE -> emailCode(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_PASSWORD_RESET -> passwordReset(frame);
+                    case edu.ember.common.protocol.WireOpcodes.CMD_EMAIL_LINK -> emailLink(frame);
                     case edu.ember.common.protocol.WireOpcodes.CMD_AUTH_LOGOUT -> logout();
                     case edu.ember.common.protocol.WireOpcodes.CMD_MSG_SEND -> sendMessage(frame);
                     case edu.ember.common.protocol.WireOpcodes.CMD_MSG_RECEIPT -> receiveReceipt(frame);
@@ -553,9 +595,42 @@ public final class EmberServer implements AutoCloseable {
             MapFields fields = new MapFields(frame.payload());
             String username = fields.required("user");
             char[] password = fields.required("pass").toCharArray();
+            String email = register ? fields.values.get("email") : null;
+            String emailHash = null;
+            if (email != null && !email.isBlank()) {
+                // Sign-up with an email: the address must be free and proven with the code sent to it.
+                email = EmailCodes.normalize(email);
+                emailHash = emailCodes.hash(email);
+                edu.ember.common.security.InputValidator.validateUsername(username);
+                if (storage.findUser(username).isPresent()) {
+                    throw new edu.ember.common.exceptions.AuthenticationException("Invalid username or password");
+                }
+                if (emailOwner(emailHash) != null
+                        || !emailCodes.verify("register", email, fields.values.get("code"), System.currentTimeMillis())) {
+                    throw new edu.ember.common.exceptions.ValidationException("Wrong or expired email code");
+                }
+            }
+            if (!register && username.contains("@")) {
+                String owner = emailOwner(emailCodes.hash(EmailCodes.normalize(username)));
+                if (owner == null) {
+                    authService.failLogin(password);
+                }
+                username = owner;
+            }
             var user = register
                     ? authService.register(username, password, fields.required("displayName"))
                     : authService.login(username, password);
+            if (emailHash != null) {
+                linkEmail(user.userId(), emailHash);
+            }
+            passwordAuthed = true;
+            signIn(frame, user.userId(), fields);
+        }
+
+        /** Finishes any password sign-in: session, AUTH_OK, sync, presence. */
+        private void signIn(edu.ember.common.protocol.WireFrame frame, String signedInUser, MapFields fields)
+                throws IOException {
+            var user = storage.findUser(signedInUser).orElseThrow();
             goOnline(user.userId());
             token = sessions.create(userId);
             java.util.Map<String, String> response = new java.util.HashMap<>();
@@ -566,6 +641,8 @@ public final class EmberServer implements AutoCloseable {
             response.put("globalSeq", "0");
             response.put("ice", ICE_SERVERS);
             response.put("callsV2", Boolean.toString(callsV2));
+            response.put("email", Boolean.toString(storage.setting("useremail:" + userId).filter(v -> !v.isEmpty()).isPresent()));
+            storage.setting("keybackup:" + userId).ifPresent(backup -> response.put("keyBackup", backup));
             supportsCalls = "1".equals(fields.values.get("calls"));
             String sinceRevision = syncStart(fields, response);
             send(edu.ember.common.protocol.FrameFactory.event(
@@ -595,6 +672,8 @@ public final class EmberServer implements AutoCloseable {
             response.put("globalSeq", "0");
             response.put("ice", ICE_SERVERS);
             response.put("callsV2", Boolean.toString(callsV2));
+            response.put("email", Boolean.toString(storage.setting("useremail:" + userId).filter(v -> !v.isEmpty()).isPresent()));
+            storage.setting("keybackup:" + userId).ifPresent(backup -> response.put("keyBackup", backup));
             supportsCalls = "1".equals(fields.values.get("calls"));
             String sinceRevision = syncStart(fields, response);
             send(edu.ember.common.protocol.FrameFactory.event(
@@ -676,6 +755,114 @@ public final class EmberServer implements AutoCloseable {
             broadcastPresence(userId, true);
         }
 
+        /** Who owns an email hash, or null. An unlinked email is stored as an empty value. */
+        private String emailOwner(String emailHash) throws IOException {
+            return storage.setting("email:" + emailHash).filter(owner -> !owner.isEmpty()).orElse(null);
+        }
+
+        private void linkEmail(String owner, String emailHash) throws IOException {
+            String previous = storage.setting("useremail:" + owner).orElse("");
+            if (!previous.isEmpty() && !previous.equals(emailHash)) {
+                storage.saveSetting("email:" + previous, "");
+            }
+            storage.saveSetting("email:" + emailHash, owner);
+            storage.saveSetting("useremail:" + owner, emailHash);
+        }
+
+        /**
+         * Emails a one-time code. The answer is always "sent", so nobody can learn which addresses
+         * have accounts: an address already in use gets a notice instead of a sign-up code, and a
+         * reset for an unknown address sends nothing.
+         */
+        private void emailCode(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            MapFields fields = new MapFields(frame.payload());
+            String purpose = fields.required("purpose");
+            String email = EmailCodes.normalize(fields.required("email"));
+            if (purpose.equals("link")) {
+                requireAuthenticated(frame.correlationId());
+            } else if (!purpose.equals("register") && !purpose.equals("reset")) {
+                throw new edu.ember.common.exceptions.ValidationException("Unknown code purpose");
+            }
+            boolean perAddress = clientAddress.isLoopbackAddress() // like the login limiter: loopback demos share one address
+                    || mailBuckets.computeIfAbsent(clientAddress.getHostAddress(), ignored -> new TokenBucket(5, 1.0 / 720)).tryConsume();
+            if (!perAddress || !mailTotal.tryConsume()) {
+                throw new edu.ember.common.exceptions.RateLimitedException("Too many emails: try again later");
+            }
+            String owner = emailOwner(emailCodes.hash(email));
+            String code = emailCodes.issue(purpose, email, System.currentTimeMillis());
+            String subject;
+            String body;
+            if (purpose.equals("reset") && owner == null) {
+                subject = null;
+                body = null;
+            } else if (owner != null && !purpose.equals("reset") && !owner.equals(userId)) {
+                subject = "Your Ember account";
+                body = "Someone (maybe you) tried to use this email for a new Ember account, but it already "
+                        + "belongs to @" + owner + ".\n\nForgot the password? Choose \"Forgot password\" on the "
+                        + "sign-in screen. If this was not you, you can ignore this email.";
+            } else {
+                subject = "Your Ember code: " + code;
+                body = "Your Ember " + (purpose.equals("reset") ? "password reset" : purpose.equals("link")
+                        ? "email confirmation" : "sign-up") + " code is\n\n    " + code + "\n\nIt works once, "
+                        + "for 10 minutes. Nobody from Ember will ever ask you for it.";
+            }
+            if (subject != null) {
+                String to = email;
+                Mailer current = mailer;
+                mailSender.execute(() -> {
+                    try {
+                        current.send(to, subject, body);
+                    } catch (IOException | RuntimeException failure) {
+                        java.util.logging.Logger.getLogger(EmberServer.class.getName())
+                                .log(Level.WARNING, "An email could not be sent: " + failure.getMessage());
+                    }
+                });
+            }
+            send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_EMAIL,
+                    frame.correlationId(), java.util.Map.of("sent", "true")));
+        }
+
+        /** Email + code + new password: sets it, signs out every other device, and signs in here. */
+        private void passwordReset(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            MapFields fields = new MapFields(frame.payload());
+            String email = EmailCodes.normalize(fields.required("email"));
+            String owner = emailOwner(emailCodes.hash(email));
+            char[] password = fields.required("pass").toCharArray();
+            edu.ember.common.security.InputValidator.validatePassword(password);
+            if (owner == null || !emailCodes.verify("reset", email, fields.required("code"), System.currentTimeMillis())) {
+                throw new edu.ember.common.exceptions.ValidationException("Wrong or expired email code");
+            }
+            authService.resetPassword(owner, password);
+            sessions.removeUser(owner);
+            for (ConnectionHandler device : online.getOrDefault(owner, java.util.Set.of())) {
+                if (device != this) {
+                    device.closeQuietly(); // signed in with the old password: they must sign in again
+                }
+            }
+            passwordAuthed = true;
+            signIn(frame, owner, fields);
+        }
+
+        /** Links (or changes) the signed-in account's email after the code sent to it is entered. */
+        private void emailLink(edu.ember.common.protocol.WireFrame frame) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            requireAuthenticated(frame.correlationId());
+            MapFields fields = new MapFields(frame.payload());
+            String email = EmailCodes.normalize(fields.required("email"));
+            String emailHash = emailCodes.hash(email);
+            String owner = emailOwner(emailHash);
+            if ((owner != null && !owner.equals(userId))
+                    || !emailCodes.verify("link", email, fields.required("code"), System.currentTimeMillis())) {
+                throw new edu.ember.common.exceptions.ValidationException("Wrong or expired email code");
+            }
+            linkEmail(userId, emailHash);
+            auditLogger.log("email_linked", userId, "email_code");
+            send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_EMAIL,
+                    frame.correlationId(), java.util.Map.of("linked", "true")));
+        }
+
         /** Registers (or retires, on logout) this device's public key for encrypted chats. */
         private void deviceKey(edu.ember.common.protocol.WireFrame frame) throws IOException,
                 edu.ember.common.exceptions.EmberException {
@@ -684,6 +871,10 @@ public final class EmberServer implements AutoCloseable {
             String deviceId = fields.required("deviceId");
             if (!DeviceKeys.validDeviceId(deviceId)) {
                 throw new edu.ember.common.exceptions.ValidationException("Invalid device id");
+            }
+            if ("backup".equals(fields.values.get("action"))) {
+                saveKeyBackup(frame, fields);
+                return;
             }
             boolean retire = "retire".equals(fields.values.get("action"));
             synchronized (DeviceKeys.class) {
@@ -714,6 +905,33 @@ public final class EmberServer implements AutoCloseable {
                     }
                 }
             }
+            send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_KEYS,
+                    frame.correlationId(), java.util.Map.of("n", "0")));
+        }
+
+        /**
+         * The account key, sealed on the device with a key derived from the password (the server
+         * cannot open it without the password). Every device that signs in with the password opens
+         * it, so all of them read the same messages. Only a password sign-in may set it, and an
+         * existing backup is replaced only on request (after a password reset).
+         */
+        private void saveKeyBackup(edu.ember.common.protocol.WireFrame frame, MapFields fields)
+                throws IOException, edu.ember.common.exceptions.EmberException {
+            String backup = fields.required("backup");
+            if (!backup.matches("kb1\\.[A-Za-z0-9_-]{16,43}\\.[A-Za-z0-9_-]{87}\\.[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{100,400}")) {
+                throw new edu.ember.common.exceptions.ValidationException("Invalid key backup");
+            }
+            if (!passwordAuthed) {
+                throw new edu.ember.common.exceptions.AuthorizationException("Sign in with your password to change the key backup");
+            }
+            synchronized (DeviceKeys.class) {
+                if (storage.setting("keybackup:" + userId).isPresent() && !"1".equals(fields.values.get("replace"))) {
+                    sendError(frame.correlationId(), "409", "A key backup already exists");
+                    return;
+                }
+                storage.saveSetting("keybackup:" + userId, backup);
+            }
+            auditLogger.log("key_backup_saved", userId, "device");
             send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_KEYS,
                     frame.correlationId(), java.util.Map.of("n", "0")));
         }
@@ -1264,6 +1482,10 @@ public final class EmberServer implements AutoCloseable {
         private void viewStories(edu.ember.common.protocol.WireFrame frame) throws IOException,
                 edu.ember.common.exceptions.EmberException {
             requireAuthenticated(frame.correlationId());
+            MapFields request = new MapFields(frame.payload());
+            if ("delete".equals(request.values.get("action"))) {
+                socialFeedService.deleteStory(userId, request.required("storyId"));
+            }
             java.util.List<edu.ember.common.model.StoryItem> stories =
                     socialFeedService.stories(userId);
             java.util.Map<String, String> response = new java.util.HashMap<>();
@@ -1418,6 +1640,13 @@ public final class EmberServer implements AutoCloseable {
                 send(edu.ember.common.protocol.FrameFactory.event(
                         edu.ember.common.protocol.WireOpcodes.EVT_FEED_PAGE,
                         frame.correlationId(), response));
+                return;
+            }
+            if (fields.values.getOrDefault("action", "").equals("delete")) {
+                socialFeedService.deletePost(userId, fields.required("postId"));
+                send(edu.ember.common.protocol.FrameFactory.event(
+                        edu.ember.common.protocol.WireOpcodes.EVT_FEED_PAGE, frame.correlationId(),
+                        java.util.Map.of("post.n", "0", "deleted", fields.required("postId"))));
                 return;
             }
             var post = socialFeedService.interact(userId, fields.required("postId"),
@@ -1873,6 +2102,14 @@ public final class EmberServer implements AutoCloseable {
 
         private String receiptKey(edu.ember.common.model.Message message) {
             return message.senderUserId() + "\n" + message.clientMsgId();
+        }
+
+        private void closeQuietly() {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // already closed
+            }
         }
 
         private void requireAuthenticated(long correlationId) throws IOException {

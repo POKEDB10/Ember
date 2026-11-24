@@ -70,6 +70,15 @@ public final class InMemoryStorageEngine implements StorageEngine {
     }
 
     @Override
+    public synchronized void updateUser(UserRecord user) throws IOException {
+        String key = user.username().toLowerCase(java.util.Locale.ROOT);
+        if (!users.containsKey(key)) {
+            throw new IOException("No such account");
+        }
+        users.put(key, user);
+    }
+
+    @Override
     public synchronized Optional<UserRecord> findUser(String username) {
         return Optional.ofNullable(users.get(username.toLowerCase(java.util.Locale.ROOT)));
     }
@@ -412,6 +421,16 @@ public final class InMemoryStorageEngine implements StorageEngine {
         });
         contacts.remove(userId);
         return contacts;
+    }
+
+    @Override public synchronized void deletePost(String postId) {
+        posts.remove(postId);
+        postLikes.remove(postId);
+        comments.remove(postId);
+    }
+
+    @Override public synchronized void deleteStory(String storyId) {
+        stories.remove(storyId);
     }
 
     @Override public synchronized void saveSetting(String key, String value) {
