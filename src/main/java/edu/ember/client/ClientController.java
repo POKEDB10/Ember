@@ -78,6 +78,13 @@ public final class ClientController implements AutoCloseable {
         }
     }
 
+    /** The current voice call (desktop calls always use the encrypted relay), or null. */
+    private volatile CallSession call;
+    private volatile CallSession lastCall;
+    private volatile long ringCorrelation;
+    private volatile long acceptCorrelation;
+    private volatile Runnable callListener = () -> { };
+
     private volatile String activeConversationId;
     private volatile String sessionToken;
     private volatile LocalOutbox outbox;
@@ -114,12 +121,12 @@ public final class ClientController implements AutoCloseable {
 
     public void login(String username, char[] password) {
         sendCommand(WireOpcodes.CMD_AUTH_LOGIN, Map.of("user", username,
-                "pass", new String(password)));
+                "pass", new String(password), "calls", "1"));
     }
 
     public void register(String username, char[] password, String displayName) {
         sendCommand(WireOpcodes.CMD_AUTH_REGISTER, Map.of("user", username,
-                "pass", new String(password), "displayName", displayName));
+                "pass", new String(password), "displayName", displayName, "calls", "1"));
     }
 
     public String sendMessage(String conversationId, String body) {
@@ -195,7 +202,7 @@ public final class ClientController implements AutoCloseable {
 
     public void resume(String token, long lastGlobalSeq) {
         sendCommand(WireOpcodes.CMD_AUTH_RESUME,
-                Map.of("token", token, "lastGlobalSeq", Long.toString(lastGlobalSeq)));
+                Map.of("token", token, "lastGlobalSeq", Long.toString(lastGlobalSeq), "calls", "1"));
     }
 
     public void resumeStoredSession(String userId) throws IOException {
@@ -387,7 +394,95 @@ public final class ClientController implements AutoCloseable {
     }
 
     /** Logging out also retires this device's key: it gets no new encrypted messages and forgets its key. */
+    // ---- voice calls ----
+
+    public CallSession call() { return call; }
+
+    /** The call that just ended, so its window can show why. */
+    public CallSession lastCall() { return lastCall; }
+
+    /** Runs on the Swing thread whenever a call starts, changes or ends. */
+    public void setCallListener(Runnable listener) { callListener = listener; }
+
+    private void callChanged() {
+        CallSession current = call;
+        if (current != null && current.state() == CallSession.State.ENDED) {
+            lastCall = current;
+            call = null;
+        }
+        javax.swing.SwingUtilities.invokeLater(() -> callListener.run());
+    }
+
+    private CallSession newCall(String conversationId, boolean incoming, String callId) {
+        String[] parts = conversationId.split(":");
+        String title = parts.length == 3 ? (parts[1].equals(model.userId()) ? parts[2] : parts[1])
+                : java.util.Optional.ofNullable(model.groupDetails(parts[1])).map(g -> "#" + g.name()).orElse("group");
+        return new CallSession(model.userId(), conversationId, title, incoming, callId,
+                (kind, fields) -> {
+                    Map<String, String> all = new HashMap<>(fields);
+                    all.put("kind", kind);
+                    sendCommand(WireOpcodes.CMD_CALL, all);
+                },
+                packet -> outbound.enqueue(new WireFrame.Builder(WireOpcodes.CMD_CALL_MEDIA).payload(packet).build()),
+                this::callChanged);
+    }
+
+    /** Starts a voice call in a direct or group chat. */
+    public void startCall(String conversationId) {
+        if (call != null || model.userId() == null) {
+            return;
+        }
+        call = newCall(conversationId, false, "");
+        WireFrame ring = commandFrame(WireOpcodes.CMD_CALL, Map.of("kind", "ring", "convId", conversationId,
+                "video", "false"));
+        ringCorrelation = ring.correlationId();
+        outbound.enqueue(ring);
+        callChanged();
+    }
+
+    public void acceptCall() {
+        CallSession current = call;
+        if (current == null || current.state() != CallSession.State.RINGING_IN) {
+            return;
+        }
+        WireFrame accept = commandFrame(WireOpcodes.CMD_CALL, Map.of("kind", "accept", "callId", current.callId()));
+        acceptCorrelation = accept.correlationId();
+        outbound.enqueue(accept);
+    }
+
+    public void hangUp() {
+        CallSession current = call;
+        if (current == null) {
+            return;
+        }
+        if (!current.callId().isEmpty()) {
+            sendCommand(WireOpcodes.CMD_CALL, Map.of("kind",
+                    current.state() == CallSession.State.RINGING_IN ? "decline" : "end", "callId", current.callId()));
+        }
+        current.end("call ended");
+    }
+
+    private void onCallFrame(WireFrame frame, Map<String, String> fields) {
+        String kind = fields.getOrDefault("kind", "");
+        CallSession current = call;
+        if (frame.correlationId() != 0 && frame.correlationId() == ringCorrelation && current != null) {
+            current.ringing(fields.getOrDefault("callId", ""));
+        } else if (frame.correlationId() != 0 && frame.correlationId() == acceptCorrelation && current != null) {
+            current.roster(fields);
+        } else if (kind.equals("ring")) {
+            if (current != null) {
+                sendCommand(WireOpcodes.CMD_CALL, Map.of("kind", "decline", "callId", fields.getOrDefault("callId", "")));
+                return;
+            }
+            call = newCall(fields.getOrDefault("convId", ""), true, fields.get("callId"));
+            callChanged();
+        } else if (current != null && current.callId().equals(fields.get("callId"))) {
+            current.onEvent(fields);
+        }
+    }
+
     public void logout() {
+        hangUp();
         E2eCrypto.Identity me = identity;
         if (me != null && model.userId() != null) {
             sendCommand(WireOpcodes.CMD_DEVICE_KEY, Map.of("deviceId", me.deviceId(), "action", "retire"));
@@ -406,6 +501,10 @@ public final class ClientController implements AutoCloseable {
 
     @Override
     public void close() {
+        CallSession current = call;
+        if (current != null) {
+            current.end("call ended");
+        }
         closing = true;
         heartbeat.shutdownNow();
         frameWorker.shutdownNow();
@@ -424,6 +523,13 @@ public final class ClientController implements AutoCloseable {
 
     /** Called on the network reader thread. Key replies are answered here; all else goes in order to the worker. */
     void handleFrame(WireFrame frame) {
+        if (frame.opcode() == WireOpcodes.EVT_CALL_MEDIA) {
+            CallSession current = call; // voice packets skip the queue: they must never wait
+            if (current != null) {
+                current.onMedia(frame.payload());
+            }
+            return;
+        }
         if (frame.opcode() == WireOpcodes.EVT_KEYS || frame.opcode() == WireOpcodes.EVT_ERROR) {
             var waiting = keyRequests.remove(frame.correlationId());
             if (waiting != null) {
@@ -451,6 +557,14 @@ public final class ClientController implements AutoCloseable {
         Map<String, String> fields = new HashMap<>(KvPayloadCodec.decode(frame.payload()));
         if (fields.getOrDefault("body", "").startsWith(E2eCrypto.PREFIX)) {
             openSealed(fields);
+        }
+        if (frame.opcode() == WireOpcodes.EVT_CALL) {
+            onCallFrame(frame, fields);
+            return;
+        }
+        if (frame.opcode() == WireOpcodes.EVT_ERROR && call != null
+                && (frame.correlationId() == ringCorrelation || frame.correlationId() == acceptCorrelation)) {
+            call.end(fields.getOrDefault("message", "call failed"));
         }
         if (frame.opcode() == WireOpcodes.EVT_AUTH_OK) {
             sessionToken = fields.get("token");

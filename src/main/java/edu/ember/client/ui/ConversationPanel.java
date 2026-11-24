@@ -32,6 +32,7 @@ public final class ConversationPanel extends JPanel implements ClientModelListen
     private final javax.swing.JButton createPollButton = new javax.swing.JButton("Create poll");
     private final javax.swing.JButton groupInfoButton = new javax.swing.JButton("Group info");
     private final javax.swing.JButton safetyButton = new javax.swing.JButton("🔒 Safety number");
+    private final javax.swing.JButton callButton = new javax.swing.JButton("📞 Call");
     private final javax.swing.JTextField searchField = new javax.swing.JTextField(14);
     private final SearchEngine searchEngine = new SearchEngine();
     private final JLabel replyIndicator = new JLabel();
@@ -76,6 +77,14 @@ public final class ConversationPanel extends JPanel implements ClientModelListen
         safetyButton.addActionListener(event -> showSafetyNumber());
         safetyButton.setVisible(false);
         headerTools.add(safetyButton);
+        callButton.setToolTipText("Voice call (end-to-end encrypted)");
+        callButton.addActionListener(event -> {
+            if (conversationId != null) {
+                controller.startCall(conversationId);
+            }
+        });
+        callButton.setVisible(false);
+        headerTools.add(callButton);
         headerTools.add(connection);
         header.add(headerTools, BorderLayout.EAST);
         pinnedBanner.setForeground(ThemeManager.current().muted());
@@ -139,6 +148,7 @@ public final class ConversationPanel extends JPanel implements ClientModelListen
         createPollButton.setVisible(id.startsWith("grp:"));
         groupInfoButton.setVisible(id.startsWith("grp:"));
         safetyButton.setVisible(id.startsWith("dm:"));
+        callButton.setVisible(true);
         refreshMessages();
         composer.requestFocusInWindow();
     }

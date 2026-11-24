@@ -35,6 +35,7 @@ public final class ChatWorkspacePanel extends JPanel implements ClientModelListe
         this.controller = controller;
         setBackground(ThemeManager.current().background());
         conversation = new ConversationPanel(controller);
+        controller.setCallListener(() -> CallDialog.update(this, controller));
         chatList = new ChatListPanel(controller, id -> {
             conversation.openConversation(id);
             openConversation.accept(id);
