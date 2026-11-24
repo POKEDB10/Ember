@@ -97,10 +97,10 @@ function noticeNewDevices(convId, list) {
   let changed = false;
   for (const k of list) {
     if (!k.active || (k.user === S.me && e2e.dev && k.dev === e2e.dev.id && k.pub === e2e.dev.pub)) continue;
-    const known = seen[k.user];
-    if (!known) { seen[k.user] = [k.dev]; changed = true; continue; }
-    if (!known.includes(k.dev)) {
-      known.push(k.dev); changed = true;
+    const known = seen[k.user], pin = k.dev + ':' + k.pub; // the key is pinned, not just the device id
+    if (!known) { seen[k.user] = [pin]; changed = true; continue; }
+    if (!known.includes(pin)) {
+      known.push(pin); changed = true;
       // A device added to your own account also receives your messages: warn about that too.
       toast(k.user === S.me ? '🔑 A new device was added to YOUR account. If it is not yours, change your password and check the device codes in your profile.'
         : '🔑 ' + name(k.user) + ' signed in on a new device. Compare the device codes in their profile.');
@@ -146,6 +146,17 @@ async function wrapKey(pub, salt, from, to) {
 const aad = (convId, sender, msgId) => utf8.encode(convId + '\n' + sender + '\n' + msgId);
 const ZERO_IV = new Uint8Array(12);
 
+/**
+ * What each key wrap is bound to: SHA-256 of chat, sender, message id, iv and ciphertext. Another
+ * recipient who learns the message key still cannot pass new text off under the sender's wrap.
+ */
+async function binding(convId, sender, msgId, iv, ct) {
+  const head = aad(convId, sender, msgId);
+  const all = new Uint8Array(head.length + iv.length + ct.length);
+  all.set(head); all.set(iv, head.length); all.set(ct, head.length + iv.length);
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', all));
+}
+
 // ---- encrypt before sending ----
 /** Returns the body to send: encrypted for every device in the chat, or refuses. */
 async function sealBody(convId, msgId, text) {
@@ -170,8 +181,9 @@ async function sealBody(convId, msgId, text) {
   const msgKeyRaw = rand(32), iv = rand(12), salt = rand(16);
   const msgKey = await crypto.subtle.importKey('raw', msgKeyRaw, 'AES-GCM', false, ['encrypt']);
   const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad(convId, S.me, msgId) }, msgKey, utf8.encode(text));
+  const bind = await binding(convId, S.me, msgId, iv, new Uint8Array(ct));
   const wraps = await Promise.all(list.map(async (k) => {
-    const w = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ZERO_IV }, await wrapKey(k.pub, salt, e2e.dev.id, k.dev), msgKeyRaw);
+    const w = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ZERO_IV, additionalData: bind }, await wrapKey(k.pub, salt, e2e.dev.id, k.dev), msgKeyRaw);
     return k.dev + ':' + enc(w);
   }));
   return E2E.PREFIX + [e2e.dev.id, enc(salt), enc(iv), enc(ct), wraps.join(',')].join('.');
@@ -189,7 +201,8 @@ async function openBody(convId, sender, msgId, body) {
   let senderKey = list.find((k) => k.user === sender && k.dev === from);
   if (!senderKey) { list = await keysFor(convId, true); senderKey = list.find((k) => k.user === sender && k.dev === from); }
   if (!senderKey) throw new Error('unknown sender device');
-  const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ZERO_IV }, await wrapKey(senderKey.pub, dec(salt), from, e2e.dev.id), dec(mine.split(':')[1]));
+  const bind = await binding(convId, sender, msgId, dec(iv), dec(ct));
+  const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ZERO_IV, additionalData: bind }, await wrapKey(senderKey.pub, dec(salt), from, e2e.dev.id), dec(mine.split(':')[1]));
   const msgKey = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
   return unutf8.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: dec(iv), additionalData: aad(convId, sender, msgId) }, msgKey, dec(ct)));
 }
@@ -211,7 +224,11 @@ async function decryptFrame(f) {
 
 /** Frames are handled in arrival order; ones carrying encrypted text wait for their decryption. */
 function inbound(msg) {
+  delete msg.f.e2e; // never trust an "encrypted" marker from the wire: only a local decryption sets it
   const needs = msg.f.body && msg.f.body.startsWith(E2E.PREFIX);
+  if (!needs && msg.f.body && msg.f.convId && wasEncrypted(msg.f.convId)) {
+    msg.f.body = '⚠ unencrypted message in an encrypted chat (not verified): ' + msg.f.body;
+  }
   if (msg.op === OP.KEYS_CHANGED) { e2e.keys.clear(); return; }
   // Key replies (and errors for waiting requests) skip the queue: a decryption may be waiting for them.
   if (msg.op === OP.KEYS || (msg.op === OP.ERROR && S.waiting.has(msg.corr))) { handle(msg); return; }

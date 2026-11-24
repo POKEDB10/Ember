@@ -557,6 +557,10 @@ public final class ClientController implements AutoCloseable {
         Map<String, String> fields = new HashMap<>(KvPayloadCodec.decode(frame.payload()));
         if (fields.getOrDefault("body", "").startsWith(E2eCrypto.PREFIX)) {
             openSealed(fields);
+        } else if (fields.containsKey("body") && fields.containsKey("convId") && model.userId() != null
+                && wasEncrypted(fields.get("convId"))) {
+            // Plain text in a chat that has been encrypted: shown, but clearly flagged as not verified.
+            fields.put("body", "⚠ unencrypted message in an encrypted chat (not verified): " + fields.get("body"));
         }
         if (frame.opcode() == WireOpcodes.EVT_CALL) {
             onCallFrame(frame, fields);

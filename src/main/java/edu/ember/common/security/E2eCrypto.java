@@ -153,23 +153,36 @@ public final class E2eCrypto {
         byte[] salt = random(16);
         byte[] ciphertext = aesGcm(true, messageKey, iv, associatedData(conversationId, sender, messageId),
                 text.getBytes(StandardCharsets.UTF_8));
+        byte[] bind = binding(conversationId, sender, messageId, iv, ciphertext);
         StringBuilder wraps = new StringBuilder();
         boolean self = false;
         for (DeviceKey device : devices) {
             self |= device.deviceId().equals(me.deviceId());
-            appendWrap(wraps, me, device.deviceId(), device.publicKey(), salt, messageKey);
+            appendWrap(wraps, me, device.deviceId(), device.publicKey(), salt, messageKey, bind);
         }
         if (!self) {
-            appendWrap(wraps, me, me.deviceId(), me.publicKey(), salt, messageKey);
+            appendWrap(wraps, me, me.deviceId(), me.publicKey(), salt, messageKey, bind);
         }
         return PREFIX + me.deviceId() + "." + encode(salt) + "." + encode(iv) + "." + encode(ciphertext)
                 + "." + wraps;
     }
 
+    /**
+     * What each key wrap is bound to: SHA-256 of chat, sender, message id, iv and ciphertext. Another
+     * recipient who learns the message key still cannot pass new text off under the sender's wrap.
+     */
+    private static byte[] binding(String conversationId, String sender, String messageId, byte[] iv,
+            byte[] ciphertext) throws GeneralSecurityException {
+        java.security.MessageDigest sha = java.security.MessageDigest.getInstance("SHA-256");
+        sha.update(associatedData(conversationId, sender, messageId));
+        sha.update(iv);
+        return sha.digest(ciphertext);
+    }
+
     private static void appendWrap(StringBuilder wraps, Identity me, String deviceId, String publicKey,
-            byte[] salt, byte[] messageKey) throws GeneralSecurityException {
+            byte[] salt, byte[] messageKey, byte[] bind) throws GeneralSecurityException {
         byte[] wrapped = aesGcm(true, wrapKey(me, decode(publicKey), salt, me.deviceId(), deviceId),
-                ZERO_IV, null, messageKey);
+                ZERO_IV, bind, messageKey);
         if (wraps.length() > 0) {
             wraps.append(',');
         }
@@ -199,8 +212,9 @@ public final class E2eCrypto {
         if (mine == null) {
             throw new GeneralSecurityException("Not encrypted for this device");
         }
+        byte[] bind = binding(conversationId, sender, messageId, decode(parts[2]), decode(parts[3]));
         byte[] messageKey = aesGcm(false, wrapKey(me, decode(senderKey.publicKey()), decode(parts[1]), from,
-                me.deviceId()), ZERO_IV, null, decode(mine));
+                me.deviceId()), ZERO_IV, bind, decode(mine));
         return new String(aesGcm(false, messageKey, decode(parts[2]),
                 associatedData(conversationId, sender, messageId), decode(parts[3])), StandardCharsets.UTF_8);
     }
