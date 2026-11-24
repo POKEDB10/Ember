@@ -114,7 +114,7 @@ Conversation IDs: direct chats are `dm:` plus the two usernames in alphabetical 
 | Direct and group chat | As in section 5. Groups have a moderator who adds and removes members. | `EmberServer`, `GroupService` |
 | Receipts ✓ / ✓✓ | Delivered and read receipts. In groups, ✓✓ only once everyone has read it. | `GroupReceiptTracker` |
 | Typing… | Sent at most once every 3 seconds, only to people in that chat. | `EmberServer.typing` |
-| Presence and status | Online, away (manual or after 5 minutes idle), do not disturb, invisible (looks offline to others). | `EmberServer.presenceEvent` |
+| Presence and status | Online, away (manual or after 5 minutes idle), do not disturb, invisible (looks offline to others). Only your contacts (chat partners, group mates, accepted follows) ever see it. | `EmberServer.presenceEvent` |
 | Reply, react, edit, delete | Each is its own command. The server checks you own the message (edit/delete) or are in the chat (react). | `EmberServer` |
 | Pins and stars | Pins are seen by everyone in the chat; stars only by you, on all your devices. | `EmberServer`, storage |
 | Disappearing messages | 15-second timer; a background thread deletes them and tells every app. | `ExpiryReaperThread` |
@@ -128,59 +128,78 @@ Conversation IDs: direct chats are `dm:` plus the two usernames in alphabetical 
 | Notifications | In-page card with quick reply; system notification when the tab is in the background; Web Push when no tab is open. | `app.js`, `sw.js`, `WebPush` |
 | Offline cache | The website keeps chats in the browser (IndexedDB) and on return asks only "what changed since revision N". | `app.js` (`cache`), `EmberServer.syncStart` |
 | Themes | 7 retro themes on the web, 2 on desktop. | `app.css`, `ThemeManager` |
-| **Voice and video calls** | Section 7. | `call.js`, `call-worklet.js`, `CallRegistry` |
+| **Voice and video calls** | One-to-one and group, section 7. | `call.js`, `call-worklet.js`, `CallRegistry`, `CallSession` |
+| **End-to-end encrypted chats** | Section 7b. | `e2e.js`, `E2eCrypto`, `DeviceKeys` |
 
 ---
 
 ## 7. Voice and video calls
 
 ### The short version
-Press 📞 or 🎥 in a direct chat. The other person's website rings. When they answer:
+Press 📞 (voice) or 🎥 (video) in a direct chat **or a group chat** (up to 8 people). On the website everyone in the chat rings; the desktop app rings too and joins with voice. When people answer:
 
-1. **Lowest delay first:** the two browsers try to connect **directly** to each other (WebRTC, peer-to-peer). Audio and video then do not pass through our server at all, so the delay is only the distance between the two people.
-2. **If that is blocked** (some networks, including many in the UAE, block calling apps and their UDP traffic), the call switches to the **relay** within about 6 seconds: the audio and video packets travel inside the normal HTTPS WebSocket the website already uses. To the network it looks like an ordinary web page.
+1. **Lowest delay first:** the browsers try to connect **directly** to each other (WebRTC, peer-to-peer), for calls of up to 4 people. Audio and video then do not pass through our server at all, so the delay is only the distance between the people.
+2. **Otherwise the relay:** if a direct link fails within about 6 seconds, if anyone turned on "Hide my IP", if a desktop app is in the call, or if more than 4 people join, the whole call switches to the **relay**. The audio and video packets travel inside the normal HTTPS WebSocket the website already uses, so to the network it looks like an ordinary web page. That is why it still works where VoIP or UDP is blocked.
 
 Either way the call is **end-to-end encrypted**: our server cannot listen.
 
 ### Step by step
-1. **Ring.** Alice's browser sends `CALL kind=ring`. The server checks the same rules as messages (DM only, no blocks), plus a rate limit (5 rings, then 1 per 20 s). It rings only Bob's devices that can take calls (website, not the Swing app). If Bob is offline, on do not disturb, or already on a call, Alice hears ordinary ringing that is never answered, and Bob gets a "missed call" push. That way a call never reveals whether someone who looks offline or invisible is really online. Unanswered calls stop after 45 s.
-2. **Answer.** Bob presses ACCEPT. The server links exactly *one* of Bob's devices with Alice's device; his other devices stop ringing.
-3. **Keys.** Each browser makes a brand-new key pair for this call (ECDH P-256) and sends the public half. Both compute the same secret key (HKDF, then AES-GCM 128). The server only ever sees the public halves, so it cannot compute the key.
-4. **Safety code.** Both screens show 12 digits made from the two public keys. If the codes match, nobody (not even the server) swapped the keys, so nobody is in the middle. Users can read them out to each other.
-5. **Everything after that is encrypted with the call key**, including the network addresses (ICE candidates) for the direct link. So the server never learns your IP address from a call.
-6. **Direct link** (WebRTC): DTLS-SRTP encryption (built into every browser). Its fingerprints are inside the encrypted signals, so the server cannot fake them either.
-7. **Relay** (if direct fails, or if "Hide my IP" is on): the browser encodes audio with **Opus** and video with **VP8/H.264** itself (WebCodecs), encrypts each packet with AES-GCM, and sends it as a `CALL_MEDIA` frame. The server forwards the bytes **without reading them** (it cannot) to the one linked device.
+1. **Ring.** The caller sends `CALL kind=ring`. The server checks the same rules as messages (no calls across a block, groups only for members), plus a rate limit (5 rings, then 1 per 20 s). It rings only devices that can take calls. For a one-to-one call, if the other person is offline, on do not disturb, or already on a call, the caller hears ordinary ringing that is never answered ("phantom" call) and the other person gets a "missed call" push. So a call never reveals whether someone who looks offline or invisible is really online. Unanswered calls stop after 45 s.
+2. **Join.** Each person who presses ACCEPT joins on one device (their other devices stop ringing). The server gives them the list of people already in the call and tells everyone else "X joined". Someone removed from the group is also removed from its call.
+3. **Pair keys.** Every pair of people in the call makes a brand-new key pair (ECDH P-256) and swaps the public halves, then derives their pair key (HKDF, AES-GCM 128). The server only sees public halves, so it cannot compute any key.
+4. **Safety codes.** For each other person you see a 12-digit code made from your two public keys. Matching codes on both screens mean nobody, not even the server, swapped the keys.
+5. **Everything after that is encrypted with the pair key**, including the network addresses (ICE candidates) for direct links. So the server never learns your IP address from a call.
+6. **Direct links** (WebRTC): DTLS-SRTP encryption (built into every browser). Their fingerprints travel inside the encrypted pair messages, so the server cannot fake them either.
+7. **Relay:** each person makes a random **sender key**, hands it to everyone over the encrypted pair channels, encodes their audio and video once (Opus or G.711 voice, VP8/H.264 video) and encrypts each packet once with it. The server copies each packet to everyone else **without reading it**, and stamps it with the sender's account so nobody in the call can pass audio off as someone else's. When someone leaves, everyone makes a new sender key, so the person who left cannot listen to the rest.
+
+### The desktop app
+Java has no WebRTC, so the desktop app (`CallSession.java`, window `CallDialog.java`) always uses the relay. It speaks the same protocol as `call.js`: pair keys, sender keys, the same safety codes. It sends G.711 mu-law voice (8 kHz, 64 kbit/s) because Java has no Opus encoder; the browsers notice and use G.711 for that call too. Voice only (Java has no built-in camera access). It mixes everyone's voice into one speaker. Use headphones: there is no echo cancellation on the desktop.
 
 ### Low data use
 | | Direct | Relay |
 |---|---|---|
-| Voice | ~20 kbit/s (Opus, mono, silence suppression) | ~25–35 kbit/s |
-| Voice + video (320×240, 15 fps) | ~170 kbit/s | ~195 kbit/s |
+| Voice | ~20 kbit/s (Opus, mono, silence suppression) | ~25–35 kbit/s (G.711 with a desktop: ~80) |
+| Voice + video (320×240, 15 fps) | ~170 kbit/s | ~195–215 kbit/s |
 | Muted microphone | ~0 | 0 |
 
-A one-hour voice call is roughly 10–15 MB. Memory: no libraries; video frames are freed right after use; everything (camera, microphone, codecs, timers) is released when the call ends.
+In relay mode each person uploads **once**, however many people are in the call. A one-hour voice call is roughly 10–15 MB. Memory: no libraries; video frames are freed right after use; everything (camera, microphone, codecs, timers) is released when the call ends.
 
 ### Keeping the delay low
 - Direct whenever the network allows it.
-- Audio is sent in 20 ms pieces; the player holds only 40–160 ms and drops older audio rather than falling behind (`call-worklet.js`).
+- Audio is sent in 20 ms pieces; the player holds only 40–160 ms per person and drops older audio rather than falling behind (`call-worklet.js`, and the same rule in `CallSession`).
 - When the line is congested, video frames are skipped *before* encoding (audio always wins).
 - The server sends frames immediately (`TCP_NODELAY`) and does not compress call packets (encrypted data does not compress).
 - `render.yaml` puts the server in Render's Singapore region, the closest to the UAE.
 
 ### Safety rules the server enforces for calls (`CallRegistry.java`)
-- One call per person at a time. A busy person just doesn't answer: callers are never told "busy", so calls can't be used to check whether someone is online.
-- Only the two linked devices can signal or send media; an outsider gets "call not found".
-- At most 400 signalling messages per call; at most ~1 Mbit/s of relayed media per direction; packets over 64 KB are dropped.
-- Calls end when either device disconnects.
+- One call per person at a time. A busy person just doesn't answer: callers are never told "busy".
+- Only devices that joined can signal or send media; an outsider gets "call not found". Signals go to one named participant only.
+- Per-device limits on signalling messages and relayed media (~1 Mbit/s); packets over 64 KB are dropped; at most 8 people.
+- A person leaves when their device disconnects; a one-to-one call, or a group call down to one person, ends.
 
-### Packet protection (in `call.js`)
-Each encrypted packet starts with a direction byte (caller = 0, callee = 1) and a counter.
-- A packet with the wrong direction is rejected, so the server cannot bounce your own audio back at you.
-- A packet with an old counter is rejected, so a recording cannot be replayed into the call.
-- The header is authenticated, so it cannot be changed without detection.
+### Packet protection
+- Pair messages carry a direction byte and a counter: a bounced or replayed message is rejected.
+- Relay packets carry the sender's tag and a counter, authenticated with AES-GCM: old or replayed packets are dropped, and a packet is accepted only with the key of the person the server says sent it.
 
 ### A note on the UAE
-In the UAE, voice and video calling services are regulated by the TDRA, and unlicensed VoIP apps are restricted. Ember's relay mode uses ordinary HTTPS (like any website), which is why it still connects on networks that block VoIP ports. That is fine for a university project demo, but **do not run Ember as a public calling service in the UAE** without checking the rules with the university or TDRA.
+In the UAE, voice and video calling services are regulated by the TDRA, and unlicensed VoIP apps are restricted. Ember's relay mode uses ordinary HTTPS (like any website), which is why it still connects on networks that block VoIP ports. That is fine for a university project demo, but **do not run Ember as a public calling service in the UAE** without checking the rules with the university or TDRA. No code can change that; it is a licensing question.
+
+---
+
+## 7b. End-to-end encrypted chats
+
+Every device (each browser, each desktop app) has its own key pair (ECDH P-256). The private key never leaves the device: in the browser it is a non-extractable key in IndexedDB, on the desktop a file in the user's folder. The server only stores public keys (`DeviceKeys.java`) and hands out the keys of the people in a chat.
+
+**Sending** (`e2e.js` `sealBody`, `E2eCrypto.seal`):
+1. A random message key encrypts the text with AES-256-GCM. The chat, the sender and the message id are bound in, so the server cannot move the text to another chat or message.
+2. The message key is "wrapped" once for every device in the chat (including your own other devices): ECDH between your device and theirs, HKDF with a fresh salt, AES-GCM. Each wrap is also bound to this exact message, so even another recipient cannot reuse it for different text.
+3. The server stores only `e2e1.<sender device>.<salt>.<iv>.<ciphertext>.<wraps>`. Push notifications say "🔒 New message".
+
+**Receiving:** your device finds its own wrap, checks the sender device belongs to the sender, unwraps the key and decrypts. Edits are encrypted the same way. Reply quotes come from your own decrypted copy.
+
+**Trust:** the first devices seen for a person are remembered (device and key). A new device (including one added to *your own* account) shows a warning. Profiles show **device codes** (40 digits each): your device's code comes from your own key, never from the server; check together that each of you sees your own codes on the other's screen and no unknown ones. A chat that was ever encrypted never falls back to plain text, and plain text arriving in such a chat is flagged as unverified.
+
+**Trade-offs (same as Signal):** a new device cannot read messages sent before it existed, and logging out deletes this device's key (its old messages become unreadable here). People who have never opened the new app get plain text the first time, marked 🔓.
 
 ---
 
@@ -202,7 +221,9 @@ In the UAE, voice and video calling services are regulated by the TDRA, and unli
 
 | Threat | What stops it |
 |---|---|
-| Someone reads traffic on the Wi-Fi | TLS 1.3 everywhere (desktop socket and HTTPS/WSS). Calls are additionally end-to-end encrypted. |
+| Someone reads traffic on the Wi-Fi | TLS 1.3 everywhere (desktop socket and HTTPS/WSS). Chats and calls are additionally end-to-end encrypted. |
+| The server (or whoever runs it) reads chats | End-to-end encryption: the server stores only ciphertext (section 7b). |
+| Strangers watching who is online | Presence and expiry notices go only to contacts; calls never reveal presence. |
 | Stolen database leaks passwords | Passwords are never stored. Only salted PBKDF2-SHA256 hashes (600,000 rounds) are kept. |
 | Password guessing | 5 failures lock the account for 15 minutes; login attempts are rate-limited per IP. |
 | "Does this username exist?" probing | Login failures give the same message either way; private or blocked profiles say "not found" instead of "forbidden". |
@@ -220,8 +241,11 @@ In the UAE, voice and video calling services are regulated by the TDRA, and unli
 | Audit trail | `SecurityAuditLogger` writes one JSON line per security event (failed login, lockout, denied access, rate limit) and never writes passwords. |
 
 ### Honest limits (say these if asked)
-- **Chat messages are not end-to-end encrypted** (only calls are). They are encrypted on the network and in the backup, but the server itself can read them, so it can deliver them to every device and sync history. True end-to-end encryption for multi-device chat (like Signal's) is a big project of its own.
-- Everyone online can see who else is online (the "invisible" status hides you).
+- **Metadata is visible to the server**: who talks to whom and when, reactions, pins, group names, profiles, posts and stories. Only message text and call audio/video are end-to-end encrypted.
+- Keys are checked by comparing device codes by hand; nobody checks them automatically. A malicious server could add a device key, which every user is warned about.
+- New devices cannot read older messages, and logging out deletes this device's key.
+- Someone you have never talked to can still fetch your public device keys (needed to send you a first message), which shows when your devices change.
+- The desktop app calls with voice only and has no echo cancellation (use headphones).
 - The session token is kept in the browser's localStorage. That is safe as long as no script injection exists, which the CSP and the text-only rendering prevent.
 - Direct calls ask public STUN servers (Cloudflare, Google) "what is my public address?". "Hide my IP" skips that and always uses the relay.
 
@@ -240,7 +264,8 @@ When none of your devices is connected, the server sends a push through your bro
 | `index.html` | The page skeleton: login form, chat list, chat area, call window. |
 | `app.css` | The retro look and the 7 themes (CSS variables per theme). |
 | `app.js` | Everything else: frame encode/decode, connection and reconnect, the state (`S`), rendering, chats, Pulse, profiles, notifications, and the IndexedDB cache. |
-| `call.js` | Voice and video calls (section 7). |
+| `call.js` | Voice and video calls, one-to-one and group (section 7). |
+| `e2e.js` | End-to-end encrypted chats: device keys, encrypt, decrypt, device codes (section 7b). |
 | `call-worklet.js` | Runs on the browser's audio thread: cuts the microphone into 20 ms pieces and plays incoming audio with a small jitter buffer. |
 | `sw.js` | Service worker: keeps the app files offline and shows push notifications. |
 | `manifest.json`, `icon.svg` | Let the browser install Ember as an app. |
@@ -257,7 +282,7 @@ The server only serves these exact files (an allowlist), so `../../secret` style
 - **Threads**: `OutboundSenderThread` writes frames from a queue (producer-consumer), `InboundReceiverThread` reads them, `ReconnectManager` retries with exponential backoff. The UI is only touched on Swing's Event Dispatch Thread.
 - **Offline**: `LocalOutbox` saves unsent messages to a file and sends them after reconnecting.
 - **Connection**: `ServerLink` is an interface with two implementations, a TLS socket or the website's WebSocket (`--url https://...`).
-- The desktop app does not do calls. Calls ring only on the website.
+- **Calls**: `CallSession` (voice over the encrypted relay) and `CallDialog` (the call window). **Encryption**: `E2eCrypto` in `common/security`.
 
 ---
 
