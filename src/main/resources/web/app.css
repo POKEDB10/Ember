@@ -215,5 +215,6 @@ input:focus, textarea:focus, button:focus-visible { outline: 2px dashed var(--ac
 .callstage .selfview { position: absolute; right: 8px; bottom: 8px; width: 28%; height: auto; aspect-ratio: 4 / 3; border: 2px solid var(--accent); }
 .callstatus { margin: 0; padding: 10px 12px 0; font-size: 20px; color: var(--accent); }
 .callcode { padding: 4px 12px 0; letter-spacing: .05em; }
+.callstats { padding: 4px 12px; white-space: pre-wrap; font-size: 11px; color: var(--ok); }
 .danger { border-color: var(--err); color: var(--err); }
 @media (max-width: 720px) { .callbox { inset: 0; width: 100vw; max-height: none; box-shadow: none; } }

@@ -75,3 +75,81 @@ test('anti-aliasing resampler: flat passband, deep stopband (48 -> 32 kHz)', () 
   for (const f of [300, 1000, 4000, 8000, 12000]) assert.ok(Math.abs(gainDb(f)) < 1, `${f} Hz passband`);
   for (const f of [17500, 20000, 23000]) assert.ok(gainDb(f) < -50, `${f} Hz stopband`);
 });
+
+test('send limit = min(camera, mode, display, network), with the limiting factor named', () => {
+  const vga = q.relayLimit({ cameraH: 480, cameraFps: 30, mode: 'max', displayH: 0, netRung: 4 });
+  assert.ok(vga.h <= 480, 'a 640x480 camera must never be encoded above 480p');
+  assert.strictEqual(vga.limiting, 'camera');
+  assert.strictEqual(q.relayLimit({ cameraH: 720, mode: 'auto', displayH: 0, netRung: 4 }).h, 540, 'Auto relay caps at 540p');
+  assert.strictEqual(q.relayLimit({ cameraH: 720, mode: 'auto', displayH: 0, netRung: 4 }).limiting, 'mode');
+  const pip = q.relayLimit({ cameraH: 720, mode: 'auto', displayH: 200, netRung: 4 });
+  assert.strictEqual(pip.h, 270, 'a 200 px tall tile needs only the 270p rung');
+  assert.strictEqual(pip.limiting, 'display');
+  assert.strictEqual(q.relayLimit({ cameraH: 720, mode: 'max', displayH: 200, netRung: 4 }).h, 720, 'Max ignores display size');
+  const net = q.relayLimit({ cameraH: 720, mode: 'auto', displayH: 1000, netRung: 1 });
+  assert.strictEqual(net.limiting, 'network');
+  assert.strictEqual(q.relayLimit({ cameraH: 720, cameraFps: 12, mode: 'auto', displayH: 0, netRung: 4 }).fps, 12, 'camera fps is a ceiling');
+  assert.deepStrictEqual(q.relayLimit({ cameraH: 1080, mode: 'datasaver', displayH: 0, netRung: 4 }).h, 360);
+  const direct = q.directLimit({ cameraH: 480, cameraFps: 30, mode: 'max', displayH: 0, people: 2 });
+  assert.ok(direct.height <= 480 && direct.scale === 1, 'direct never above the camera');
+  const shrink = q.directLimit({ cameraH: 1080, cameraFps: 30, mode: 'auto', displayH: 360, people: 2 });
+  assert.strictEqual(shrink.height, 360);
+  assert.strictEqual(shrink.scale, 3);
+  assert.strictEqual(shrink.limiting, 'display');
+});
+
+test('ladder: down at once, up only after 6 s calm, failed rungs back off', () => {
+  const ladder = new q.Ladder(2);
+  let now = 0;
+  ladder.update(now, false);
+  for (now = 2000; now < 6000; now += 2000) assert.strictEqual(ladder.update(now, false), 2, 'no step up before 6 s');
+  assert.strictEqual(ladder.update(6000, false), 3, 'step up after 6 s calm');
+  assert.strictEqual(ladder.update(8000, true), 2, 'step down in the first window with trouble');
+  // Calm starts at the first trouble-free window (10 s); the failed rung needs 12 s of calm.
+  for (now = 10000; now < 22000; now += 2000) assert.strictEqual(ladder.update(now, false), 2, 'a rung that failed waits 12 s');
+  assert.strictEqual(ladder.update(22000, false), 3);
+
+  // Steady trouble just above rung 2 (rung 3 always fails): measure the change rate over 10 minutes.
+  const steady = new q.Ladder(3);
+  for (now = 0; now <= 600000; now += 2000) steady.update(now, steady.net >= 3);
+  const late = steady.changes.filter((t) => t > 60000);
+  const headroom = new q.Ladder(4);
+  assert.strictEqual(headroom.update(1000, true, 3), 2, 'a drop starts from the rung in use (mode-capped at 3), not the network estimate');
+  assert.ok(late.length <= (600000 - 60000) / 10000, `${late.length} changes after settling: more than 1 per 10 s`);
+});
+
+test('trouble signals: send backlog, rising round trip, receiver reports', () => {
+  assert.ok(q.relayTrouble({ skipped: 2 }));
+  assert.ok(!q.relayTrouble({ skipped: 1, rttMs: 60, minRttMs: 40 }));
+  assert.ok(q.relayTrouble({ skipped: 0, rttMs: 400, minRttMs: 40 }), 'round trip up 360 ms');
+  assert.ok(q.relayTrouble({ skipped: 0, report: { late: 6, lost: 0, windowMs: 2000 }, fps: 25 }), '12% late');
+  assert.ok(!q.relayTrouble({ skipped: 0, report: { late: 2, lost: 0, windowMs: 2000 }, fps: 25 }));
+});
+
+test('control messages are validated, clamped and rate-limited (fuzz)', () => {
+  assert.deepStrictEqual(q.parseControl({ v: 2, t: 'disp', w: 99999, h: 360, dpr: 10 }), { t: 'disp', w: 8192, h: 360, dpr: 4 });
+  assert.strictEqual(q.parseControl({ v: 1, t: 'disp', w: 1, h: 1 }), null, 'wrong version');
+  assert.strictEqual(q.parseControl({ v: 2, t: 'explode' }), null, 'unknown type ignored');
+  assert.strictEqual(q.parseControl({ v: 2, t: 'vpause', paused: 'yes' }), null);
+  assert.deepStrictEqual(q.parseControl({ v: 2, t: 'vstat', late: -5, lost: 3.6, windowMs: 1 }), { t: 'vstat', late: 0, lost: 4, windowMs: 500 });
+  let seed = 9;
+  const random = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const values = [null, undefined, NaN, Infinity, -1e12, 1e12, 0, 1, 'x', '', true, [], {}, [1, 2], { a: 1 }];
+  const types = ['caps', 'disp', 'vstat', 'vpause', 'vkey', 'bogus', 7, null];
+  for (let round = 0; round < 5000; round++) {
+    const msg = { v: random() < 0.9 ? 2 : values[Math.floor(random() * values.length)], t: types[Math.floor(random() * types.length)] };
+    for (const field of ['w', 'h', 'dpr', 'late', 'lost', 'windowMs', 'paused', 'codecs', 'features', 'maxVideo']) {
+      if (random() < 0.5) msg[field] = values[Math.floor(random() * values.length)];
+    }
+    const parsed = q.parseControl(msg);
+    if (parsed) {
+      for (const value of Object.values(parsed)) {
+        if (typeof value === 'number') assert.ok(Number.isFinite(value) && Math.abs(value) <= 10000, 'clamped');
+      }
+    }
+  }
+  const last = {};
+  assert.ok(q.allowControl(last, 'vkey', 0));
+  assert.ok(!q.allowControl(last, 'vkey', 500), 'key-frame requests at most once a second');
+  assert.ok(q.allowControl(last, 'vkey', 1000));
+});

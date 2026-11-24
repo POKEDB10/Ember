@@ -48,6 +48,7 @@ class Play extends AudioWorkletProcessor {
 
   process(_, outputs) {
     const out = outputs[0][0];
+    if ((this.reports = (this.reports || 0) + 1) % 75 === 0) this.port.postMessage({ depthMs: Math.round(((this.queued - this.offset) / sampleRate) * 1000) });
     if (!this.started && this.queued >= sampleRate * 0.04) this.started = true;
     let i = 0;
     while (this.started && i < out.length && this.queue.length) {

@@ -127,6 +127,146 @@ function makeResampler(inRate, outRate) {
   };
 }
 
+// ---- video limits (calls v2) ----
+
+/** Highest rung no taller than h (for ceilings: camera, mode). */
+function rungAtMost(h) {
+  let rung = 0;
+  LADDER.forEach((q, i) => { if (q.h <= h) rung = i; });
+  return rung;
+}
+
+/** Lowest rung at least as tall as h (for the receiver's display: no point sending more). */
+function rungAtLeast(h) {
+  const i = LADDER.findIndex((q) => q.h >= h);
+  return i < 0 ? LADDER.length - 1 : i;
+}
+
+/**
+ * Relay send quality = min(camera ceiling, mode ceiling, receiver display, what the network
+ * sustains). Returns the rung, the frame rate (camera fps is a soft ceiling) and which of the four
+ * is limiting, for the stats overlay. On a tie the first in that order is reported.
+ */
+function relayLimit({ cameraH, cameraFps, mode, displayH, netRung }) {
+  const q = qualityFor(mode);
+  const parts = [
+    ['camera', rungAtMost(cameraH || 720)],
+    ['mode', rungAtMost(q.relay.h)],
+    ['display', q.followsDisplay && displayH > 0 ? rungAtLeast(displayH) : LADDER.length - 1],
+    ['network', netRung],
+  ];
+  const [limiting, rung] = parts.reduce((best, part) => (part[1] < best[1] ? part : best));
+  const fps = Math.max(5, Math.min(LADDER[rung].fps, q.relay.fps, Math.round(cameraFps || 30)));
+  return { ...LADDER[rung], rung, fps, limiting }; // fps after the spread: the camera-capped rate wins
+}
+
+/** Direct video cap: 2.5 Mbit/s at 720p30 scaled by pixels and frame rate, capped by call size. */
+function directBitrate(height, fps, people) {
+  const ceiling = people <= 2 ? 4000000 : people === 3 ? 1200000 : 800000;
+  return Math.round(Math.max(150000, Math.min(ceiling, 2500000 * (height / 720) ** 2 * (fps / 30))));
+}
+
+/**
+ * Direct (WebRTC) ceiling: the browser's congestion control adapts below it. Returns what goes into
+ * RTCRtpSender.setParameters: maxBitrate, maxFramerate and scaleResolutionDownBy.
+ */
+function directLimit({ cameraH, cameraFps, mode, displayH, people }) {
+  const q = qualityFor(mode), camera = cameraH || 720;
+  const parts = [['camera', camera], ['mode', q.direct.h], ['display', q.followsDisplay && displayH > 0 ? displayH : Infinity]];
+  const [limiting, height] = parts.reduce((best, part) => (part[1] < best[1] ? part : best));
+  const fps = Math.max(5, Math.min(q.direct.fps, Math.round(cameraFps || 30)));
+  return { height: Math.round(height), fps, limiting, scale: Math.max(1, camera / height), bps: directBitrate(height, fps, people) };
+}
+
+/**
+ * What the network sustains on the relay, as a rung. Called every second with whether that window had
+ * trouble (send queue backing up, round trip rising, or the receiver reporting late/lost frames).
+ * Steps down at once; steps up only after 6 s without trouble. A rung that failed must stay calm
+ * twice as long before it is tried again (12 s, then 24 s, up to 60 s), so a link that can almost
+ * carry a rung does not flip back and forth.
+ */
+class Ladder {
+  constructor(start = 2, top = LADDER.length - 1) {
+    this.net = start;
+    this.top = top;
+    this.calmSince = null;
+    this.lastChange = -Infinity;
+    this.upWait = LADDER.map(() => 6000);
+    this.changes = [];
+  }
+
+  /** @param current the rung actually in use; a drop starts from it, so every step down is visible at once */
+  update(now, trouble, current = this.net) {
+    if (trouble) {
+      this.calmSince = null;
+      this.net = Math.min(this.net, current);
+      if (this.net > 0) {
+        this.upWait[this.net] = Math.min(60000, Math.max(12000, this.upWait[this.net] * 2));
+        this.change(now, this.net - 1);
+      }
+      return this.net;
+    }
+    if (this.calmSince === null) this.calmSince = now;
+    if (this.net < this.top && now - this.calmSince >= this.upWait[this.net + 1] && now - this.lastChange >= 6000) {
+      this.change(now, this.net + 1);
+      this.calmSince = now;
+    }
+    return this.net;
+  }
+
+  change(now, rung) {
+    this.net = rung;
+    this.lastChange = now;
+    this.changes.push(now);
+    if (this.changes.length > 50) this.changes.shift();
+  }
+}
+
+/** Trouble in the last window: frames skipped for a backed-up socket, rising round trip, or receiver losses. */
+function relayTrouble({ skipped, rttMs, minRttMs, report, fps }) {
+  const rttRising = rttMs > 0 && minRttMs > 0 && rttMs > minRttMs + 150 && rttMs > minRttMs * 1.5;
+  const expected = Math.max(1, ((report && report.windowMs) || 2000) / 1000 * (fps || 15));
+  const receiverBad = !!report && (report.late + report.lost) / expected > 0.1;
+  return skipped > 1 || rttRising || receiverBad;
+}
+
+/**
+ * Calls v2 control messages from the other side (inside the encrypted signal channel). Everything
+ * is validated and clamped; unknown types and fields are ignored, so old and new builds mix.
+ */
+function parseControl(msg) {
+  if (!msg || typeof msg !== 'object' || msg.v !== 2 || typeof msg.t !== 'string') return null;
+  const num = (x, lo, hi) => (typeof x === 'number' && Number.isFinite(x) ? Math.round(Math.max(lo, Math.min(hi, x))) : null);
+  switch (msg.t) {
+    case 'caps': {
+      const features = Array.isArray(msg.features) ? msg.features.filter((f) => ['disp', 'vstat', 'vpause', 'vkey'].includes(f)).slice(0, 8) : [];
+      return { t: 'caps', codecs: peerDecodes(msg), features, maxVideo: num(msg.maxVideo, 0, 4320) || 0 };
+    }
+    case 'disp': {
+      const w = num(msg.w, 0, 8192), h = num(msg.h, 0, 8192);
+      const dpr = typeof msg.dpr === 'number' && Number.isFinite(msg.dpr) ? Math.max(0.5, Math.min(4, msg.dpr)) : 1;
+      return w === null || h === null ? null : { t: 'disp', w, h, dpr };
+    }
+    case 'vstat': {
+      const late = num(msg.late, 0, 10000), lost = num(msg.lost, 0, 10000), windowMs = num(msg.windowMs, 500, 10000);
+      return late === null || lost === null || windowMs === null ? null : { t: 'vstat', late, lost, windowMs };
+    }
+    case 'vpause': return typeof msg.paused === 'boolean' ? { t: 'vpause', paused: msg.paused } : null;
+    case 'vkey': return { t: 'vkey' };
+    default: return null;
+  }
+}
+
+/** Minimum gap between control messages of one type from one peer (anything faster is dropped). */
+const CONTROL_GAP_MS = { caps: 1000, disp: 200, vstat: 1000, vpause: 200, vkey: 1000 };
+
+function allowControl(last, type, now) {
+  if (now - (last[type] ?? -Infinity) < (CONTROL_GAP_MS[type] ?? 1000)) return false;
+  last[type] = now;
+  return true;
+}
+
 if (typeof module !== 'undefined') {
-  module.exports = { AC, LADDER, QUALITY, qualityFor, pickVoiceCodec, peerDecodes, adpcmEncode, adpcmDecode, makeResampler };
+  module.exports = { AC, LADDER, QUALITY, qualityFor, pickVoiceCodec, peerDecodes, adpcmEncode, adpcmDecode, makeResampler,
+    rungAtMost, rungAtLeast, relayLimit, directLimit, directBitrate, Ladder, relayTrouble, parseControl, allowControl };
 }

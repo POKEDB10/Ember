@@ -105,8 +105,9 @@ function endLocal(text) {
   ringTone(false);
   c.timers.forEach((t) => clearInterval(t));
   if (c.stream) c.stream.getTracks().forEach((t) => t.stop());
-  for (const p of c.peers.values()) closePeer(p);
+  for (const p of c.peers.values()) { if (p.resize) p.resize.disconnect(); closePeer(p); }
   stopRelay(c);
+  $('callStats').hidden = true;
   $('callLocal').srcObject = null;
   $('callTiles').replaceChildren();
   $('callBox').hidden = true;
@@ -150,6 +151,7 @@ async function onSignal(c, p, kind, data) {
   const msg = await openSignal(p, data);
   if (call !== c) return;
   if (kind === 'sdp') await onSdp(c, p, msg);
+  else if (kind === 'ice' && msg && msg.v === 2) onControl(c, p, parseControl(msg));
   else if (kind === 'ice') {
     if (p.pc && p.pc.remoteDescription) await p.pc.addIceCandidate(msg).catch(() => {});
     else p.iceQueue.push(msg);
@@ -260,6 +262,7 @@ async function openSignal(p, data) {
 
 // ---- choosing direct or relay ----
 function pairReady(c, p) {
+  if (c.v2) startControls(c, p);
   if (c.mode === 'relay') { c.relayStarted.then(() => sendRelayInfo(c, p)); return; }
   if (callPrefs.hideIp || !window.RTCPeerConnection || c.peers.size + 1 > CALL.MAX_DIRECT) { goRelay(c); return; }
   if (S.me < p.user) startDirect(c, p).catch(() => goRelay(c));
@@ -332,6 +335,15 @@ function capBitrates(c, pc) {
     params.encodings[0].maxBitrate = video ? DIRECT_VIDEO_BPS(c.peers.size + 1) : opusBps(c) + (c.v2 ? 0 : 8000);
     params.encodings[0].priority = params.encodings[0].networkPriority = video ? 'low' : 'high';
     if (video) { params.encodings[0].maxFramerate = CALL.FPS; params.degradationPreference = 'balanced'; }
+    if (video && c.v2) {
+      // Calls v2: the ceiling (camera, mode, their display) goes into the sender; WebRTC adapts below it.
+      const peer = [...c.peers.values()].find((x) => x.pc === pc);
+      const lim = directLimit({ cameraH: c.camera && c.camera.h, cameraFps: c.camera && c.camera.fps, mode: callPrefs.mode,
+        displayH: peer ? peer.dispH : 0, people: c.peers.size + 1 });
+      Object.assign(params.encodings[0], { maxBitrate: lim.bps, maxFramerate: lim.fps, scaleResolutionDownBy: lim.scale,
+        active: !(peer && peer.peerPaused) });
+      c.limit = { h: lim.height, fps: lim.fps, bps: lim.bps, limiting: lim.limiting, rung: -1 };
+    }
     sender.setParameters(params).catch(() => {});
   }
 }
@@ -426,6 +438,10 @@ function applyMode(c) {
   const r = c.relay;
   if (r && r.aenc && r.audioCodec === AC.OPUS) r.aenc.configure(opusConfig(r.rate, qualityFor(callPrefs.mode).opus));
   for (const p of c.peers.values()) if (p.pc && p.pc.connectionState === 'connected') capBitrates(c, p.pc);
+  const track = c.stream && c.stream.getVideoTracks()[0];
+  if (track) track.applyConstraints({ height: { ideal: qualityFor(callPrefs.mode).direct.h }, frameRate: { ideal: 30, max: 30 } })
+    .catch(() => {}).then(() => probeCamera(c, 1000));
+  applyLimits(c);
 }
 
 /** One encoding for everyone: codecs every listener can decode (re-chosen when people change). */
@@ -489,6 +505,15 @@ async function startVideoEncoder(c, codec) {
   clearInterval(r.videoTimer); clearInterval(r.adaptTimer);
   r.vcodecId = codec;
   if (!codec) return;
+  if (c.v2) {
+    r.ladder = new Ladder(2); // what the network sustains, starting at 360p
+    const lim = relayLimit(relayInputs(c));
+    r.rung = lim.rung; r.fpsCap = lim.fps; c.limit = lim;
+    if (!(await configureVideo(c))) { toast('video cannot be relayed on this browser; voice only'); return; }
+    r.adaptTimer = setInterval(() => adaptVideoV2(c), 1000); // trouble is checked every second: down in <= 2 s
+    c.timers.push(r.adaptTimer);
+    return;
+  }
   r.rung = Math.min(2, maxRung(c)); // start at 360p, then climb
   if (!(await configureVideo(c))) { toast('video cannot be relayed on this browser; voice only'); return; }
   r.adaptTimer = setInterval(() => adaptVideo(c), 2000);
@@ -507,30 +532,41 @@ function maxRung(c) {
 async function configureVideo(c) {
   const r = c.relay;
   for (; r.rung >= 0; r.rung--) {
-    const q = LADDER[r.rung];
+    const q = { ...LADDER[r.rung], fps: Math.min(LADDER[r.rung].fps, r.fpsCap || 30) };
     const config = { codec: VCODEC[r.vcodecId], width: q.w, height: q.h, bitrate: q.bps, framerate: q.fps, latencyMode: 'realtime' };
     if (r.vcodecId === VC.AVC) config.avc = { format: 'annexb' };
     if (!(await VideoEncoder.isConfigSupported(config).then((x) => x.supported, () => false))) continue;
     if (call !== c || !c.relay) return false;
     if (!r.venc || r.venc.state === 'closed') {
       const codec = r.vcodecId;
-      r.venc = new VideoEncoder({ output: (chunk) => sendPacket(c, PKT.VIDEO, codec | (chunk.type === 'key' ? 0x80 : 0), chunk), error: () => {} });
+      r.venc = new VideoEncoder({
+        output: (chunk) => { r.lastVideoOut = performance.now(); sendPacket(c, PKT.VIDEO, codec | (chunk.type === 'key' ? 0x80 : 0), chunk); },
+        error: () => { if (c.v2) rebuildEncoder(c); },
+      });
+      r.lastVideoOut = performance.now();
     }
     r.venc.configure(config);
     r.forceKey = true; r.skipped = 0; r.calm = 0; r.frames = 0;
+    r.graceUntil = performance.now() + 1500; // the forced key frame is big: a short backlog right after a change is not congestion
     r.canvas = h('canvas', { width: q.w, height: q.h });
     r.g = r.canvas.getContext('2d', { alpha: false });
     clearInterval(r.videoTimer);
     const local = $('callLocal'), venc = r.venc;
     r.videoTimer = setInterval(() => {
       if (call !== c || r.venc !== venc || venc.state !== 'configured' || !c.camOn || local.readyState < 2) return;
+      if (c.v2 && [...c.peers.values()].every((x) => x.peerPaused)) return; // they cannot see us: encode nothing
       // Congested: skip this frame before encoding (the stream stays decodable, voice goes first).
-      if (venc.encodeQueueSize > 1 || !S.ws || S.ws.bufferedAmount > q.bps / 32) { r.skipped++; return; }
+      if (venc.encodeQueueSize > 1 || !S.ws || S.ws.bufferedAmount > q.bps / 32) {
+        if (!c.v2 || performance.now() > r.graceUntil) r.skipped++;
+        return;
+      }
       r.g.drawImage(local, 0, 0, q.w, q.h);
       const vf = new VideoFrame(r.canvas, { timestamp: performance.now() * 1000 });
       const keyFrame = r.forceKey || r.frames++ % (q.fps * CALL.KEY_SECONDS) === 0;
       r.forceKey = false;
       venc.encode(vf, { keyFrame });
+      // Watchdog (calls v2): an encoder that takes frames but has produced nothing for 3 s is rebuilt.
+      if (c.v2 && performance.now() - r.lastVideoOut > 3000) { r.lastVideoOut = performance.now(); rebuildEncoder(c); }
       vf.close();
     }, Math.round(1000 / q.fps));
     c.timers.push(r.videoTimer);
@@ -539,6 +575,195 @@ async function configureVideo(c) {
   r.rung = 0;
   return false;
 }
+
+// ---- calls v2: video limits, reports and pause ----
+
+/** Inputs to the relay limit: camera ceiling, mode, the other side's display, the network rung. */
+function relayInputs(c) {
+  const p = [...c.peers.values()][0];
+  return { cameraH: c.camera && c.camera.h, cameraFps: c.camera && c.camera.fps, mode: callPrefs.mode,
+    displayH: p ? p.dispH : 0, netRung: c.relay && c.relay.ladder ? c.relay.ladder.net : 2 };
+}
+
+/** Replaces a failed or stuck video encoder with a fresh one at the current rung. */
+function rebuildEncoder(c) {
+  const r = c.relay;
+  if (!r || call !== c) return;
+  try { if (r.venc && r.venc.state !== 'closed') r.venc.close(); } catch { /* already closed */ }
+  r.venc = null;
+  configureVideo(c);
+}
+
+/** Every second: feed this window's trouble into the ladder, then apply the (possibly new) limit. */
+function adaptVideoV2(c) {
+  const r = c.relay;
+  if (call !== c || !r || !r.venc || !r.ladder) return;
+  const p = [...c.peers.values()][0];
+  const trouble = relayTrouble({ skipped: r.skipped, rttMs: c.rtt, minRttMs: c.minRtt, report: p && p.vstat,
+    fps: LADDER[r.rung].fps });
+  if (p) p.vstat = null;
+  r.skipped = 0;
+  r.ladder.update(performance.now(), trouble, r.rung);
+  applyLimits(c);
+}
+
+/** Re-applies the send limit now (display resize, mode change, camera re-check, network step). */
+function applyLimits(c) {
+  if (!c || !c.v2 || call !== c) return;
+  const r = c.relay;
+  if (c.mode === 'relay' && r && r.ladder && r.venc) {
+    const lim = relayLimit(relayInputs(c));
+    c.limit = lim;
+    if (lim.rung !== r.rung || lim.fps !== r.fpsCap) { r.rung = lim.rung; r.fpsCap = lim.fps; configureVideo(c); }
+  }
+  for (const p of c.peers.values()) if (p.pc && p.pc.connectionState === 'connected') capBitrates(c, p.pc);
+}
+
+/** Camera ceiling: resolution from the track settings, frame rate measured (a soft ceiling). */
+async function probeCamera(c, ms = 1500) {
+  const track = c.stream && c.stream.getVideoTracks()[0], video = $('callLocal');
+  if (!track) return;
+  const settings = track.getSettings();
+  let fps = settings.frameRate || 30;
+  if (window.MediaStreamTrackProcessor) {
+    // Counts frames the camera really delivers (works even when nothing is on screen).
+    const copy = track.clone(), reader = new MediaStreamTrackProcessor({ track: copy }).readable.getReader();
+    let frames = 0, first = -1, last = -1;
+    const stop = setTimeout(() => reader.cancel().catch(() => {}), ms + 500);
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (first < 0) first = value.timestamp;
+        last = value.timestamp; frames++;
+        value.close();
+        if ((last - first) / 1000 >= ms || call !== c) break;
+      }
+    } catch { /* cancelled */ }
+    clearTimeout(stop);
+    reader.cancel().catch(() => {});
+    copy.stop();
+    if (frames > 3 && last > first) fps = Math.min(fps, ((frames - 1) * 1e6) / (last - first));
+  } else if (video.requestVideoFrameCallback) {
+    let frames = 0, first = 0, last = 0;
+    await new Promise((done) => {
+      const end = setTimeout(done, ms + 500);
+      const tick = (now) => {
+        if (!first) first = now;
+        last = now; frames++;
+        if (now - first < ms && call === c) video.requestVideoFrameCallback(tick); else { clearTimeout(end); done(); }
+      };
+      video.requestVideoFrameCallback(tick);
+    });
+    if (frames > 3 && last > first) fps = Math.min(fps, (frames - 1) * 1000 / (last - first));
+  }
+  c.camera = { h: settings.height || video.videoHeight || CALL.H, w: settings.width || video.videoWidth || CALL.W, fps: Math.max(5, Math.round(fps)) };
+  applyLimits(c);
+}
+
+/** Starts the v2 reports for one peer: our capabilities, display size, late/lost reports, pause. */
+function startControls(c, p) {
+  if (p.controlsStarted) return;
+  p.controlsStarted = true;
+  p.lastControl = {};
+  sendCtl(c, p, { t: 'caps', codecs: [AC.OPUS, AC.ADPCM32, AC.ADPCM, AC.MULAW], features: ['disp', 'vstat', 'vpause', 'vkey'],
+    maxVideo: c.camera ? c.camera.h : 0 });
+  if (c.video && window.ResizeObserver) {
+    let timer = 0;
+    p.resize = new ResizeObserver(() => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const box = p.tile.el.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+        if (call === c && box.height > 0) sendCtl(c, p, { t: 'disp', w: Math.round(box.width * dpr), h: Math.round(box.height * dpr), dpr });
+      }, 300); // debounced: one report per settled resize
+    });
+    p.resize.observe(p.tile.el);
+  }
+  if (c.video) {
+    c.timers.push(setInterval(() => {
+      if (call !== c || c.mode !== 'relay' || !p.relay || !p.relay.vseen) return;
+      const pr = p.relay;
+      sendCtl(c, p, { t: 'vstat', late: pr.vlate || 0, lost: pr.vlost || 0, windowMs: 2000 });
+      pr.vlate = 0; pr.vlost = 0;
+    }, 2000));
+    if (document.hidden) sendCtl(c, p, { t: 'vpause', paused: true });
+  }
+}
+
+function sendCtl(c, p, obj) {
+  if (call === c && p.key) sendSignal(c, p, 'ice', { v: 2, ...obj }).catch(() => {});
+}
+
+/** A validated control message from the other side (rate-limited per type). */
+function onControl(c, p, msg) {
+  if (!msg) return;
+  if (!allowControl(p.lastControl || (p.lastControl = {}), msg.t, performance.now())) {
+    // Too soon. A state (pause, display size) must not be lost: apply the newest one after the gap.
+    if (msg.t === 'vpause' || msg.t === 'disp') {
+      const pending = p.pendingControl || (p.pendingControl = {});
+      clearTimeout(pending[msg.t]);
+      pending[msg.t] = setTimeout(() => { if (call === c) onControl(c, p, msg); }, CONTROL_GAP_MS[msg.t]);
+    }
+    return;
+  }
+  if (msg.t === 'caps') { p.caps = msg; return; }
+  if (msg.t === 'disp') { p.dispH = msg.h; applyLimits(c); return; } // immediate, still bounded by the network
+  if (msg.t === 'vstat') { p.vstat = msg; p.lastVstat = msg; return; }
+  if (msg.t === 'vpause') {
+    p.peerPaused = msg.paused;
+    if (!msg.paused && c.relay) c.relay.forceKey = true;
+    applyLimits(c);
+    return;
+  }
+  if (msg.t === 'vkey' && c.relay) c.relay.forceKey = true;
+}
+
+/** My window hidden: stop decoding their video and ask them to pause; visible again: resume with a key frame. */
+function onVisibility() {
+  const c = call;
+  if (!c || !c.v2 || !c.video) return;
+  for (const p of c.peers.values()) {
+    sendCtl(c, p, { t: 'vpause', paused: document.hidden });
+    if (!document.hidden) sendCtl(c, p, { t: 'vkey' });
+  }
+}
+document.addEventListener('visibilitychange', onVisibility);
+
+// ---- calls v2: stats overlay (Ctrl+Shift+D) and a local log of the last 300 samples ----
+const statsLog = [];
+function sampleStats(c) {
+  if (call !== c || !c.v2) return;
+  const r = c.relay, lim = c.limit || {}, p = [...c.peers.values()][0];
+  const sent = r ? r.sentBytes || 0 : 0;
+  if (r) r.sentBytes = 0;
+  const codecName = { 1: 'Opus', 2: 'G.711', 3: 'ADPCM 16k', 4: 'ADPCM 32k' };
+  const row = { t: new Date().toISOString().slice(11, 19), mode: callPrefs.mode, via: c.mode || '-',
+    video: lim.h ? (lim.w || '') + (lim.w ? 'x' : '') + lim.h + '@' + lim.fps : '-', limit: lim.limiting || '-',
+    sendKbps: c.mode === 'relay' ? Math.round(sent * 8 / 1000) : c.directKbps || 0, fps: c.sentFps || 0,
+    rtt: c.rtt >= 0 ? c.rtt : '-', loss: p && p.lastVstat ? p.lastVstat.late + p.lastVstat.lost : 0,
+    jbMs: p && p.relay && p.relay.playDepthMs != null ? p.relay.playDepthMs : '-',
+    codec: r && r.audioCodec ? codecName[r.audioCodec] : c.mode === 'direct' ? 'Opus (WebRTC)' : '-' };
+  statsLog.push(row);
+  if (statsLog.length > 300) statsLog.shift();
+  const box = $('callStats');
+  if (!box.hidden) {
+    box.textContent = 'mode ' + row.mode + ' · via ' + row.via + ' · video ' + row.video + ' (limit: ' + row.limit + ')\n'
+      + 'send ' + row.sendKbps + ' kbps · ' + row.fps + ' fps · rtt ' + row.rtt + ' ms · late/lost ' + row.loss
+      + ' · voice buffer ' + row.jbMs + ' ms · ' + row.codec;
+  }
+}
+document.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.shiftKey && (e.key === 'D' || e.key === 'd')) {
+    e.preventDefault();
+    $('callStats').hidden = !$('callStats').hidden;
+    $('callStatsSave').hidden = $('callStats').hidden;
+  }
+});
+$('callStatsSave').onclick = () => {
+  const text = statsLog.map((row) => JSON.stringify(row)).join('\n');
+  const a = h('a', { href: URL.createObjectURL(new Blob([text], { type: 'text/plain' })), download: 'ember-call-stats.txt' });
+  a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
 
 /** Every 2 s: step down at once when frames had to be skipped, step up after 6 s without trouble. */
 function adaptVideo(c) {
@@ -565,6 +790,8 @@ function sendPacket(c, type, flags, data, time) {
   if (data.copyTo) data.copyTo(plain.subarray(6)); else plain.set(data, 6);
   const head = new Uint8Array(8); head.set(r.sendTag); new DataView(head.buffer).setUint32(4, ++r.sendCtr);
   const key = r.sendKey;
+  r.sentBytes = (r.sentBytes || 0) + len;
+  if (type === PKT.VIDEO) r.framesOut = (r.framesOut || 0) + 1;
   r.sendChain = r.sendChain.then(() => seal(key, head, plain)).then((sealed) => {
     if (call === c && S.ws && S.ws.readyState === 1) S.ws.send(frame(OP.CALL_MEDIA, 0, sealed));
   }).catch(() => {});
@@ -595,7 +822,11 @@ function onPacket(c, p, data) {
   if (type === PKT.PING) { sendPacket(c, PKT.PONG, 0, pr.tagBytes || (pr.tagBytes = unb64(pr.tag)), time); return; }
   if (type === PKT.PONG) { if (b64(body) === b64(r.sendTag)) showPing(u32(nowMs() - time)); return; }
   if (type === PKT.AUDIO) {
-    if (!pr.play) { pr.play = new AudioWorkletNode(r.actx, 'ember-play', { outputChannelCount: [1] }); pr.play.connect(r.actx.destination); }
+    if (!pr.play) {
+      pr.play = new AudioWorkletNode(r.actx, 'ember-play', { outputChannelCount: [1] });
+      pr.play.connect(r.actx.destination);
+      pr.play.port.onmessage = (e) => { if (e.data && typeof e.data.depthMs === 'number') pr.playDepthMs = e.data.depthMs; };
+    }
     if (flags === AC.OPUS && window.AudioDecoder) {
       if (!pr.adec) {
         pr.adec = new AudioDecoder({ output: (ad) => {
@@ -622,6 +853,13 @@ function onPacket(c, p, data) {
     }
   } else if (type === PKT.VIDEO && window.VideoDecoder) {
     const codec = flags & 0x7f, key = !!(flags & 0x80);
+    if (c.v2) {
+      pr.vseen = true;
+      const arrived = performance.now();
+      if (pr.vLastArrival && pr.vLastTime != null && (arrived - pr.vLastArrival) - u32(time - pr.vLastTime) > 100) pr.vlate = (pr.vlate || 0) + 1;
+      pr.vLastArrival = arrived; pr.vLastTime = time;
+      if (document.hidden) return; // my window is hidden: do not decode (they were asked to pause)
+    }
     if (!pr.vdec || pr.vcodec !== codec) {
       if (!key) { askKeyframe(c, p); return; }
       if (pr.vdec) { try { pr.vdec.close(); } catch { /* closed */ } }
@@ -629,12 +867,16 @@ function onPacket(c, p, data) {
       pr.vdec = new VideoDecoder({ output: (vf) => drawRemote(p, vf), error: () => { pr.vdec = null; askKeyframe(c, p); } });
       pr.vdec.configure({ codec: VCODEC[codec], optimizeForLatency: true });
     }
-    if (pr.vdec.decodeQueueSize > 3 && !key) return; // behind: wait for the next key frame
+    if (pr.vdec.decodeQueueSize > 3 && !key) { pr.vlate = (pr.vlate || 0) + 1; return; } // behind: wait for the next key frame
     pr.vdec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: time * 1000, data: body }));
   }
 }
 
 function askKeyframe(c, p) {
+  if (c.v2) {
+    if (allowControl(p.askedKey || (p.askedKey = {}), 'vkey', performance.now())) sendCtl(c, p, { t: 'vkey' });
+    return;
+  }
   if (Date.now() - p.relay.lastKfAsk < 2000) return;
   p.relay.lastKfAsk = Date.now();
   sendSignal(c, p, 'relay', { keyframe: true }).catch(() => {});
@@ -695,9 +937,11 @@ async function getMedia(video) {
   try {
     call.stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 48000 },
-      video: video ? { width: { ideal: CALL.W }, height: { ideal: CALL.H }, frameRate: { ideal: CALL.FPS, max: CALL.FPS }, facingMode: 'user' } : false,
+      video: video ? (call.v2 ? { height: { ideal: qualityFor(callPrefs.mode).direct.h }, frameRate: { ideal: 30, max: 30 }, facingMode: 'user' }
+        : { width: { ideal: CALL.W }, height: { ideal: CALL.H }, frameRate: { ideal: CALL.FPS, max: CALL.FPS }, facingMode: 'user' }) : false,
     });
     call.stream.getAudioTracks().forEach((t) => { t.contentHint = 'speech'; });
+    if (video && call.v2) probeCamera(call); // during ringing: measured before the call connects
   } catch (e) {
     throw new Error(e.name === 'NotAllowedError' ? 'allow the microphone' + (video ? ' and camera' : '') + ' to call' : 'no microphone found');
   }
@@ -727,6 +971,11 @@ function connected(c) {
     c.startedAt = Date.now();
     c.timers.push(setInterval(() => { if (call === c) setCallStatus(clock(Date.now() - c.startedAt)); }, 1000));
     c.timers.push(setInterval(() => directPing(c), 2000));
+    if (c.v2) {
+      c.timers.push(setInterval(() => sampleStats(c), 1000));
+      c.timers.push(setInterval(() => { if (c.relay) { c.sentFps = c.relay.framesOut || 0; c.relay.framesOut = 0; } }, 1000));
+      if (c.video) c.timers.push(setInterval(() => probeCamera(c, 2000), 10000)); // fps can drop in low light
+    }
   }
   c.state = 'active';
   setCallStatus(clock(Date.now() - c.startedAt));
@@ -745,12 +994,23 @@ async function directPing(c) {
         const ms = Math.round(s.currentRoundTripTime * 1000);
         best = best == null ? ms : Math.max(best, ms);
       }
+      if (c.v2 && s.type === 'outbound-rtp' && s.kind === 'video') {
+        // For the stats overlay: video send rate over the last 2 s, and frames per second.
+        if (p.lastVideoBytes != null) c.directKbps = Math.round((s.bytesSent - p.lastVideoBytes) * 8 / 2000);
+        p.lastVideoBytes = s.bytesSent;
+        c.sentFps = Math.round(s.framesPerSecond || 0);
+        if (s.frameHeight && c.limit) c.limit.w = s.frameWidth;
+      }
+      if (c.v2 && s.type === 'remote-inbound-rtp' && s.kind === 'video' && s.fractionLost != null) {
+        p.lastVstat = { late: 0, lost: Math.round(s.fractionLost * 100) };
+      }
     });
   }
   if (best != null) showPing(best);
 }
 
 function showPing(ms) {
+  if (call) { call.rtt = ms; call.minRtt = call.minRtt > 0 ? Math.min(call.minRtt, ms) : ms; }
   if (call) $('callInfo').textContent = modeText(call) + ' · ' + ms + ' ms';
 }
 
