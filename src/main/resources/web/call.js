@@ -464,7 +464,8 @@ async function startRelay(c) {
   r.cap.connect(actx.destination); // the capture node outputs silence; connecting keeps it running
   r.cap.port.onmessage = (e) => sendAudio(c, e.data);
   if (actx.state === 'suspended') await actx.resume().catch(() => {});
-  c.timers.push(setInterval(() => { if (call === c && c.relay) sendPacket(c, PKT.PING, 0, new Uint8Array(0)); }, 2000));
+  // Every second: the round trip is one of the ladder's trouble signals (measured: 2 s pings made a step-down take 3 s).
+  c.timers.push(setInterval(() => { if (call === c && c.relay) sendPacket(c, PKT.PING, 0, new Uint8Array(0)); }, 1000));
 }
 
 async function newSenderKey(r) {
@@ -741,7 +742,10 @@ function startControls(c, p) {
   }
   if (c.video) {
     c.timers.push(setInterval(() => {
-      if (call !== c || c.mode !== 'relay' || !p.relay || !p.relay.vseen) return;
+      if (call !== c) return;
+      // A missed visibility event must not leave the other side paused for good (seen live): re-send our state.
+      if (p.sentPaused !== document.hidden) sendCtl(c, p, { t: 'vpause', paused: document.hidden });
+      if (c.mode !== 'relay' || !p.relay || !p.relay.vseen) return;
       const pr = p.relay;
       sendCtl(c, p, { t: 'vstat', late: pr.vlate || 0, lost: pr.vlost || 0, windowMs: 2000 });
       pr.vlate = 0; pr.vlost = 0;
@@ -751,7 +755,9 @@ function startControls(c, p) {
 }
 
 function sendCtl(c, p, obj) {
-  if (call === c && p.key) sendSignal(c, p, 'ice', { v: 2, ...obj }).catch(() => {});
+  if (call !== c || !p.key) return;
+  if (obj.t === 'vpause') p.sentPaused = obj.paused;
+  sendSignal(c, p, 'ice', { v: 2, ...obj }).catch(() => {});
 }
 
 /** A validated control message from the other side (rate-limited per type). */

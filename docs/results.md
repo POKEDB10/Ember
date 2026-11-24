@@ -25,7 +25,7 @@ What was measured, how, and against which bar. **Setup for every number below:**
 | Direct bitrate vs cap | within ±10 % | 1072 / 1071 / 1074 kbit/s vs 1111 cap (−3 %) | three 10 s windows, `getStats` |
 | Display resize follows | immediate | immediate, both directions | resizing the tile |
 | Pause when hidden | 0 fps while hidden, key frame on resume | 0 fps → 29 fps on resume | hiding the tab |
-| Grace period after a rung change (decision 15) | no drop back within 1.5 s | **not re-measured live** after the fix; ladder logic covered by Node tests | |
+| Grace period after a rung change (decision 15) | no drop back within 1.5 s | no drop within 1.5 s of any of the 8 step-ups seen in the throttled runs (the closest was 2 s later, caused by a real round-trip rise) | throttled runs below |
 
 ## Hand-off (desktop → website)
 
@@ -38,13 +38,26 @@ What was measured, how, and against which bar. **Setup for every number below:**
 | Races, reuse, expiry, outsiders, flag off | all refused | all refused | `testCallHandoff` (server) |
 | The real desktop app's "Video on website" button | — | **not tested live** (compiles; URL built from the WebSocket address) | |
 
+## Throttled relay
+
+`src/test/java/edu/ember/test/ThrottleProxy.java` sits between one browser and the server: a bandwidth limit, extra one-way delay, and a 64 KB router queue, on a timed profile. One side (Thr) connected through it; the other (Hob) connected straight to the server. Auto mode, relay forced, both tabs kept "visible", synthetic 720p30 cameras. TCP only: there is no packet loss on the relay, only delay and queueing.
+
+| What | Bar | Measured |
+|---|---|---|
+| Step-down after the link drops to 400 kbit/s + 40 ms | ≤ 2 s after trouble | round-trip spike seen 1.8 s after the drop; first step down in the next 1 s sample (1.8–2.8 s after the drop); 180p floor 4.8 s after the drop. Before pinging every second (decision 25): first step 3 s after the drop |
+| Steady state at 400 kbit/s | voice keeps going, video at what fits | 180p/15 with tries at 270p that held for 12 s in run 1 and failed after 3 s in run 2; round trip ~100–130 ms (2.9 s peak while the queue first filled) |
+| Voice through the throttle (Thr → Hob) | no dropout | Hob's voice buffer for Thr emptied for one 1 s sample as the throttle began, then 120–150 ms for the rest of it; no other gaps |
+| Recovery after the link clears | steps up only after ≥ 6 s calm | first step up 21.8 s and 23 s after clearing (two runs); 540p back after 60 s in run 1. Slow on purpose: rungs that failed wait 12 s, then 24 s, up to 60 s before another try |
+| 1.2 Mbit/s + 20 ms | 540p (1.1 Mbit/s) fits | held 540p/30, round trip 54–79 ms, no step-down |
+| Pause state lost (a "visible again" event never arrives) | the other side does not stay paused | before the fix: video stopped for good (seen live, run 1). After (decision 24): a stray "paused" cleared after 0.7 s |
+
 ## Server load
 
 | What | Measured |
 |---|---|
 | Desktop app CPU, idle / in a call | 0.5 % / 1.0 % (P0 baseline, before calls v2) |
 | Render CPU / RAM during a relayed call | **not measured**: needs the Render dashboard (owner access) |
-| Throttled network (Chrome DevTools throttling, Clumsy) | **not measured**: DevTools throttling is not available in the pane; Clumsy needs a download the user must approve |
+| Throttled network | relay measured with a JDK proxy (below); direct WebRTC (UDP) under loss **not measured** (needs an OS-level tool with admin rights, e.g. Clumsy) |
 
 ## Tests
 

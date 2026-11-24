@@ -30,7 +30,7 @@ Opus always uses DTX (near-silent when nobody talks). In-band FEC is on for dire
 
 - **Camera ceiling:** resolution from `getSettings()`. The frame rate is measured from frames the camera actually delivers (`MediaStreamTrackProcessor`; else `requestVideoFrameCallback`; else the setting), during ringing and again every 10 s. It is a soft ceiling: when auto-exposure lowers it, the call follows.
 - **Display size:** the other side reports its video tile in device pixels (CSS px × devicePixelRatio), debounced 300 ms. The relay sends the lowest rung at least that tall. Changes apply at once in both directions, still bounded by the network.
-- **Network (relay):** checked every second. A window has trouble when:
+- **Network (relay):** checked every second (the round trip is pinged every second). A window has trouble when:
   - more than one frame was skipped for a backed-up socket (outside the 1.5 s grace period after a rung change);
   - the round trip rises more than 150 ms and 1.5× above its minimum;
   - the receiver reports more than 10 % of frames late or lost (`vstat`, every 2 s).
@@ -44,3 +44,4 @@ Opus always uses DTX (near-silent when nobody talks). In-band FEC is on for dire
 - **They pause me:** I stop encoding (relay), or set the sender inactive (direct). On resume, a key frame is sent.
 - **Key-frame requests (`vkey`):** at most one per second.
 - **Pause and display messages that arrive too fast:** they are coalesced, not dropped: the newest one is applied once the gap passes.
+- **Lost pause state:** each side re-sends its pause state every 2 s when it differs from what it last sent, so a missed "visible again" cannot leave video stopped.
