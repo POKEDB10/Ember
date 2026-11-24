@@ -448,7 +448,7 @@ public final class EmberServer implements AutoCloseable {
                     return; // the plain listener is web-only; desktop frames need TLS
                 }
                 if (http) {
-                    upgrade = WebGateway.serve(input, output, EmberServer.this::loadMedia,
+                    upgrade = WebGateway.serve(input, output, mediaSource,
                             () -> edu.ember.common.protocol.FrameCodec.HEADER_BYTES + (userId == null ? 4096 : maxFrameBytes));
                     if (upgrade == null) {
                         return;
@@ -1205,17 +1205,23 @@ public final class EmberServer implements AutoCloseable {
             requireAuthenticated(frame.correlationId());
             MapFields fields = new MapFields(frame.payload());
             String encoded = fields.required("data");
+            boolean video = "video".equals(fields.values.get("kind"));
             byte[] bytes;
+            byte[] poster = null;
             try {
                 bytes = java.util.Base64.getDecoder().decode(encoded);
+                if (video) {
+                    poster = java.util.Base64.getDecoder().decode(fields.required("poster"));
+                }
             } catch (IllegalArgumentException exception) {
-                throw new edu.ember.common.exceptions.MediaValidationException("Image data is invalid");
+                throw new edu.ember.common.exceptions.MediaValidationException("Media data is invalid");
             }
             edu.ember.common.model.MediaAsset asset;
             try {
-                asset = socialFeedService.upload(userId, bytes, fields.required("fileName"));
+                asset = video ? socialFeedService.uploadVideo(userId, bytes, fields.required("fileName"), poster)
+                        : socialFeedService.upload(userId, bytes, fields.required("fileName"));
             } catch (edu.ember.common.exceptions.MediaValidationException exception) {
-                auditLogger.log("upload_rejected", userId, "image");
+                auditLogger.log("upload_rejected", userId, video ? "video" : "image");
                 throw exception;
             }
             send(edu.ember.common.protocol.FrameFactory.event(
@@ -1230,12 +1236,13 @@ public final class EmberServer implements AutoCloseable {
             MapFields fields = new MapFields(frame.payload());
             var post = socialFeedService.createPost(userId, fields.required("mediaId"),
                     fields.required("caption"));
+            java.util.Map<String, String> response = new java.util.HashMap<>(java.util.Map.of("post.n", "1",
+                    "post.0", post.postId(), "owner.0", post.ownerUserId(), "media.0", post.mediaId(),
+                    "caption.0", post.caption(), "created.0", Long.toString(post.createdAtMs()),
+                    "likes.0", "0", "comments.0", "0", "liked.0", "false"));
+            putMediaLinks(response, ".0", post.mediaId());
             send(edu.ember.common.protocol.FrameFactory.event(
-                    edu.ember.common.protocol.WireOpcodes.EVT_FEED_PAGE, frame.correlationId(),
-                    java.util.Map.of("post.n", "1", "post.0", post.postId(),
-                            "owner.0", post.ownerUserId(), "media.0", post.mediaId(),
-                            "caption.0", post.caption(), "created.0", Long.toString(post.createdAtMs()),
-                            "likes.0", "0", "comments.0", "0", "liked.0", "false")));
+                    edu.ember.common.protocol.WireOpcodes.EVT_FEED_PAGE, frame.correlationId(), response));
         }
 
         private void createStory(edu.ember.common.protocol.WireFrame frame) throws IOException,
@@ -1244,13 +1251,14 @@ public final class EmberServer implements AutoCloseable {
             MapFields fields = new MapFields(frame.payload());
             var story = socialFeedService.createStory(userId, fields.required("mediaId"),
                     fields.values.getOrDefault("caption", ""));
+            java.util.Map<String, String> response = new java.util.HashMap<>(java.util.Map.of("story.n", "1",
+                    "story.0", story.storyId(), "owner.0", story.ownerUserId(),
+                    "media.0", story.mediaId(), "caption.0", story.caption(),
+                    "created.0", Long.toString(story.createdAtMs()),
+                    "expires.0", Long.toString(story.expiresAtMs())));
+            putMediaLinks(response, ".0", story.mediaId());
             send(edu.ember.common.protocol.FrameFactory.event(
-                    edu.ember.common.protocol.WireOpcodes.EVT_STORY_UPDATE,
-                    frame.correlationId(), java.util.Map.of("story.n", "1",
-                            "story.0", story.storyId(), "owner.0", story.ownerUserId(),
-                            "media.0", story.mediaId(), "caption.0", story.caption(),
-                            "created.0", Long.toString(story.createdAtMs()),
-                            "expires.0", Long.toString(story.expiresAtMs()))));
+                    edu.ember.common.protocol.WireOpcodes.EVT_STORY_UPDATE, frame.correlationId(), response));
         }
 
         private void viewStories(edu.ember.common.protocol.WireFrame frame) throws IOException,
@@ -1265,6 +1273,7 @@ public final class EmberServer implements AutoCloseable {
                 response.put("story." + index, story.storyId());
                 response.put("owner." + index, story.ownerUserId());
                 response.put("media." + index, story.mediaId());
+                putMediaLinks(response, "." + index, story.mediaId());
                 response.put("caption." + index, story.caption());
                 response.put("created." + index, Long.toString(story.createdAtMs()));
                 response.put("expires." + index, Long.toString(story.expiresAtMs()));
@@ -1413,14 +1422,14 @@ public final class EmberServer implements AutoCloseable {
             }
             var post = socialFeedService.interact(userId, fields.required("postId"),
                     fields.required("action"), fields.values.getOrDefault("text", ""));
+            java.util.Map<String, String> response = new java.util.HashMap<>(java.util.Map.of("post.n", "1",
+                    "post.0", post.postId(), "owner.0", post.ownerUserId(), "media.0", post.mediaId(),
+                    "caption.0", post.caption(), "created.0", Long.toString(post.createdAtMs()),
+                    "likes.0", Integer.toString(post.likeCount()), "comments.0",
+                    Integer.toString(post.commentCount()), "liked.0", Boolean.toString(post.likedByViewer())));
+            putMediaLinks(response, ".0", post.mediaId());
             send(edu.ember.common.protocol.FrameFactory.event(
-                    edu.ember.common.protocol.WireOpcodes.EVT_FEED_PAGE, frame.correlationId(),
-                    java.util.Map.of("post.n", "1", "post.0", post.postId(),
-                            "owner.0", post.ownerUserId(), "media.0", post.mediaId(),
-                            "caption.0", post.caption(), "created.0", Long.toString(post.createdAtMs()),
-                            "likes.0", Integer.toString(post.likeCount()), "comments.0",
-                            Integer.toString(post.commentCount()), "liked.0",
-                            Boolean.toString(post.likedByViewer()))));
+                    edu.ember.common.protocol.WireOpcodes.EVT_FEED_PAGE, frame.correlationId(), response));
         }
 
         private void pullFeed(edu.ember.common.protocol.WireFrame frame) throws IOException,
@@ -1438,6 +1447,7 @@ public final class EmberServer implements AutoCloseable {
                 response.put("post." + index, post.postId());
                 response.put("owner." + index, post.ownerUserId());
                 response.put("media." + index, post.mediaId());
+                putMediaLinks(response, "." + index, post.mediaId());
                 response.put("caption." + index, post.caption());
                 response.put("created." + index, Long.toString(post.createdAtMs()));
                 response.put("likes." + index, Integer.toString(post.likeCount()));
@@ -1890,17 +1900,43 @@ public final class EmberServer implements AutoCloseable {
 
     }
 
-    /** Serves /media/ID to the browser: the session token must belong to a user allowed to see it. */
-    private byte[] loadMedia(String sessionToken, String mediaId, boolean thumbnail) throws IOException {
-        String viewer = sessions.findUserId(sessionToken);
-        if (viewer == null) {
-            return null;
+    private final MediaLinks mediaLinks = new MediaLinks();
+
+    /** Serves /media/ID to the browser: a valid signed link, or a session token of someone allowed to see it. */
+    private final WebGateway.MediaSource mediaSource = new WebGateway.MediaSource() {
+        @Override
+        public java.nio.file.Path open(String sessionToken, String mediaId, boolean thumbnail) throws IOException {
+            String viewer = sessions.findUserId(sessionToken);
+            if (viewer == null) {
+                return null;
+            }
+            try {
+                return socialFeedService.mediaPath(viewer, mediaId, thumbnail);
+            } catch (edu.ember.common.exceptions.EmberException | java.nio.file.NoSuchFileException exception) {
+                return null;
+            }
         }
-        try {
-            return socialFeedService.media(viewer, mediaId, thumbnail);
-        } catch (edu.ember.common.exceptions.EmberException | java.nio.file.NoSuchFileException exception) {
-            return null;
+
+        @Override
+        public java.nio.file.Path openLink(String mediaId, String variant, String expiry, String signature)
+                throws IOException {
+            if (!mediaLinks.valid(mediaId, variant, expiry, signature, System.currentTimeMillis())) {
+                return null;
+            }
+            try {
+                return socialFeedService.mediaPathForLink(mediaId, "t".equals(variant));
+            } catch (edu.ember.common.exceptions.EmberException | java.nio.file.NoSuchFileException exception) {
+                return null;
+            }
         }
+    };
+
+    /** Adds kind, src and thumb for one listed post or story, so the website loads it without another request. */
+    private void putMediaLinks(java.util.Map<String, String> response, String suffix, String mediaId) throws IOException {
+        long now = System.currentTimeMillis();
+        response.put("kind" + suffix, socialFeedService.isVideo(mediaId) ? "video" : "image");
+        response.put("src" + suffix, mediaLinks.link(mediaId, true, now));
+        response.put("thumb" + suffix, mediaLinks.link(mediaId, false, now));
     }
 
     /** Sends to every device the user is signed in on; one dead device never fails the caller. */

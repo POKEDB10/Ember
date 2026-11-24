@@ -12,6 +12,7 @@ import edu.ember.common.model.SocialPost;
 import edu.ember.common.model.StoryItem;
 import edu.ember.common.model.UserProfile;
 import edu.ember.common.security.ImageValidator;
+import edu.ember.common.security.VideoValidator;
 import edu.ember.server.storage.StorageEngine;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -221,7 +222,73 @@ public final class SocialFeedService {
         return storage.commentsForPost(postId, 20);
     }
 
+    /**
+     * A video post: the server cannot decode video, so it checks the container (MP4 or WebM, size
+     * cap) and stores the bytes as they are. The poster frame the browser cut from the video goes
+     * through the normal image checks and re-encoding, and stands in for the video wherever a
+     * picture is needed (feed placeholder, desktop app).
+     */
+    public MediaAsset uploadVideo(String owner, byte[] video, String suppliedName, byte[] poster)
+            throws IOException, MediaValidationException {
+        String extension = VideoValidator.validate(video, suppliedName);
+        ImageValidator.ValidatedImage still = imageValidator.validate(poster, "poster.jpg");
+        String id = UUID.randomUUID().toString();
+        String fullName = id + "." + extension;
+        String posterName = id + "_thumb.jpg";
+        Path fullPath = safePath(fullName);
+        Path posterPath = safePath(posterName);
+        Files.write(fullPath, video, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        try {
+            Files.write(posterPath, still.fullJpeg(), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+            MediaAsset asset = new MediaAsset(id, owner, fullName, posterName,
+                    still.width(), still.height(), System.currentTimeMillis());
+            storage.saveMedia(asset);
+            storage.mirrorMedia(fullName, video);
+            storage.mirrorMedia(posterName, still.fullJpeg());
+            return asset;
+        } catch (IOException exception) {
+            Files.deleteIfExists(fullPath);
+            Files.deleteIfExists(posterPath);
+            throw exception;
+        }
+    }
+
+    /** True for a video; false for a picture or an unknown id. */
+    public boolean isVideo(String mediaId) throws IOException {
+        return storage.findMedia(mediaId).map(SocialFeedService::isVideo).orElse(false);
+    }
+
+    private static boolean isVideo(MediaAsset asset) {
+        String name = asset.fileName();
+        return name.endsWith(".mp4") || name.endsWith(".webm");
+    }
+
+    /** HTTP content type of a stored media file. */
+    public static String contentType(Path file) {
+        String name = file.getFileName().toString();
+        return name.endsWith(".mp4") ? "video/mp4" : name.endsWith(".webm") ? "video/webm" : "image/jpeg";
+    }
+
+    /** Media bytes for the desktop app, which shows the poster frame in place of a video. */
     public byte[] media(String requester, String mediaId, boolean thumbnail)
+            throws IOException, ResourceNotFoundException {
+        MediaAsset asset = visibleMedia(requester, mediaId);
+        return Files.readAllBytes(localFile(asset, thumbnail || isVideo(asset)));
+    }
+
+    /** The local file behind a media id, after checking the requester may see it. */
+    public Path mediaPath(String requester, String mediaId, boolean thumbnail)
+            throws IOException, ResourceNotFoundException {
+        return localFile(visibleMedia(requester, mediaId), thumbnail);
+    }
+
+    /** The local file behind a media id, for a signed link that was checked when it was issued. */
+    public Path mediaPathForLink(String mediaId, boolean thumbnail) throws IOException, ResourceNotFoundException {
+        MediaAsset asset = storage.findMedia(mediaId).orElseThrow(() -> new ResourceNotFoundException("Media not found"));
+        return localFile(asset, thumbnail);
+    }
+
+    private MediaAsset visibleMedia(String requester, String mediaId)
             throws IOException, ResourceNotFoundException {
         Optional<MediaAsset> match = storage.findMedia(mediaId);
         boolean visible = false;
@@ -245,7 +312,11 @@ public final class SocialFeedService {
         if (!visible) {
             throw new ResourceNotFoundException("Media not found");
         }
-        String fileName = thumbnail ? match.get().thumbnailFileName() : match.get().fileName();
+        return match.get();
+    }
+
+    private Path localFile(MediaAsset asset, boolean thumbnail) throws IOException, ResourceNotFoundException {
+        String fileName = thumbnail ? asset.thumbnailFileName() : asset.fileName();
         Path local = safePath(fileName);
         if (!Files.exists(local)) {
             // Fresh server disk: fetch from the replica once, then serve from the local cache.
@@ -254,9 +325,8 @@ public final class SocialFeedService {
                 throw new ResourceNotFoundException("Media not found");
             }
             Files.write(local, remote);
-            return remote;
         }
-        return Files.readAllBytes(local);
+        return local;
     }
 
     public boolean isBlocked(String firstUserId, String secondUserId) throws IOException {

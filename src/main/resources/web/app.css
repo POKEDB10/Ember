@@ -137,15 +137,25 @@ input:focus, textarea:focus, button:focus-visible { outline: 2px dashed var(--ac
 .post p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .picbtn { padding: 0; box-shadow: none; border: 2px solid var(--line); background: var(--bg); }
 .picbtn:hover:not(:disabled) { background: var(--bg); }
-.pic { display: block; width: 100%; height: auto; min-height: 120px; object-fit: cover; image-rendering: auto; }
+/* Pictures and videos sit above the scanline layer (z-index 5) so they stay sharp and never shimmer. */
+.mediabox { position: relative; z-index: 6; display: grid; place-items: center; width: 100%; aspect-ratio: 4 / 5; max-height: 72vh;
+  overflow: hidden; background: #000 center / cover no-repeat; }
+.mediabox::before { content: ""; position: absolute; inset: -24px; background: inherit; filter: blur(20px) brightness(.6); }
+.pic, .vid { position: relative; display: block; width: 100%; height: 100%; object-fit: contain; }
+.pic { opacity: 0; transition: opacity .25s ease-out; }
+.mediabox.ready .pic { opacity: 1; }
+.mediabox.isvideo::after { content: "▶ VIDEO"; position: absolute; left: 8px; top: 8px; padding: 2px 6px; font-size: 11px; letter-spacing: .1em;
+  background: rgba(0, 0, 0, .65); color: #fff; text-shadow: none; pointer-events: none; }
+.mediabox.isvideo.ready::after { content: none; }
+.mediabox.broken::after { content: "[unavailable]"; position: relative; color: var(--dim); }
 .comments { border-top: 1px dashed var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
 .profile { border: 2px solid var(--line); background: var(--raised); box-shadow: 4px 4px 0 var(--line); padding: 14px; width: min(100%, 560px); align-self: center; display: flex; flex-direction: column; gap: 8px; }
 .profile h2 { margin: 0; color: var(--accent); font-size: 20px; }
 .profile p { margin: 0; white-space: pre-wrap; }
 
-.overlay { position: fixed; inset: 0; z-index: 4; background: rgba(0, 0, 0, .88); display: grid; place-items: center; padding: 16px; }
+.overlay { position: fixed; inset: 0; z-index: 6; background: rgba(0, 0, 0, .88); display: grid; place-items: center; padding: 16px; }
 .overlay figure { margin: 0; max-width: 100%; max-height: 100%; display: flex; flex-direction: column; gap: 8px; align-items: center; }
-.overlay img { max-width: min(96vw, 1600px); max-height: 82vh; border: 2px solid var(--line); background: var(--bg); }
+.overlay img, .overlay video { max-width: min(96vw, 1600px); max-height: 82vh; border: 2px solid var(--line); background: #000; }
 .overlay figcaption { color: var(--text); text-align: center; }
 .overlay #overlayClose { position: absolute; top: 12px; right: 16px; font-size: 28px; color: var(--text); }
 .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); text-shadow: none; padding: 8px 14px; border: 2px solid var(--line); box-shadow: 4px 4px 0 var(--line); max-width: calc(100vw - 32px); z-index: 6; }
@@ -218,3 +228,41 @@ input:focus, textarea:focus, button:focus-visible { outline: 2px dashed var(--ac
 .callstats { padding: 4px 12px; white-space: pre-wrap; font-size: 11px; color: var(--ok); }
 .danger { border-color: var(--err); color: var(--err); }
 @media (max-width: 720px) { .callbox { inset: 0; width: 100vw; max-height: none; box-shadow: none; } }
+
+/* ---- in-app dialogs and the composer (replace the browser's prompt/confirm pop-ups) ---- */
+dialog.sheet { padding: 0; width: min(520px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); overflow: auto;
+  color: var(--text); text-shadow: var(--glow); background: var(--panel); border: 2px solid var(--line);
+  box-shadow: 8px 8px 0 var(--line), 0 0 60px rgba(0, 0, 0, .6); }
+dialog.sheet.postsheet { width: min(600px, calc(100vw - 24px)); }
+dialog.sheet[open] { animation: sheet-in .16s ease-out; }
+dialog.sheet::backdrop { background: rgba(0, 0, 0, .62); backdrop-filter: blur(3px); }
+@keyframes sheet-in { from { opacity: 0; transform: translateY(12px) scale(.98); } }
+.sheet-body { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
+.sheet-text { margin: 0; color: var(--dim); }
+.sheet-field { display: flex; flex-direction: column; gap: 6px; }
+.sheet-label { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; letter-spacing: .12em; color: var(--dim); }
+.sheet-count { font-variant-numeric: tabular-nums; opacity: .85; }
+.sheet input:not([type="checkbox"]), .sheet textarea { width: 100%; padding: 10px 12px; border: 2px solid var(--line); background: var(--bg);
+  box-shadow: inset 3px 3px 0 rgba(0, 0, 0, .35); resize: vertical; caret-color: var(--accent); }
+.sheet input:not([type="checkbox"]):focus, .sheet textarea:focus { outline: none; border-color: var(--accent);
+  box-shadow: inset 3px 3px 0 rgba(0, 0, 0, .35), 0 0 0 2px var(--accent); }
+.sheet-check { display: flex; gap: 10px; align-items: center; cursor: pointer; }
+.sheet-check input { width: 18px; height: 18px; accent-color: var(--accent); }
+.sheet-err { margin: 0; min-height: 1.2em; color: var(--err); }
+.sheet-err:empty { min-height: 0; }
+.sheet-actions { display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
+.sheet-actions button { min-width: 110px; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); text-shadow: none; font-weight: 700; }
+button.primary:hover:not(:disabled) { filter: brightness(1.1); }
+button.ghost { background: transparent; }
+.drop { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-height: 220px;
+  padding: 12px; text-align: center; cursor: pointer; overflow: hidden; border: 2px dashed var(--line);
+  background: repeating-linear-gradient(45deg, var(--bg) 0 10px, var(--raised) 10px 20px); transition: border-color .15s; }
+.drop:hover, .drop.over, .drop:focus-visible { border-color: var(--accent); outline: none; }
+.drop-icon { font-size: 36px; color: var(--accent); line-height: 1; }
+.drop.filled { padding: 0; min-height: 0; background: #000; border-style: solid; }
+.drop .preview { display: block; width: 100%; max-height: 52vh; object-fit: contain; background: #000; }
+.drop-tag { position: absolute; left: 8px; top: 8px; padding: 2px 6px; font-size: 12px; background: var(--bg); color: var(--text); border: 1px solid var(--line); }
+.progress { height: 12px; border: 2px solid var(--line); background: var(--bg); }
+.progress-fill { height: 100%; width: 0; background: repeating-linear-gradient(90deg, var(--accent) 0 8px, transparent 8px 11px); transition: width .15s; }
+@media (prefers-reduced-motion: reduce) { dialog.sheet[open] { animation: none; } .pic, .progress-fill { transition: none; } }

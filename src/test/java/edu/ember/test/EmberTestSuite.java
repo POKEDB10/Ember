@@ -98,7 +98,8 @@ public final class EmberTestSuite {
                 this::testMultiDeviceAndWeb);
         runTest("web-only server mode, health endpoint, and Swing client over WebSocket",
                 this::testWebOnlyModeAndDesktopOverWebSocket);
-        runTest("compressed WebSocket both ways and cached image download over HTTP",
+        runTest("video uploads: MP4/WebM by their first bytes only, 16 MB cap", this::testVideoValidator);
+        runTest("compressed WebSocket, cached images, signed links, video upload and byte ranges",
                 this::testCompressedWebSocketAndMediaHttp);
         runTest("revision sync sends only edits, pins, stars, and deletions since the cursor",
                 this::testRevisionSync);
@@ -1428,6 +1429,9 @@ public final class EmberTestSuite {
             int port = server.startHttp(0);
             String token;
             String mediaId;
+            String imageLink;
+            String videoLink;
+            String posterLink;
             try (java.net.Socket socket = new java.net.Socket("127.0.0.1", port)) {
                 socket.setSoTimeout(20_000);
                 var in = new java.io.BufferedInputStream(socket.getInputStream());
@@ -1459,9 +1463,59 @@ public final class EmberTestSuite {
                         sawCompressed).payload()).get("mediaId");
                 wsSendCompressed(out, FrameFactory.command(WireOpcodes.CMD_POST_CREATE, 3,
                         Map.of("mediaId", mediaId, "caption", "compressed hello")), deflater);
-                wsReadInflating(in, WireOpcodes.EVT_FEED_PAGE, inflater, sawCompressed);
+                Map<String, String> posted = KvPayloadCodec.decode(
+                        wsReadInflating(in, WireOpcodes.EVT_FEED_PAGE, inflater, sawCompressed).payload());
                 assertTrue(sawCompressed.get(), "No server message arrived compressed");
+                assertEquals("image", posted.get("kind.0"), "A photo post was not marked as an image");
+                imageLink = posted.get("src.0");
+
+                // A video post: the container is checked by its first bytes, the poster is re-encoded.
+                byte[] video = fakeMp4(3000);
+                wsSendCompressed(out, FrameFactory.command(WireOpcodes.CMD_MEDIA_UPLOAD, 4,
+                        Map.of("kind", "video", "fileName", "clip.mp4",
+                                "data", java.util.Base64.getEncoder().encodeToString(video),
+                                "poster", java.util.Base64.getEncoder().encodeToString(jpeg.toByteArray()))), deflater);
+                String videoId = KvPayloadCodec.decode(wsReadInflating(in, WireOpcodes.EVT_MEDIA_OK, inflater,
+                        sawCompressed).payload()).get("mediaId");
+                wsSendCompressed(out, FrameFactory.command(WireOpcodes.CMD_POST_CREATE, 5,
+                        Map.of("mediaId", videoId, "caption", "a clip")), deflater);
+                Map<String, String> clip = KvPayloadCodec.decode(
+                        wsReadInflating(in, WireOpcodes.EVT_FEED_PAGE, inflater, sawCompressed).payload());
+                assertEquals("video", clip.get("kind.0"), "A video post was not marked as a video");
+                videoLink = clip.get("src.0");
+                posterLink = clip.get("thumb.0");
+
+                byte[] script = "#!/bin/sh\nrm -rf /\n".repeat(10).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                wsSendCompressed(out, FrameFactory.command(WireOpcodes.CMD_MEDIA_UPLOAD, 6,
+                        Map.of("kind", "video", "fileName", "clip.mp4",
+                                "data", java.util.Base64.getEncoder().encodeToString(script),
+                                "poster", java.util.Base64.getEncoder().encodeToString(jpeg.toByteArray()))), deflater);
+                String refusal = "";
+                try {
+                    wsReadInflating(in, WireOpcodes.EVT_MEDIA_OK, inflater, sawCompressed);
+                } catch (AssertionError expected) {
+                    refusal = expected.getMessage();
+                }
+                assertTrue(refusal.contains("code=400") && refusal.contains("MP4"), "A script renamed to .mp4 was accepted");
             }
+            String signedImage = httpGet(port, imageLink, "");
+            assertTrue(signedImage.startsWith("HTTP/1.1 200") && signedImage.contains("image/jpeg"),
+                    "A signed image link did not load without a login header");
+            String forged = imageLink.substring(0, imageLink.length() - 2) + (imageLink.endsWith("AA") ? "BB" : "AA");
+            assertTrue(httpGet(port, forged, "").startsWith("HTTP/1.1 404"), "A tampered signed link was accepted");
+            assertTrue(httpGet(port, imageLink.replace("v=f", "v=t"), "").startsWith("HTTP/1.1 404"),
+                    "A signature for the full picture also opened another variant");
+            String poster = httpGet(port, posterLink, "");
+            assertTrue(poster.startsWith("HTTP/1.1 200") && poster.contains("image/jpeg"), "The video poster did not load");
+            String part = httpGetHeaders(port, videoLink, "Range: bytes=0-99");
+            assertTrue(part.startsWith("HTTP/1.1 206") && part.contains("Content-Type: video/mp4")
+                    && part.contains("Content-Range: bytes 0-99/3000") && part.contains("Content-Length: 100"),
+                    "The video was not streamed as a byte range");
+            assertTrue(part.endsWith(new String(java.util.Arrays.copyOf(fakeMp4(3000), 100), java.nio.charset.StandardCharsets.ISO_8859_1)),
+                    "The byte range had the wrong bytes");
+            assertTrue(httpGetHeaders(port, videoLink, "Range: bytes=5000-").startsWith("HTTP/1.1 416"),
+                    "A range past the end was not refused");
+            assertTrue(httpGetHeaders(port, videoLink, "").startsWith("HTTP/1.1 200"), "The whole video did not load");
             String withToken = httpGet(port, "/media/" + mediaId, "Bearer " + token);
             assertTrue(withToken.startsWith("HTTP/1.1 200") && withToken.contains("image/jpeg")
                     && withToken.contains("immutable"), "Image was not served with caching headers");
@@ -1472,6 +1526,57 @@ public final class EmberTestSuite {
             inflater.end();
             server.close();
         }
+    }
+
+    /** A minimal MP4: an "ftyp" box with brand isom, then filler bytes. */
+    private static byte[] fakeMp4(int size) {
+        byte[] bytes = new byte[size];
+        byte[] head = {0, 0, 0, 24, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 2, 0, 'i', 's', 'o', 'm', 'm', 'p', '4', '1'};
+        System.arraycopy(head, 0, bytes, 0, head.length);
+        for (int index = head.length; index < size; index++) {
+            bytes[index] = (byte) (index * 7);
+        }
+        return bytes;
+    }
+
+    private static String httpGetHeaders(int port, String path, String header) throws IOException {
+        try (java.net.Socket socket = new java.net.Socket("127.0.0.1", port)) {
+            socket.setSoTimeout(10_000);
+            socket.getOutputStream().write(("GET " + path + " HTTP/1.1\r\nHost: x\r\n"
+                    + (header.isEmpty() ? "" : header + "\r\n") + "\r\n").getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            return new String(socket.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.ISO_8859_1);
+        }
+    }
+
+    /** Video uploads: only real MP4/WebM containers with a matching name, under the size cap. */
+    private void testVideoValidator() throws Exception {
+        byte[] mp4 = fakeMp4(500);
+        assertEquals("mp4", edu.ember.common.security.VideoValidator.validate(mp4, "clip.MP4"), "MP4 was refused");
+        assertEquals("mp4", edu.ember.common.security.VideoValidator.validate(mp4, "phone.mov"), "A phone .mov was refused");
+        byte[] webm = new byte[200];
+        byte[] ebml = {0x1A, 0x45, (byte) 0xDF, (byte) 0xA3, (byte) 0x9F, 0x42, (byte) 0x82, (byte) 0x84, 'w', 'e', 'b', 'm'};
+        System.arraycopy(ebml, 0, webm, 0, ebml.length);
+        assertEquals("webm", edu.ember.common.security.VideoValidator.validate(webm, "clip.webm"), "WebM was refused");
+        for (Object[] bad : new Object[][] {
+            {mp4, "clip.webm"}, {webm, "clip.mp4"}, {mp4, "clip.exe"}, {new byte[500], "clip.mp4"},
+            {"<script>alert(1)</script>".repeat(20).getBytes(java.nio.charset.StandardCharsets.UTF_8), "clip.mp4"},
+            {new byte[10], "clip.mp4"}}) {
+            boolean refused = false;
+            try {
+                edu.ember.common.security.VideoValidator.validate((byte[]) bad[0], (String) bad[1]);
+            } catch (edu.ember.common.exceptions.MediaValidationException expected) {
+                refused = true;
+            }
+            assertTrue(refused, "A bad video was accepted as " + bad[1]);
+        }
+        byte[] huge = java.util.Arrays.copyOf(mp4, edu.ember.common.security.VideoValidator.MAX_BYTES + 1);
+        boolean tooBig = false;
+        try {
+            edu.ember.common.security.VideoValidator.validate(huge, "clip.mp4");
+        } catch (edu.ember.common.exceptions.MediaValidationException expected) {
+            tooBig = true;
+        }
+        assertTrue(tooBig, "A video over 16 MB was accepted");
     }
 
     private static String httpGet(int port, String path, String authorization) throws IOException {

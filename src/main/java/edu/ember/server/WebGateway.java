@@ -53,9 +53,12 @@ public final class WebGateway {
     private static final Map<String, Asset> CACHE = new ConcurrentHashMap<>();
 
     /** Loads an image for a signed-in viewer, or returns null when it is missing or not visible. */
-    @FunctionalInterface
     interface MediaSource {
-        byte[] load(String sessionToken, String mediaId, boolean thumbnail) throws IOException;
+        /** A request with "Authorization: Bearer token": the file, or null when missing or not visible. */
+        java.nio.file.Path open(String sessionToken, String mediaId, boolean thumbnail) throws IOException;
+
+        /** A signed link (v, e, s query values): the file, or null when the link is invalid or expired. */
+        java.nio.file.Path openLink(String mediaId, String variant, String expiry, String signature) throws IOException;
     }
 
     /** forwardedFor is the X-Forwarded-For header, or null. */
@@ -124,8 +127,8 @@ public final class WebGateway {
             write(out, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2"
                     + "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + (head ? "" : "ok"));
         } else if (path.startsWith("/media/")) {
-            serveMedia(out, media, headers.getOrDefault("authorization", ""),
-                    path.substring("/media/".length()), !query.contains("full=1"), head);
+            serveMedia(out, media, headers.getOrDefault("authorization", ""), path.substring("/media/".length()),
+                    query, headers.get("range"), head);
         } else {
             serveFile(out, FILES.containsKey(path) ? asset(FILES.get(path)) : null,
                     headers.get("if-none-match"), head);
@@ -147,24 +150,97 @@ public final class WebGateway {
         }
     }
 
-    /** Images never change once uploaded, so the browser may cache them for a year. */
+    /**
+     * Pictures and videos never change once uploaded, so the browser may cache them. A signed link
+     * (from a feed or story listing) needs no login header, so img and video tags load it directly;
+     * the older Bearer-header form still works. Byte ranges let a video start before it has fully
+     * downloaded and let the viewer seek; the file is streamed, never loaded whole into memory.
+     */
     private static void serveMedia(OutputStream out, MediaSource media, String authorization,
-            String mediaId, boolean thumbnail, boolean head) throws IOException {
-        byte[] image = null;
+            String mediaId, String query, String range, boolean head) throws IOException {
+        java.nio.file.Path file = null;
+        Map<String, String> params = queryParams(query);
         // The ID is only a lookup key (never a file path); still keep it to safe characters.
-        if (authorization.startsWith("Bearer ") && mediaId.matches("[A-Za-z0-9_-]{1,64}")) {
-            image = media.load(authorization.substring(7).strip(), mediaId, thumbnail);
+        if (mediaId.matches("[A-Za-z0-9_-]{1,64}")) {
+            if (params.containsKey("s")) {
+                file = media.openLink(mediaId, params.getOrDefault("v", ""), params.getOrDefault("e", ""),
+                        params.get("s"));
+            } else if (authorization.startsWith("Bearer ")) {
+                file = media.open(authorization.substring(7).strip(), mediaId, !"1".equals(params.get("full")));
+            }
         }
-        if (image == null) {
+        if (file == null || !java.nio.file.Files.isRegularFile(file)) {
             write(out, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             return;
         }
-        write(out, "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: " + image.length
-                + "\r\nCache-Control: private, max-age=31536000, immutable" + SECURITY_HEADERS
+        long size = java.nio.file.Files.size(file);
+        long[] span = byteRange(range, size);
+        String cache = params.containsKey("s") ? "private, max-age=86400, immutable" : "private, max-age=31536000, immutable";
+        String type = SocialFeedService.contentType(file);
+        if (span == null) {
+            write(out, "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */" + size
+                    + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return;
+        }
+        // Any valid single range gets 206 (Safari insists on it even for "bytes=0-").
+        boolean partial = range != null && range.startsWith("bytes=") && !range.contains(",") && size > 0;
+        long length = span[1] - span[0] + 1;
+        write(out, (partial ? "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes " + span[0] + "-" + span[1] + "/" + size
+                : "HTTP/1.1 200 OK") + "\r\nContent-Type: " + type + "\r\nContent-Length: " + length
+                + "\r\nAccept-Ranges: bytes\r\nCache-Control: " + cache + SECURITY_HEADERS
                 + "\r\nConnection: close\r\n\r\n");
         if (!head) {
-            out.write(image);
+            try (var channel = java.nio.channels.FileChannel.open(file)) {
+                channel.position(span[0]);
+                java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(64 * 1024);
+                long left = length;
+                while (left > 0) {
+                    buffer.clear().limit((int) Math.min(buffer.capacity(), left));
+                    int read = channel.read(buffer);
+                    if (read < 0) {
+                        break;
+                    }
+                    out.write(buffer.array(), 0, read);
+                    left -= read;
+                }
+            }
         }
+    }
+
+    /** One "bytes=a-b", "bytes=a-" or "bytes=-n" range as {first, last}; the whole file without a header; null when unsatisfiable. */
+    static long[] byteRange(String header, long size) {
+        if (header == null || !header.startsWith("bytes=") || header.contains(",")) {
+            return size == 0 ? new long[] {0, -1} : new long[] {0, size - 1};
+        }
+        String[] parts = header.substring(6).trim().split("-", -1);
+        try {
+            long first;
+            long last;
+            if (parts[0].isEmpty()) {
+                long suffix = Long.parseLong(parts[1]);
+                first = Math.max(0, size - suffix);
+                last = size - 1;
+            } else {
+                first = Long.parseLong(parts[0]);
+                last = parts.length > 1 && !parts[1].isEmpty() ? Math.min(Long.parseLong(parts[1]), size - 1) : size - 1;
+            }
+            return first < 0 || first > last || first >= size ? null : new long[] {first, last};
+        } catch (NumberFormatException | ArrayIndexOutOfBoundsException exception) {
+            return size == 0 ? new long[] {0, -1} : new long[] {0, size - 1};
+        }
+    }
+
+    private static Map<String, String> queryParams(String query) {
+        Map<String, String> params = new HashMap<>();
+        for (String pair : query.split("&")) {
+            int equals = pair.indexOf('=');
+            if (equals > 0 && params.size() < 8) {
+                params.put(pair.substring(0, equals), pair.substring(equals + 1));
+            } else if (pair.equals("full")) {
+                params.put("full", "1");
+            }
+        }
+        return params;
     }
 
     private static void serveFile(OutputStream out, Asset asset, String ifNoneMatch, boolean head)

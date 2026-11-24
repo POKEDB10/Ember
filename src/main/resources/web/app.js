@@ -417,30 +417,230 @@ async function mediaUrl(id, full) {
   return S.media.get(key);
 }
 
-function img(id, full, alt) {
-  const el = h('img', { alt, loading: 'lazy', class: 'pic' });
-  mediaUrl(id, full).then((u) => { el.src = u; }).catch(() => { el.alt = '[image unavailable]'; });
-  return el;
+
+/**
+ * A post's picture or video. With a signed link (src/thumb from the server) the browser loads it
+ * natively: in parallel, from its cache, and videos stream and seek. The small thumbnail paints first
+ * as a soft backdrop, then the full picture fades in sharp. Older servers fall back to a login-header fetch.
+ */
+function mediaNode(p, onOpen) {
+  const box = h('div', { class: 'mediabox' + (p.kind === 'video' ? ' isvideo' : '') });
+  if (p.thumb) box.style.backgroundImage = 'url("' + p.thumb + '")';
+  if (p.kind === 'video' && p.src) {
+    const v = h('video', { class: 'vid', controls: true, playsInline: true, preload: 'metadata', poster: p.thumb || '', src: p.src });
+    v.addEventListener('loadedmetadata', () => { if (v.videoWidth) box.style.aspectRatio = v.videoWidth + ' / ' + v.videoHeight; box.classList.add('ready'); });
+    v.addEventListener('error', () => { box.classList.add('broken'); }, { once: true });
+    box.append(v);
+    return box;
+  }
+  const el = h('img', { class: 'pic', alt: p.caption || '', decoding: 'async', loading: 'lazy' });
+  el.addEventListener('load', () => { box.style.aspectRatio = el.naturalWidth + ' / ' + el.naturalHeight; box.classList.add('ready'); });
+  el.addEventListener('error', () => { box.classList.add('broken'); el.alt = '[image unavailable]'; });
+  if (p.src) el.src = p.src; else mediaUrl(p.media, true).then((u) => { el.src = u; }).catch(() => box.classList.add('broken'));
+  if (p.thumb) { // the thumbnail tells the shape before the full picture arrives
+    const t = new Image();
+    t.onload = () => { if (!box.classList.contains('ready')) box.style.aspectRatio = t.naturalWidth + ' / ' + t.naturalHeight; };
+    t.src = p.thumb;
+  }
+  box.append(el);
+  return onOpen ? h('button', { class: 'picbtn', onclick: onOpen, 'aria-label': 'Open picture' }, box) : box;
 }
 
-/** Shrinks a photo in the browser before upload: at most 1600 px, JPEG ~82%. */
-async function pickImage() {
-  const file = await new Promise((resolve) => {
+// ---- in-app dialogs (no browser pop-ups) ----
+/**
+ * A themed modal form. fields: [{ name, label, value, max, multiline, placeholder, type: 'text' | 'check', required }].
+ * Resolves with { name: value } or null when cancelled. validate(values) may return an error message.
+ */
+function ask({ title, text = '', fields = [], ok = 'OK', danger = false, validate = null }) {
+  return new Promise((resolve) => {
+    const err = h('p', { class: 'sheet-err', role: 'alert' });
+    const inputs = fields.map((f) => {
+      if (f.type === 'check') {
+        const box = h('input', { type: 'checkbox', checked: !!f.value, name: f.name });
+        return { f, el: box, node: h('label', { class: 'sheet-check' }, box, h('span', {}, f.label)) };
+      }
+      const el = h(f.multiline ? 'textarea' : 'input', { name: f.name, maxLength: f.max || 500, placeholder: f.placeholder || '',
+        autocomplete: 'off', spellcheck: !!f.multiline });
+      if (f.multiline) el.rows = 4;
+      el.value = f.value || '';
+      const count = h('span', { class: 'sheet-count' });
+      const upd = () => { count.textContent = f.max ? el.value.length + ' / ' + f.max : ''; };
+      el.addEventListener('input', () => { upd(); err.textContent = ''; }); upd();
+      return { f, el, node: h('label', { class: 'sheet-field' }, h('span', { class: 'sheet-label' }, f.label, count), el) };
+    });
+    const cancel = h('button', { type: 'button', class: 'ghost' }, 'CANCEL');
+    const okBtn = h('button', { type: 'submit', class: danger ? 'danger' : 'primary' }, ok);
+    const form = h('form', { class: 'sheet-body' }, text ? h('p', { class: 'sheet-text' }, text) : null,
+      ...inputs.map((i) => i.node), err, h('div', { class: 'sheet-actions' }, cancel, okBtn));
+    const dlg = h('dialog', { class: 'window sheet', 'aria-label': title },
+      h('header', { class: 'titlebar' }, h('span', {}, '▣ ' + title), h('button', { type: 'button', class: 'icon', 'aria-label': 'Close', onclick: () => finish(null) }, '×')), form);
+    let done = false;
+    const finish = (value) => { if (done) return; done = true; dlg.close(); dlg.remove(); resolve(value); };
+    cancel.onclick = () => finish(null);
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); finish(null); });
+    dlg.addEventListener('click', (e) => { if (e.target === dlg) finish(null); });
+    form.onsubmit = (e) => {
+      e.preventDefault();
+      const values = Object.fromEntries(inputs.map(({ f, el }) => [f.name, f.type === 'check' ? el.checked : el.value.trim()]));
+      const missing = inputs.find(({ f, el }) => f.required && !el.value.trim());
+      const problem = missing ? missing.f.label.toLowerCase() + ' is needed' : validate && validate(values);
+      if (problem) { err.textContent = '⚠ ' + problem; (missing ? missing.el : inputs[0] && inputs[0].el)?.focus(); return; }
+      finish(values);
+    };
+    document.body.append(dlg);
+    dlg.showModal();
+    (inputs.find((i) => i.f.type !== 'check') || { el: okBtn }).el.focus();
+  });
+}
+
+const confirmBox = (title, text, ok = 'OK', danger = false) => ask({ title, text, ok, danger }).then((v) => !!v);
+
+// ---- sharing a photo or a video (post or story) ----
+const VIDEO_MAX_BYTES = 16 * 1024 * 1024, VIDEO_MAX_SECONDS = 60;
+const sizeText = (bytes) => (bytes < 1048576 ? Math.max(1, Math.round(bytes / 1024)) + ' KB' : (bytes / 1048576).toFixed(1) + ' MB');
+
+/** The composer: pick a photo or video, see it, write a caption, share. Uploads show real progress. */
+function share(kind) {
+  const story = kind === 'story';
+  let picked = null; // { file, isVideo, url, posterBlob?, duration? }
+  const preview = h('div', { class: 'drop', tabIndex: 0, role: 'button', 'aria-label': 'Choose a photo or video' },
+    h('span', { class: 'drop-icon' }, '⇪'), h('span', {}, 'CHOOSE A PHOTO OR VIDEO'), h('span', { class: 'dim small' }, 'or drop it here · video up to 60 s and 16 MB'));
+  const caption = h('textarea', { maxLength: 1000, rows: 3, placeholder: story ? 'say something (optional)' : 'write a caption…', 'aria-label': 'Caption' });
+  const count = h('span', { class: 'sheet-count' }, '0 / 1000');
+  caption.addEventListener('input', () => { count.textContent = caption.value.length + ' / 1000'; });
+  const bar = h('div', { class: 'progress', hidden: true }, h('div', { class: 'progress-fill' }));
+  const status = h('p', { class: 'sheet-err', role: 'status' });
+  const go = h('button', { type: 'submit', class: 'primary', disabled: true }, story ? 'SHARE STORY' : 'POST');
+  const cancel = h('button', { type: 'button', class: 'ghost' }, 'CANCEL');
+  const form = h('form', { class: 'sheet-body' }, preview,
+    h('label', { class: 'sheet-field' }, h('span', { class: 'sheet-label' }, 'CAPTION', count), caption), bar, status,
+    h('div', { class: 'sheet-actions' }, cancel, go));
+  const dlg = h('dialog', { class: 'window sheet postsheet', 'aria-label': story ? 'New story' : 'New post' },
+    h('header', { class: 'titlebar' }, h('span', {}, story ? '▣ NEW STORY · 24 H' : '▣ NEW POST'), h('button', { type: 'button', class: 'icon', 'aria-label': 'Close', onclick: () => close() }, '×')), form);
+  let busy = false;
+  const close = () => { if (busy) return; if (picked) URL.revokeObjectURL(picked.url); dlg.close(); dlg.remove(); };
+  cancel.onclick = close;
+  dlg.addEventListener('cancel', (e) => { e.preventDefault(); close(); });
+
+  const choose = async (file) => {
+    if (!file) return;
+    status.textContent = '';
+    const isVideo = file.type.startsWith('video/') || /\.(mp4|m4v|mov|webm)$/i.test(file.name);
+    if (picked) URL.revokeObjectURL(picked.url);
+    picked = null; go.disabled = true;
+    const url = URL.createObjectURL(file);
+    try {
+      if (isVideo) {
+        if (file.size > VIDEO_MAX_BYTES) throw new Error('that video is ' + (file.size / 1048576).toFixed(1) + ' MB; the limit is 16 MB. Trim it or record at a lower quality.');
+        const v = h('video', { src: url, muted: true, playsInline: true, preload: 'auto', controls: true, class: 'preview' });
+        preview.replaceChildren(h('span', { class: 'dim' }, 'reading video…'));
+        const { duration, posterBlob } = await videoFacts(v);
+        if (duration > VIDEO_MAX_SECONDS + 0.5) throw new Error('that video is ' + Math.round(duration) + ' s; the limit is 60 s.');
+        picked = { file, isVideo, url, posterBlob, duration };
+        preview.replaceChildren(v, h('span', { class: 'drop-tag' }, '▶ ' + Math.round(duration) + ' s · ' + sizeText(file.size)));
+      } else {
+        const im = h('img', { src: url, class: 'preview', alt: 'preview' });
+        await im.decode();
+        picked = { file, isVideo, url };
+        preview.replaceChildren(im, h('span', { class: 'drop-tag' }, 'PHOTO · tap to change'));
+      }
+      preview.classList.add('filled');
+      go.disabled = false;
+      caption.focus();
+    } catch (e) {
+      URL.revokeObjectURL(url);
+      preview.classList.remove('filled');
+      preview.replaceChildren(h('span', { class: 'drop-icon' }, '⇪'), h('span', {}, 'CHOOSE A PHOTO OR VIDEO'), h('span', { class: 'dim small' }, 'or drop it here · video up to 60 s and 16 MB'));
+      status.textContent = '⚠ ' + (e.message || 'this file cannot be opened here');
+    }
+  };
+  const pick = () => {
     const input = $('filePick');
     input.value = '';
-    input.onchange = () => resolve(input.files[0]);
+    input.onchange = () => choose(input.files[0]);
     input.click();
+  };
+  preview.onclick = (e) => { if (!(e.target instanceof HTMLVideoElement)) pick(); };
+  preview.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } };
+  preview.ondragover = (e) => { e.preventDefault(); preview.classList.add('over'); };
+  preview.ondragleave = () => preview.classList.remove('over');
+  preview.ondrop = (e) => { e.preventDefault(); preview.classList.remove('over'); choose(e.dataTransfer.files[0]); };
+
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    if (!picked || busy) return;
+    busy = true; go.disabled = true; cancel.disabled = true; caption.disabled = true;
+    bar.hidden = false; status.textContent = 'preparing…';
+    try {
+      const fields = picked.isVideo
+        ? { kind: 'video', fileName: /\.webm$/i.test(picked.file.name) || picked.file.type === 'video/webm' ? 'clip.webm' : 'clip.mp4',
+          data: await base64(picked.file), poster: await base64(picked.posterBlob) }
+        : { fileName: 'photo.jpg', data: await base64(await shrinkPhoto(picked.file)) };
+      const ok = await withProgress(bar, status, () => request(OP.MEDIA_UPLOAD, fields));
+      status.textContent = 'sharing…';
+      const text = caption.value.trim();
+      if (story) { await request(OP.STORY_CREATE, { mediaId: ok.mediaId, caption: text }); loadStories(); }
+      else { await request(OP.POST_CREATE, { mediaId: ok.mediaId, caption: text }); openPulse(); }
+      busy = false; close();
+      toast(story ? 'story shared ✦' : 'posted ✦');
+    } catch (x) {
+      busy = false; go.disabled = false; cancel.disabled = false; caption.disabled = false; bar.hidden = true;
+      status.textContent = '⚠ ' + x.message;
+    }
+  };
+  document.body.append(dlg);
+  dlg.showModal();
+  preview.focus();
+}
+
+/** Length of a video and a poster frame (JPEG, at most 1280 px) cut from it, both read in the browser. */
+function videoFacts(v) {
+  return new Promise((resolve, reject) => {
+    const fail = () => reject(new Error('this browser cannot play that video. Export it as MP4 (H.264) and try again.'));
+    const timer = setTimeout(fail, 15000);
+    v.addEventListener('error', () => { clearTimeout(timer); fail(); }, { once: true });
+    v.addEventListener('loadeddata', () => { v.currentTime = Math.min(0.5, (v.duration || 1) / 2); }, { once: true });
+    v.addEventListener('seeked', () => {
+      clearTimeout(timer);
+      const scale = Math.min(1, 1280 / Math.max(v.videoWidth, v.videoHeight));
+      const c = h('canvas', { width: Math.max(1, Math.round(v.videoWidth * scale)), height: Math.max(1, Math.round(v.videoHeight * scale)) });
+      c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+      c.toBlob((b) => (b ? resolve({ duration: v.duration, posterBlob: b }) : fail()), 'image/jpeg', 0.85);
+    }, { once: true });
   });
-  if (!file) return null;
+}
+
+/** Photos are shrunk in the browser before upload: at most 1600 px, JPEG 82 %. */
+async function shrinkPhoto(file) {
   const bitmap = await createImageBitmap(file);
   const scale = Math.min(1, 1600 / Math.max(bitmap.width, bitmap.height));
   const canvas = h('canvas', { width: Math.round(bitmap.width * scale), height: Math.round(bitmap.height * scale) });
   canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-  const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.82));
-  const dataUrl = await new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
-  toast('uploading ' + Math.round(blob.size / 1024) + ' KB…');
-  const ok = await request(OP.MEDIA_UPLOAD, { fileName: 'photo.jpg', data: dataUrl.slice(dataUrl.indexOf(',') + 1) });
-  return ok.mediaId;
+  bitmap.close();
+  return new Promise((r, j) => canvas.toBlob((b) => (b ? r(b) : j(new Error('could not read that photo'))), 'image/jpeg', 0.82));
+}
+
+const base64 = (blob) => new Promise((resolve, reject) => {
+  const fr = new FileReader();
+  fr.onload = () => resolve(String(fr.result).slice(String(fr.result).indexOf(',') + 1));
+  fr.onerror = () => reject(new Error('could not read the file'));
+  fr.readAsDataURL(blob);
+});
+
+/** Real upload progress: how much of the frame has left the WebSocket buffer. */
+async function withProgress(bar, status, run) {
+  const fill = bar.firstChild;
+  const before = S.ws ? S.ws.bufferedAmount : 0;
+  let total = 0;
+  const tick = setInterval(() => {
+    if (!S.ws) return;
+    const left = Math.max(0, S.ws.bufferedAmount - before);
+    total = Math.max(total, left);
+    const pct = total ? Math.round(100 * (1 - left / total)) : 100;
+    fill.style.width = pct + '%';
+    status.textContent = left ? 'uploading ' + pct + ' % · ' + (left / 1048576).toFixed(1) + ' MB to go' : 'checking on the server…';
+  }, 150);
+  try { return await run(); } finally { clearInterval(tick); fill.style.width = '100%'; }
 }
 
 // ---- notifications ----
@@ -696,7 +896,7 @@ function messageNode(c, m) {
     h('button', { onclick: () => send(OP.PIN, { clientMsgId: m.id, pinned: String(!m.pinned) }), title: m.pinned ? 'unpin' : 'pin for everyone' }, m.pinned ? 'unpin' : '📌'),
     h('button', { onclick: () => send(OP.STAR, { clientMsgId: m.id, starred: String(!m.starred) }), title: m.starred ? 'unstar' : 'star (only you see it)' }, m.starred ? '☆' : '★'),
     mine ? h('button', { onclick: () => editMsg(m) }, 'edit') : null,
-    mine ? h('button', { onclick: () => { if (confirm('Delete this message for everyone?')) send(OP.DELETE, { clientMsgId: m.id }); } }, 'del') : null,
+    mine ? h('button', { onclick: async () => { if (await confirmBox('DELETE MESSAGE', 'Delete this message for everyone in the chat?', 'DELETE', true)) send(OP.DELETE, { clientMsgId: m.id }); } }, 'del') : null,
     mine ? null : h('button', { onclick: () => report('message', m.id), title: 'report' }, '⚑')));
 }
 
@@ -763,6 +963,7 @@ async function openPulse() {
 function postsFrom(f) {
   return Array.from({ length: +f['post.n'] || 0 }, (_, i) => ({
     id: f['post.' + i], owner: f['owner.' + i], media: f['media.' + i], caption: f['caption.' + i],
+    kind: f['kind.' + i] || 'image', src: f['src.' + i] || '', thumb: f['thumb.' + i] || '',
     created: +f['created.' + i], likes: +f['likes.' + i], comments: +f['comments.' + i], liked: f['liked.' + i] === 'true',
   }));
 }
@@ -794,7 +995,7 @@ function postNode(p) {
   };
   return h('article', { class: 'post' },
     h('header', {}, h('button', { class: 'link', onclick: () => openProfile(p.owner) }, name(p.owner)), h('span', { class: 'dim' }, when(p.created))),
-    h('button', { class: 'picbtn', onclick: () => viewImage(p.media, p.caption), 'aria-label': 'Open image' }, img(p.media, false, p.caption)),
+    p.kind === 'video' ? mediaNode(p) : mediaNode(p, () => viewMedia(p, p.caption)),
     p.caption ? h('p', {}, p.caption) : null,
     h('div', { class: 'row gap tight' }, likeBtn, h('button', { onclick: showComments }, '💬 ' + p.comments),
       p.owner !== S.me ? h('button', { onclick: () => report('post', p.id), title: 'report' }, '⚑') : h('span')),
@@ -805,7 +1006,8 @@ async function loadStories() {
   try {
     const f = await request(OP.STORY_VIEW);
     S.stories = Array.from({ length: +f['story.n'] || 0 }, (_, i) => ({
-      owner: f['owner.' + i], media: f['media.' + i], caption: f['caption.' + i], created: +f['created.' + i] }));
+      owner: f['owner.' + i], media: f['media.' + i], caption: f['caption.' + i], created: +f['created.' + i],
+      kind: f['kind.' + i] || 'image', src: f['src.' + i] || '', thumb: f['thumb.' + i] || '' }));
     const owners = [...new Set(S.stories.map((s) => s.owner))];
     await ensureNames(owners);
     $('stories').replaceChildren(...(owners.length ? owners.map((o) => h('li', { tabIndex: 0, onclick: () => playStories(o),
@@ -820,22 +1022,39 @@ function playStories(owner) {
   let i = 0;
   const next = () => {
     if (i >= list.length || ($('overlay').hidden && i > 0)) { closeOverlay(); return; }
-    viewImage(list[i].media, name(owner) + (list[i].caption ? ' — ' + list[i].caption : ''));
+    const item = list[i];
     i++;
-    clearTimeout(playStories.timer); playStories.timer = setTimeout(next, 5000);
+    clearTimeout(playStories.timer);
+    viewMedia(item, name(owner) + (item.caption ? ' — ' + item.caption : ''), next);
+    if (item.kind !== 'video') playStories.timer = setTimeout(next, 5000); // a video story moves on when it ends
   };
   next();
 }
 
-function viewImage(mediaId, caption) {
-  $('overlayImg').removeAttribute('src');
-  mediaUrl(mediaId, true).then((u) => { $('overlayImg').src = u; }).catch(() => toast('image unavailable'));
+/** Full-size picture, or a video that plays (stories start on their own, muted, and call onEnded). */
+function viewMedia(item, caption, onEnded) {
+  const im = $('overlayImg'), vid = $('overlayVid');
+  im.removeAttribute('src'); vid.pause(); vid.removeAttribute('src'); vid.load();
+  im.hidden = item.kind === 'video'; vid.hidden = item.kind !== 'video';
+  if (item.kind === 'video') {
+    vid.poster = item.thumb || '';
+    vid.src = item.src;
+    vid.onended = onEnded || null;
+    vid.muted = !!onEnded; // autoplay needs muted; the controls unmute
+    vid.play().catch(() => {});
+  } else if (item.src) im.src = item.src;
+  else mediaUrl(item.media, true).then((u) => { im.src = u; }).catch(() => toast('image unavailable'));
   $('overlayCap').textContent = caption || '';
   $('overlay').hidden = false;
   $('overlayClose').focus();
 }
 
-function closeOverlay() { clearTimeout(playStories.timer); $('overlay').hidden = true; }
+function closeOverlay() {
+  clearTimeout(playStories.timer);
+  const vid = $('overlayVid');
+  vid.onended = null; vid.pause(); vid.removeAttribute('src'); vid.load();
+  $('overlay').hidden = true;
+}
 
 // ---- profiles and follow requests ----
 async function openProfile(userId) {
@@ -914,13 +1133,13 @@ async function approve(follower, yes) {
 
 async function editProfile() {
   const current = S.profiles.get(S.me) || {};
-  const displayName = prompt('Display name (1–40 characters)', current.displayName || S.me);
-  if (displayName == null) return;
-  const bio = prompt('Bio (up to 280 characters)', current.bio || '');
-  if (bio == null) return;
-  const privateAccount = confirm('Make your account private? (OK = private, Cancel = public)');
+  const v = await ask({ title: 'EDIT PROFILE', ok: 'SAVE', fields: [
+    { name: 'displayName', label: 'DISPLAY NAME', value: current.displayName || S.me, max: 40, required: true },
+    { name: 'bio', label: 'BIO', value: current.bio || '', max: 280, multiline: true, placeholder: 'a line or two about you' },
+    { name: 'privateAccount', label: 'Private account: people must ask to follow you', type: 'check', value: current.privateAccount === 'true' }] });
+  if (!v) return;
   try {
-    S.profiles.set(S.me, await request(OP.PROFILE_UPDATE, { userId: S.me, displayName: displayName.trim(), bio, privateAccount: String(privateAccount) }));
+    S.profiles.set(S.me, await request(OP.PROFILE_UPDATE, { userId: S.me, displayName: v.displayName, bio: v.bio, privateAccount: String(v.privateAccount) }));
     toast('profile saved'); renderMe(); openProfile(S.me);
   } catch (e) { toast('⚠ ' + e.message); }
 }
@@ -934,14 +1153,15 @@ async function follow(userId, on) {
 }
 
 async function block(userId) {
-  if (!confirm('Block ' + name(userId) + '? You will not see each other\'s messages or posts.')) return;
+  if (!await confirmBox('BLOCK ' + name(userId).toUpperCase(), 'You will not see each other\'s messages or posts, and any follow between you ends.', 'BLOCK', true)) return;
   try { await request(OP.BLOCK, { targetUserId: userId, blocked: 'true' }); toast('blocked'); } catch (e) { toast('⚠ ' + e.message); }
 }
 
 async function report(targetType, targetId) {
-  const reason = (prompt('Why are you reporting this? (sent to the moderators)') || '').trim();
-  if (!reason) return;
-  try { await request(OP.REPORT, { targetType, targetId, reason: reason.slice(0, 300) }); toast('report sent — thank you'); } catch (e) { toast('⚠ ' + e.message); }
+  const v = await ask({ title: 'REPORT', text: 'Only the moderators see this.', ok: 'SEND REPORT', danger: true,
+    fields: [{ name: 'reason', label: 'WHAT IS WRONG?', max: 300, multiline: true, required: true, placeholder: 'spam, harassment, something else…' }] });
+  if (!v) return;
+  try { await request(OP.REPORT, { targetType, targetId, reason: v.reason }); toast('report sent — thank you'); } catch (e) { toast('⚠ ' + e.message); }
 }
 
 function renderMe() {
@@ -987,9 +1207,10 @@ function startReply(m) {
   $('input').focus();
 }
 
-function editMsg(m) {
-  const body = prompt('Edit message', m.body);
-  if (!body || !body.trim() || body === m.body) return;
+async function editMsg(m) {
+  const v = await ask({ title: 'EDIT MESSAGE', ok: 'SAVE', fields: [{ name: 'body', label: 'MESSAGE', value: m.body, max: 4000, multiline: true, required: true }] });
+  const body = v && v.body;
+  if (!body || body === m.body) return;
   sealBody(m.conv, m.id, body).then((sealed) => send(OP.EDIT, { clientMsgId: m.id, newBody: sealed }))
     .catch((e) => toast('⚠ ' + e.message));
 }
@@ -1067,40 +1288,34 @@ $('chatTitle').onclick = () => {
   if (p) openProfile(p); else if (c && c.members) toast('members: ' + c.members.map(name).join(', '));
 };
 for (const b of document.querySelectorAll('.tabs button')) b.onclick = () => setTab(b.dataset.tab);
-$('newDm').onclick = () => {
-  const u = (prompt('Username to message') || '').trim().toLowerCase();
-  if (!u) return;
-  if (!/^[a-z0-9_]{3,20}$/.test(u)) { toast('usernames are 3–20 letters, digits or _'); return; }
-  if (u === S.me) { toast('that is you'); return; }
-  openChat('dm:' + [S.me, u].sort().join(':'));
+const USERNAME_RULE = (u) => (!/^[a-z0-9_]{3,20}$/.test(u) ? 'usernames are 3–20 letters, digits or _' : u === S.me ? 'that is you' : null);
+$('newDm').onclick = async () => {
+  const v = await ask({ title: 'NEW CHAT', ok: 'OPEN CHAT', fields: [{ name: 'user', label: 'USERNAME', max: 20, required: true, placeholder: 'e.g. alice' }],
+    validate: (x) => USERNAME_RULE(x.user.toLowerCase()) });
+  if (v) openChat('dm:' + [S.me, v.user.toLowerCase()].sort().join(':'));
 };
 $('newGroup').onclick = async () => {
-  const groupName = (prompt('Group name') || '').trim();
-  if (!groupName) return;
+  const v = await ask({ title: 'NEW GROUP', ok: 'CREATE', fields: [{ name: 'name', label: 'GROUP NAME', max: 60, required: true, placeholder: 'e.g. OOP study group' }] });
+  if (!v) return;
+  const groupName = v.name;
   try { const g = await request(OP.GROUP_CREATE, { name: groupName, desc: '', 'member.n': 0 }); openChat('grp:' + g.groupId); } catch (e) { toast('⚠ ' + e.message); }
 };
-$('addMember').onclick = () => {
-  const u = (prompt('Username to add') || '').trim().toLowerCase();
-  if (u && S.active) send(OP.GROUP_MEMBER, { groupId: S.active.slice(4), targetUser: u, action: 'ADD' });
+$('addMember').onclick = async () => {
+  const v = await ask({ title: 'ADD MEMBER', ok: 'ADD', fields: [{ name: 'user', label: 'USERNAME', max: 20, required: true }],
+    validate: (x) => USERNAME_RULE(x.user.toLowerCase()) });
+  if (v && S.active) send(OP.GROUP_MEMBER, { groupId: S.active.slice(4), targetUser: v.user.toLowerCase(), action: 'ADD' });
 };
-$('pollBtn').onclick = () => {
-  const question = (prompt('Poll question') || '').trim();
-  if (!question) return;
-  const options = (prompt('2–6 options, separated by commas') || '').split(',').map((o) => o.trim()).filter(Boolean);
-  if (options.length < 2 || options.length > 6) { toast('a poll needs 2–6 options'); return; }
+$('pollBtn').onclick = async () => {
+  const v = await ask({ title: 'NEW POLL', ok: 'START POLL', fields: [
+    { name: 'q', label: 'QUESTION', max: 200, required: true, placeholder: 'what should we ask?' },
+    ...[1, 2, 3, 4, 5, 6].map((n) => ({ name: 'o' + n, label: 'OPTION ' + n + (n > 2 ? ' (optional)' : ''), max: 80, required: n <= 2 }))] });
+  if (!v) return;
+  const question = v.q;
+  const options = [1, 2, 3, 4, 5, 6].map((n) => v['o' + n]).filter(Boolean);
   const fields = { groupId: S.active.slice(4), question, 'option.n': options.length };
   options.forEach((o, i) => { fields['option.' + i] = o; });
   send(OP.POLL_CREATE, fields);
 };
-async function share(kind) {
-  try {
-    const mediaId = await pickImage();
-    if (!mediaId) return;
-    const caption = (prompt(kind === 'post' ? 'Caption (optional)' : 'Story caption (optional)') || '').trim();
-    if (kind === 'post') { await request(OP.POST_CREATE, { mediaId, caption }); openPulse(); } else { await request(OP.STORY_CREATE, { mediaId, caption }); loadStories(); }
-    toast(kind + ' shared');
-  } catch (e) { toast('⚠ ' + e.message); }
-}
 $('newPost').onclick = () => share('post');
 $('newStory').onclick = () => share('story');
 $('overlayClose').onclick = closeOverlay;
