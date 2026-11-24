@@ -33,11 +33,21 @@ import javax.sound.sampled.TargetDataLine;
 public final class CallSession {
     public enum State { RINGING_OUT, RINGING_IN, CONNECTING, ACTIVE, ENDED }
 
-    private static final AudioFormat VOICE = new AudioFormat(8000f, 16, 1, true, false);
-    private static final int FRAME_SAMPLES = 160; // 20 ms at 8 kHz
+    /** Wideband voice: 16 kHz captures speech up to 8 kHz, twice what a phone line carries. */
+    private static final AudioFormat VOICE = new AudioFormat(16000f, 16, 1, true, false);
+    private static final int FRAME_SAMPLES = 320; // 20 ms at 16 kHz
     private static final int MAX_QUEUED_FRAMES = 8; // 160 ms per voice before old audio is dropped
     private static final byte AUDIO = 1;
     private static final byte MULAW = 2;
+    private static final byte ADPCM = 3;
+    private static final int[] IMA_STEP = {7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37,
+        41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337,
+        371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+        2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442,
+        11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767};
+    private static final int[] IMA_INDEX = {-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
+    /** The encoder's step index carries over between frames; each frame still decodes on its own. */
+    private final int[] adpcmIndex = new int[1];
     private static final byte PING = 3;
     private static final byte PONG = 4;
 
@@ -52,6 +62,7 @@ public final class CallSession {
         int sigRecv = -1;
         volatile byte[] senderKey;
         volatile String tag;
+        volatile boolean adpcm;
         volatile long lastCounter = -1;
         final ConcurrentLinkedDeque<short[]> voice = new ConcurrentLinkedDeque<>();
 
@@ -279,7 +290,7 @@ public final class CallSession {
         }
         try {
             sendSignal(peer, "relay", "{\"key\":" + MiniJson.quote(E2eCrypto.encode(senderKey)) + ",\"tag\":"
-                    + MiniJson.quote(E2eCrypto.encode(senderTag)) + ",\"opus\":false,\"video\":[]}");
+                    + MiniJson.quote(E2eCrypto.encode(senderTag)) + ",\"opus\":false,\"adpcm\":true,\"video\":[]}");
         } catch (GeneralSecurityException exception) {
             status = "could not secure the call";
         }
@@ -305,6 +316,7 @@ public final class CallSession {
                 }
                 peer.senderKey = E2eCrypto.decode(keyText);
                 peer.tag = tagText;
+                peer.adpcm = Boolean.TRUE.equals(MiniJson.path(message, "adpcm"));
                 peer.lastCounter = -1;
                 byTag.put(tagText, peer);
                 startAudio();
@@ -398,10 +410,15 @@ public final class CallSession {
                 pingMs = (int) (System.nanoTime() / 1_000_000) - time;
                 changed.run();
             }
-        } else if (plain[0] == AUDIO && plain[1] == MULAW) {
-            short[] pcm = new short[body.length];
-            for (int index = 0; index < body.length; index++) {
-                pcm[index] = mulawDecode(body[index]);
+        } else if (plain[0] == AUDIO && (plain[1] == MULAW || plain[1] == ADPCM)) {
+            short[] pcm;
+            if (plain[1] == ADPCM) {
+                pcm = adpcmDecode(body);
+            } else {
+                pcm = new short[body.length * 2]; // 8 kHz G.711 played at 16 kHz: each sample twice
+                for (int index = 0; index < body.length; index++) {
+                    pcm[2 * index] = pcm[2 * index + 1] = mulawDecode(body[index]);
+                }
             }
             peer.voice.addLast(pcm);
             while (peer.voice.size() > MAX_QUEUED_FRAMES) {
@@ -454,11 +471,19 @@ public final class CallSession {
             if (muted) {
                 continue;
             }
-            byte[] mulaw = new byte[FRAME_SAMPLES];
+            short[] pcm = new short[FRAME_SAMPLES];
             for (int index = 0; index < FRAME_SAMPLES; index++) {
-                mulaw[index] = mulawEncode((short) ((frame[2 * index] & 0xFF) | (frame[2 * index + 1] << 8)));
+                pcm[index] = (short) ((frame[2 * index] & 0xFF) | (frame[2 * index + 1] << 8));
             }
-            sendPacket(AUDIO, MULAW, mulaw, now);
+            if (peers.values().stream().filter(peer -> peer.senderKey != null).allMatch(peer -> peer.adpcm)) {
+                sendPacket(AUDIO, ADPCM, adpcmEncode(pcm, adpcmIndex), now); // wideband when everyone can play it
+            } else {
+                byte[] mulaw = new byte[FRAME_SAMPLES / 2];
+                for (int index = 0; index < mulaw.length; index++) {
+                    mulaw[index] = mulawEncode((short) ((pcm[2 * index] + pcm[2 * index + 1]) / 2));
+                }
+                sendPacket(AUDIO, MULAW, mulaw, now);
+            }
         }
     }
 
@@ -482,6 +507,81 @@ public final class CallSession {
             }
             speaker.write(out, 0, out.length);
         }
+    }
+
+    /**
+     * IMA ADPCM, byte for byte the same as the website's adpcmEncode: [first sample, 2 bytes LE]
+     * [step index] then one 4-bit code per further sample (low nibble first). 64 kbit/s at 16 kHz.
+     */
+    public static byte[] adpcmEncode(short[] samples, int[] state) {
+        byte[] out = new byte[3 + (samples.length) / 2];
+        int predicted = samples[0];
+        int index = state[0];
+        out[0] = (byte) predicted;
+        out[1] = (byte) (predicted >> 8);
+        out[2] = (byte) index;
+        for (int sample = 1; sample < samples.length; sample++) {
+            int diff = samples[sample] - predicted;
+            int code = 0;
+            int step = IMA_STEP[index];
+            int delta = step >> 3;
+            if (diff < 0) {
+                code = 8;
+                diff = -diff;
+            }
+            if (diff >= step) {
+                code |= 4;
+                diff -= step;
+                delta += step;
+            }
+            step >>= 1;
+            if (diff >= step) {
+                code |= 2;
+                diff -= step;
+                delta += step;
+            }
+            step >>= 1;
+            if (diff >= step) {
+                code |= 1;
+                delta += step;
+            }
+            predicted = Math.max(-32768, Math.min(32767, (code & 8) != 0 ? predicted - delta : predicted + delta));
+            index = Math.max(0, Math.min(88, index + IMA_INDEX[code]));
+            int at = 3 + ((sample - 1) >> 1);
+            out[at] = (byte) (out[at] | (((sample - 1) & 1) != 0 ? code << 4 : code));
+        }
+        state[0] = index;
+        return out;
+    }
+
+    /** Frames hold an even number of samples (320), so the last half-byte is padding. */
+    public static short[] adpcmDecode(byte[] bytes) {
+        if (bytes.length < 4) {
+            return new short[0];
+        }
+        short[] out = new short[(bytes.length - 3) * 2];
+        int predicted = (short) ((bytes[0] & 0xFF) | (bytes[1] << 8));
+        int index = Math.min(88, bytes[2] & 0xFF);
+        out[0] = (short) predicted;
+        for (int sample = 1; sample < out.length; sample++) {
+            int packed = bytes[3 + ((sample - 1) >> 1)] & 0xFF;
+            int code = (((sample - 1) & 1) != 0 ? packed >> 4 : packed) & 15;
+            int step = IMA_STEP[index];
+            int delta = step >> 3;
+            if ((code & 4) != 0) {
+                delta += step;
+            }
+            if ((code & 2) != 0) {
+                delta += step >> 1;
+            }
+            if ((code & 1) != 0) {
+                delta += step >> 2;
+            }
+            predicted = Math.max(-32768, Math.min(32767, (code & 8) != 0 ? predicted - delta : predicted + delta));
+            index = Math.max(0, Math.min(88, index + IMA_INDEX[code]));
+            out[sample] = (short) predicted;
+        }
+        return out;
     }
 
     /** G.711 mu-law, byte for byte the same as the website's mulawEncode. */

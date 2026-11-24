@@ -105,6 +105,7 @@ public final class EmberTestSuite {
         runTest("Web Push: SSRF guard, invisible status, encrypted payload, VAPID signature",
                 this::testWebPush);
         runTest("calls: ringing, answer, encrypted relay, busy, block, and origin check", this::testCalls);
+        runTest("wideband desktop voice: 64 kbit/s frames decode cleanly", this::testWidebandVoice);
         runTest("end-to-end chats: tamper, impostor and outsider refused; server sees only ciphertext", this::testEndToEndChat);
         runTest("theme palettes, wrapped message bodies, and EDT notifications",
                 this::testUiBasics);
@@ -1865,6 +1866,29 @@ public final class EmberTestSuite {
             if (bobApp != null) { bobApp.close(); }
             server.close();
         }
+    }
+
+    /** Wideband desktop voice: 20 ms frames are 163 bytes (64 kbit/s) and decode back close to the input. */
+    private void testWidebandVoice() {
+        int[] state = {0};
+        double signal = 0;
+        double noise = 0;
+        for (int frame = 0; frame < 5; frame++) {
+            short[] pcm = new short[320];
+            for (int index = 0; index < pcm.length; index++) {
+                double time = (frame * 320 + index) / 16000.0;
+                pcm[index] = (short) Math.round(0.6 * Math.sin(2 * Math.PI * 440 * time) * 32767);
+            }
+            byte[] encoded = edu.ember.client.CallSession.adpcmEncode(pcm, state);
+            assertEquals(163, encoded.length, "A 20 ms wideband frame changed size");
+            short[] decoded = edu.ember.client.CallSession.adpcmDecode(encoded);
+            assertEquals(320, decoded.length, "A frame did not decode to 320 samples");
+            for (int index = 0; index < pcm.length; index++) {
+                signal += (double) pcm[index] * pcm[index];
+                noise += Math.pow(decoded[index] - pcm[index], 2);
+            }
+        }
+        assertTrue(10 * Math.log10(signal / noise) > 18, "Wideband voice lost too much quality");
     }
 
     private void testUiBasics() throws Exception {
