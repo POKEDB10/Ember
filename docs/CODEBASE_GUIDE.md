@@ -39,7 +39,7 @@ ember/
 │   │   └── ui/          every window, panel and button of the desktop app
 │   └── tools/       demo and proof programs (attack simulator, stress test, demo data)
 ├── src/main/resources/web/   the website (index.html, app.js, call.js, app.css, sw.js...)
-├── src/test/java/            the automated tests (37 of them)
+├── src/test/java/            the automated tests (39 of them)
 ├── scripts/                  build/run/test scripts (.bat for Windows, .sh for Linux/Mac)
 ├── docs/                     report, diagrams, screenshots, this guide
 ├── Dockerfile, render.yaml   how Render builds and runs the server
@@ -150,31 +150,36 @@ Either way the call is **end-to-end encrypted**: our server cannot listen.
 4. **Safety codes.** For each other person you see a 12-digit code made from your two public keys. Matching codes on both screens mean nobody, not even the server, swapped the keys.
 5. **Everything after that is encrypted with the pair key**, including the network addresses (ICE candidates) for direct links. So the server never learns your IP address from a call.
 6. **Direct links** (WebRTC): DTLS-SRTP encryption (built into every browser). Their fingerprints travel inside the encrypted pair messages, so the server cannot fake them either.
-7. **Relay:** each person makes a random **sender key**, hands it to everyone over the encrypted pair channels, encodes their audio and video once (Opus or G.711 voice, VP8/H.264 video) and encrypts each packet once with it. The server copies each packet to everyone else **without reading it**, and stamps it with the sender's account so nobody in the call can pass audio off as someone else's. When someone leaves, everyone makes a new sender key, so the person who left cannot listen to the rest.
+7. **Relay:** each person makes a random **sender key**, hands it to everyone over the encrypted pair channels, encodes their audio and video once (Opus, wideband ADPCM or G.711 voice; VP8/H.264 video) and encrypts each packet once with it. The server copies each packet to everyone else **without reading it**, and stamps it with the sender's account so nobody in the call can pass audio off as someone else's. When someone leaves, everyone makes a new sender key, so the person who left cannot listen to the rest.
 
 ### The desktop app
-Java has no WebRTC, so the desktop app (`CallSession.java`, window `CallDialog.java`) always uses the relay. It speaks the same protocol as `call.js`: pair keys, sender keys, the same safety codes. It sends G.711 mu-law voice (8 kHz, 64 kbit/s) because Java has no Opus encoder; the browsers notice and use G.711 for that call too. Voice only (Java has no built-in camera access). It mixes everyone's voice into one speaker. Use headphones: there is no echo cancellation on the desktop.
+Java has no WebRTC, so the desktop app (`CallSession.java`, window `CallDialog.java`) always uses the relay. It speaks the same protocol as `call.js`: pair keys, sender keys, the same safety codes. Java has no Opus encoder, so it sends **wideband voice**: 16 kHz IMA ADPCM, 64 kbit/s, twice the audio range of a phone line. The browsers notice (the desktop says so in its encrypted relay message) and use the same codec for that call; the encoder is byte for byte identical in `call.js` and `CallSession.java`. Each 20 ms frame decodes on its own. G.711 (8 kHz) remains as a last fallback. Voice only (Java has no built-in camera access). It mixes everyone's voice into one speaker. Use headphones: there is no echo cancellation on the desktop.
 
-### Low data use
-| | Direct | Relay |
+### Quality, adapted to the connection
+Calls aim for the best quality the connection can carry, and back off at once when it cannot.
+
+| | Direct (peer-to-peer) | Relay |
 |---|---|---|
-| Voice | ~20 kbit/s (Opus, mono, silence suppression) | ~25–35 kbit/s (G.711 with a desktop: ~80) |
-| Voice + video (320×240, 15 fps) | ~170 kbit/s | ~195–215 kbit/s |
-| Muted microphone | ~0 | 0 |
+| Voice | Opus fullband 48 kHz, up to 40 kbit/s, loss recovery (FEC) | Opus 32 kbit/s (no FEC: the relay runs on TCP, which never loses packets, so those bits go to the voice) |
+| Voice with a desktop app | — | Wideband ADPCM, 64 kbit/s |
+| Video | Up to 1280×720, 30 fps. Cap per link: 2.5 Mbit/s one-to-one, 1.2 Mbit/s for 3 people, 0.8 Mbit/s for 4. The browser's own congestion control lowers it as needed. | A quality ladder: 180p/15 fps (150 kbit/s), 270p/20 (300), 360p/25 (600), 540p/30 (1100), 720p/30 (1800). |
+| Silence / muted | almost nothing (DTX) | almost nothing / 0 |
 
-In relay mode each person uploads **once**, however many people are in the call. A one-hour voice call is roughly 10–15 MB. Memory: no libraries; video frames are freed right after use; everything (camera, microphone, codecs, timers) is released when the call ends.
+**The relay ladder** (`adaptVideo` in `call.js`): a call starts at 360p. Every 2 seconds it checks whether any frame had to be skipped because the connection was backed up. If so, it steps down a rung at once; after 6 seconds without trouble it steps up one. Bigger calls have a lower ceiling (720p one-to-one, 540p for 3, 360p for 4–5, 270p above), because everyone downloads everyone else, and it never goes above what the camera delivers. Measured on one machine: 360p → 540p → 720p within 12 s (~1.9 Mbit/s); with the line held backed up it dropped from 720p to 180p within 6 s while the voice kept flowing.
+
+**Efficiency:** each person encodes once and, in relay mode, uploads once however many people are in the call. Key frames come every 4 s (and when someone needs one), voice is flagged as high priority and video as low, and no library is loaded. Video frames are freed right after use, and everything (camera, microphone, codecs, timers) is released when the call ends.
 
 ### Keeping the delay low
 - Direct whenever the network allows it.
 - Audio is sent in 20 ms pieces; the player holds only 40–160 ms per person and drops older audio rather than falling behind (`call-worklet.js`, and the same rule in `CallSession`).
-- When the line is congested, video frames are skipped *before* encoding (audio always wins).
+- When the line is congested, video frames are skipped *before* encoding, so the stream stays decodable and voice always goes first; the ladder then lowers the quality.
 - The server sends frames immediately (`TCP_NODELAY`) and does not compress call packets (encrypted data does not compress).
 - `render.yaml` puts the server in Render's Singapore region, the closest to the UAE.
 
 ### Safety rules the server enforces for calls (`CallRegistry.java`)
 - One call per person at a time. A busy person just doesn't answer: callers are never told "busy".
 - Only devices that joined can signal or send media; an outsider gets "call not found". Signals go to one named participant only.
-- Per-device limits on signalling messages and relayed media (~1 Mbit/s); packets over 64 KB are dropped; at most 8 people.
+- Per-device limits on signalling messages and relayed media (~2.5 Mbit/s, enough for 720p); packets over 256 KB are dropped; at most 8 people.
 - A person leaves when their device disconnects; a one-to-one call, or a group call down to one person, ends.
 
 ### Packet protection
@@ -310,19 +315,20 @@ The server only serves these exact files (an allowlist), so `../../secret` style
 
 ```
 scripts\build.bat                       compile everything into build\classes
-scripts\run-tests.bat                   run the 37 automated tests
+scripts\run-tests.bat                   run the 39 automated tests
 scripts\run-demo.bat                    server + 3 desktop clients with demo data (alice / alice-demo-42)
 scripts\run-server.bat --no-tls --http-port 8080 --storage data   website at http://localhost:8080
 ```
 
-Calls need two browsers (or two different addresses, such as `localhost` and `127.0.0.1`), each signed in as a different user. Browsers only allow the camera and microphone on `https://` or `localhost`.
+Calls need two browsers (or two different addresses, such as `localhost`, `127.0.0.1` and `name.localhost`, which each keep their own login), each signed in as a different user. Browsers only allow the camera and microphone on `https://` or `localhost`. The desktop app can join from its 📞 Call button.
 
 ## 15. Questions you may be asked in the demo
 
 - **Why a custom protocol?** It is small and fast, has hard size limits, and avoids Java deserialization attacks.
 - **What happens if the server crashes mid-write?** The WAL checksum detects the half record and trims it. Everything before it is intact.
 - **How do two devices stay in sync?** Every change has a revision number; a device asks "changes since N".
-- **How are calls secure if they go through your server?** The key is made by the two browsers (ECDH); the server only forwards encrypted bytes and cannot derive the key. The safety code proves nobody swapped keys.
+- **How are chats and calls secure if they go through your server?** The keys are made on the devices (ECDH); the server only stores and forwards encrypted bytes and cannot derive any key. Device codes and call safety codes prove nobody swapped keys.
+- **How is call quality so good on a weak connection?** It adapts: direct links use the browser's congestion control, and the relay climbs or drops a 180p–720p ladder every 2 seconds, always putting voice first.
 - **Why is the call fast?** It goes direct (peer-to-peer) when possible. The relay sends small 20 ms audio pieces, keeps the playback buffer short, and drops late audio instead of queueing it.
 - **Why does it work where VoIP is blocked?** The fallback uses the same HTTPS connection as the website itself, on port 443.
-- **What would you add next?** End-to-end encrypted chats, group calls, and a TURN server for direct calls through strict firewalls.
+- **What would you add next?** A TURN server for direct calls through strict firewalls, video in the desktop app, and encrypted message history for new devices.
