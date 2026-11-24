@@ -226,7 +226,12 @@ async function decryptFrame(f) {
 function inbound(msg) {
   delete msg.f.e2e; // never trust an "encrypted" marker from the wire: only a local decryption sets it
   const needs = msg.f.body && msg.f.body.startsWith(E2E.PREFIX);
-  if (!needs && msg.f.body && msg.f.convId && wasEncrypted(msg.f.convId)) {
+  // An update changes a message we already have: judge it by that message's own chat, and drop
+  // updates that claim another chat (the server must not move text between chats).
+  const known = msg.op === OP.UPDATE && msg.f.clientMsgId ? findMsg(msg.f.clientMsgId) : null;
+  if (known && msg.f.convId && msg.f.convId !== known.conv) return;
+  const chat = known ? known.conv : msg.f.convId;
+  if (!needs && msg.f.body && chat && (wasEncrypted(chat) || (known && known.e2e === 'true'))) {
     msg.f.body = '⚠ unencrypted message in an encrypted chat (not verified): ' + msg.f.body;
   }
   if (msg.op === OP.KEYS_CHANGED) { e2e.keys.clear(); return; }

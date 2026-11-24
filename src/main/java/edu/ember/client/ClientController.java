@@ -555,10 +555,20 @@ public final class ClientController implements AutoCloseable {
 
     private void handleFrameNow(WireFrame frame) {
         Map<String, String> fields = new HashMap<>(KvPayloadCodec.decode(frame.payload()));
+        // An update changes a message we already have: judge it by that message's own chat, and drop
+        // updates that claim another chat (the server must not move text between chats).
+        String chat = fields.get("convId");
+        if (frame.opcode() == WireOpcodes.EVT_MSG_UPDATE && fields.containsKey("clientMsgId")) {
+            String stored = storedConversation(fields.get("clientMsgId"));
+            if (stored != null && chat != null && !stored.equals(chat)) {
+                return;
+            }
+            chat = stored != null ? stored : chat;
+        }
         if (fields.getOrDefault("body", "").startsWith(E2eCrypto.PREFIX)) {
             openSealed(fields);
-        } else if (fields.containsKey("body") && fields.containsKey("convId") && model.userId() != null
-                && wasEncrypted(fields.get("convId"))) {
+        } else if (fields.containsKey("body") && chat != null && model.userId() != null
+                && wasEncrypted(chat)) {
             // Plain text in a chat that has been encrypted: shown, but clearly flagged as not verified.
             fields.put("body", "⚠ unencrypted message in an encrypted chat (not verified): " + fields.get("body"));
         }
@@ -1018,6 +1028,16 @@ public final class ClientController implements AutoCloseable {
         }
         var group = parts.length == 2 ? model.groupDetails(parts[1]) : null;
         return group == null ? null : new java.util.ArrayList<>(group.members().keySet());
+    }
+
+    /** The chat a message we already hold belongs to, or null. */
+    private String storedConversation(String clientMsgId) {
+        for (String conversationId : model.conversationIds()) {
+            if (model.messages(conversationId).stream().anyMatch(m -> m.clientMsgId().equals(clientMsgId))) {
+                return conversationId;
+            }
+        }
+        return null;
     }
 
     /** The other people in a chat: the partner of a direct chat, or the group's known members. */
