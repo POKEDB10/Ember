@@ -559,11 +559,17 @@ public final class ClientController implements AutoCloseable {
         // updates that claim another chat (the server must not move text between chats).
         String chat = fields.get("convId");
         if (frame.opcode() == WireOpcodes.EVT_MSG_UPDATE && fields.containsKey("clientMsgId")) {
-            String stored = storedConversation(fields.get("clientMsgId"));
-            if (stored != null && chat != null && !stored.equals(chat)) {
-                return;
+            Message stored = storedMessage(fields.get("clientMsgId"));
+            if (stored != null) {
+                String sender = fields.get("senderUserId");
+                if ((chat != null && !stored.conversationId().equals(chat))
+                        || (sender != null && !stored.senderUserId().equals(sender))) {
+                    return; // an update may not move a message to another chat or another sender
+                }
+                chat = stored.conversationId();
+                fields.put("convId", chat);
+                fields.put("senderUserId", stored.senderUserId()); // decrypt as the stored message only
             }
-            chat = stored != null ? stored : chat;
         }
         if (fields.getOrDefault("body", "").startsWith(E2eCrypto.PREFIX)) {
             openSealed(fields);
@@ -1030,11 +1036,13 @@ public final class ClientController implements AutoCloseable {
         return group == null ? null : new java.util.ArrayList<>(group.members().keySet());
     }
 
-    /** The chat a message we already hold belongs to, or null. */
-    private String storedConversation(String clientMsgId) {
+    /** A message we already hold, or null. */
+    private Message storedMessage(String clientMsgId) {
         for (String conversationId : model.conversationIds()) {
-            if (model.messages(conversationId).stream().anyMatch(m -> m.clientMsgId().equals(clientMsgId))) {
-                return conversationId;
+            for (Message message : model.messages(conversationId)) {
+                if (message.clientMsgId().equals(clientMsgId)) {
+                    return message;
+                }
             }
         }
         return null;

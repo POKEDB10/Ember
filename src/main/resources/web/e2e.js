@@ -229,7 +229,8 @@ function inbound(msg) {
   // An update changes a message we already have: judge it by that message's own chat, and drop
   // updates that claim another chat (the server must not move text between chats).
   const known = msg.op === OP.UPDATE && msg.f.clientMsgId ? findMsg(msg.f.clientMsgId) : null;
-  if (known && msg.f.convId && msg.f.convId !== known.conv) return;
+  if (known && ((msg.f.convId && msg.f.convId !== known.conv) || (msg.f.senderUserId && msg.f.senderUserId !== known.from))) return;
+  if (known) { msg.f.convId = known.conv; msg.f.senderUserId = known.from; } // decrypt as the stored message only
   const chat = known ? known.conv : msg.f.convId;
   if (!needs && msg.f.body && chat && (wasEncrypted(chat) || (known && known.e2e === 'true'))) {
     msg.f.body = '⚠ unencrypted message in an encrypted chat (not verified): ' + msg.f.body;
