@@ -23,7 +23,7 @@ Due: report and code link on LMS by **Mon 30 Nov 2026**. Demo: **4–7 Dec**. Ti
 
 ## Already done (checked 24 Nov 2026)
 
-- [x] Report with calls and end-to-end chapters, call sequence/state/CRC figures, measured results table, 36 pages, Times New Roman 12/14, 1.15 spacing, contents page filled.
-- [x] Honesty pass: test and file counts recounted (46 Java + 9 Node tests, 122 Java files); the old "40 MB idle" claim replaced by a measurement (about 64 MB, laptop, not Render); an unverifiable photo-size claim removed.
+- [x] Report with calls and end-to-end chapters, call sequence/state/CRC figures, measured results table, accounts and queue-guard sections, 38 pages, Times New Roman 12/14, 1.15 spacing, contents page filled.
+- [x] Honesty pass: test and file counts recounted (53 Java + 11 Node tests, 127 Java files); the old "40 MB idle" claim replaced by a measurement (about 64 MB, laptop, not Render); an unverifiable photo-size claim removed.
 - [x] `docs/results.md`, `docs/decisions.md` (26 decisions), `docs/ladder.md`, `docs/DEMO.md`, `docs/VIVA_NOTES.md`, README quick start.
 - [x] Secrets stay out of git: `config/secrets.properties`, keystores, `Start cmd.txt` and local data folders are ignored.

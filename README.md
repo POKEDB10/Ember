@@ -11,14 +11,14 @@ The current build provides a website (installable as an app) and a Swing desktop
 Nothing but a JDK: no Maven, no Gradle, no libraries.
 
 - JDK 17 or newer (21 recommended; the code compiles with `--release 17`).
-- Optional: Node.js, only to run the website's 9 JavaScript tests (built-in `node --test`, no packages). Without Node, the test script says "skipped".
+- Optional: Node.js, only to run the website's 11 JavaScript tests (built-in `node --test`, no packages). Without Node, the test script says "skipped".
 - Windows scripts are provided in `.bat` form; matching `.sh` scripts are also included.
 
 ## Quick start
 
 ```text
 scripts\build.bat                 compile everything into build\classes
-scripts\run-tests.bat             46 Java tests, then the 9 JavaScript tests
+scripts\run-tests.bat             53 Java tests, then the 11 JavaScript tests
 scripts\run-demo.bat              TLS server with demo data + three desktop windows
 ```
 

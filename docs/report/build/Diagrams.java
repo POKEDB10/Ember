@@ -165,7 +165,7 @@ public class Diagrams {
         g.draw(new RoundRectangle2D.Double(230, 40, 680, 640, 18, 18));
         center("Ember system", NAME, 570, 62);
         String[][] cases = {
-            {"auth", "Register / log in on any device"}, {"msg", "Send and read messages (DM, group)"},
+            {"auth", "Register / log in, reset by email code"}, {"msg", "Send and read messages (DM, group)"},
             {"react", "Reply, react, edit, pin, star"}, {"group", "Create groups and polls"},
             {"pulse", "Publish posts and stories"}, {"social", "Follow, approve requests, block, report"},
             {"status", "Set status (online / away / DND / invisible)"}, {"notify", "Get notifications, quick reply"},
