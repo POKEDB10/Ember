@@ -25,8 +25,8 @@ public final class CallRegistry<D> {
     private static final double SIGNALS_PER_SEC = 20;
     /** More people than this would make every phone upload too many streams. */
     public static final int MAX_PARTICIPANTS = 8;
-    /** Relayed media per device: ~1 Mbit/s sustained, a 2 s burst for key frames. */
-    private static final double MEDIA_BYTES_PER_SEC = 128_000;
+    /** Relayed media per device: ~2.5 Mbit/s sustained (720p video plus voice), a 3 s burst for key frames. */
+    private static final double MEDIA_BYTES_PER_SEC = 320_000;
 
     public enum State { RINGING, ACTIVE }
 
@@ -196,7 +196,7 @@ public final class CallRegistry<D> {
     /** Byte-rate limit on relayed media, per sending device; false means drop this packet. */
     public boolean allowMedia(Call<D> call, D device, int bytes) {
         return call.media.computeIfAbsent(device,
-                ignored -> new TokenBucket(MEDIA_BYTES_PER_SEC * 2, MEDIA_BYTES_PER_SEC)).tryConsume(bytes);
+                ignored -> new TokenBucket(MEDIA_BYTES_PER_SEC * 3, MEDIA_BYTES_PER_SEC)).tryConsume(bytes);
     }
 
     private void remove(Call<D> call) {

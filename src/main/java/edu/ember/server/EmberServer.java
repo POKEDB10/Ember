@@ -912,7 +912,8 @@ public final class EmberServer implements AutoCloseable {
             byte[] packet = frame.payload();
             var others = callRegistry.others(call, this);
             // Dropped silently: answering every bad packet would itself be a flood.
-            if (others.isEmpty() || packet.length > 65_536 || !callRegistry.allowMedia(call, this, packet.length)) {
+            // 256 KB fits a 720p key frame.
+            if (others.isEmpty() || packet.length > 262_144 || !callRegistry.allowMedia(call, this, packet.length)) {
                 return;
             }
             // Stamped with the sender's account, so nobody in the call can pass audio off as someone else's.

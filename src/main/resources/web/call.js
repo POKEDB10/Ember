@@ -14,11 +14,23 @@
 //      encrypts each packet once with their own sender key (shared with the others over the
 //      encrypted pair channels) and sends it inside the normal HTTPS WebSocket; the server copies it
 //      to everyone else without being able to read it. When someone leaves, the keys change.
-// Low data use: mono Opus at 16-20 kbit/s with silence suppression, video at 320x240, 15 fps.
+// Quality: fullband Opus voice (48 kHz) and up to 720p / 30 fps video, adapting to the connection:
+// direct links use the browser's congestion control; the relay climbs a quality ladder while the
+// connection keeps up and steps down at once when it does not. Silence costs almost nothing (DTX).
 
-const CALL = { AUDIO_BPS: 16000, VIDEO_BPS: 150000, W: 320, H: 240, FPS: 15, DIRECT_WAIT_MS: 6000, KEY_EVERY: 45, MAX_DIRECT: 4 };
+const CALL = { AUDIO_BPS: 32000, W: 1280, H: 720, FPS: 30, DIRECT_WAIT_MS: 6000, KEY_SECONDS: 4, MAX_DIRECT: 4 };
+/** Direct video bitrate cap per link, by how many people are in the call (each link uploads separately). */
+const DIRECT_VIDEO_BPS = (people) => (people <= 2 ? 2500000 : people === 3 ? 1200000 : 800000);
+/** Relay video quality ladder. */
+const LADDER = [
+  { w: 320, h: 180, fps: 15, bps: 150000 },
+  { w: 480, h: 270, fps: 20, bps: 300000 },
+  { w: 640, h: 360, fps: 25, bps: 600000 },
+  { w: 960, h: 540, fps: 30, bps: 1100000 },
+  { w: 1280, h: 720, fps: 30, bps: 1800000 },
+];
 const PKT = { AUDIO: 1, VIDEO: 2, PING: 3, PONG: 4 };
-const AC = { OPUS: 1, MULAW: 2 };
+const AC = { OPUS: 1, MULAW: 2, ADPCM: 3 };
 const VC = { VP8: 1, AVC: 2 };
 const VCODEC = { [VC.VP8]: 'vp8', [VC.AVC]: 'avc1.42001f' };
 let call = null;
@@ -186,6 +198,7 @@ function dropPeer(c, p) { closePeer(p); c.peers.delete(p.user); renderPeople(); 
 
 function renderPeople() {
   if (!call) return;
+  for (const p of call.peers.values()) if (p.pc && p.pc.connectionState === 'connected') capBitrates(call, p.pc);
   const n = call.peers.size + 1;
   $('callStage').classList.toggle('many', n > 2);
   $('callCode').replaceChildren(...[...call.peers.values()].filter((p) => p.code).map((p) =>
@@ -280,7 +293,7 @@ function newPeerConnection(c, p) {
     if (call !== c || p.pc !== pc) return;
     if (pc.connectionState === 'connected') {
       if (c.mode !== 'relay') c.mode = 'direct';
-      connected(c); capBitrates(pc);
+      connected(c); capBitrates(c, pc);
     } else if (pc.connectionState === 'failed') {
       goRelay(c);
     } else if (pc.connectionState === 'disconnected') {
@@ -305,24 +318,26 @@ async function onSdp(c, p, desc) {
   for (const cand of p.iceQueue.splice(0)) if (p.pc) await p.pc.addIceCandidate(cand).catch(() => {});
 }
 
-/** Opus tuned for speech: mono, silence suppression (DTX), loss recovery (FEC), capped bitrate. */
+/** Opus for voice: fullband mono, silence suppression (DTX), loss recovery (FEC) for UDP, 40 kbit/s ceiling. */
 function thinOpus(sdp) {
   const m = sdp.match(/a=rtpmap:(\d+) opus\/48000/i);
   if (!m) return sdp;
-  const extra = 'usedtx=1;useinbandfec=1;stereo=0;sprop-stereo=0;maxaveragebitrate=' + (CALL.AUDIO_BPS + 4000);
+  const extra = 'usedtx=1;useinbandfec=1;stereo=0;sprop-stereo=0;maxplaybackrate=48000;maxaveragebitrate=' + (CALL.AUDIO_BPS + 8000);
   const re = new RegExp('a=fmtp:' + m[1] + ' ([^\\r\\n]*)');
   return re.test(sdp) ? sdp.replace(re, (_, x) => 'a=fmtp:' + m[1] + ' ' + x.split(';').filter((y) => !/^(usedtx|useinbandfec|stereo|sprop-stereo|maxaveragebitrate)=/.test(y)).concat(extra).join(';'))
     : sdp.replace(m[0], m[0] + '\r\na=fmtp:' + m[1] + ' ' + extra);
 }
 
-function capBitrates(pc) {
+/** Caps each link: voice first (high priority), video shared out by call size; the browser adapts below that. */
+function capBitrates(c, pc) {
   for (const sender of pc.getSenders()) {
     if (!sender.track) continue;
     const params = sender.getParameters();
     if (!params.encodings || !params.encodings.length) params.encodings = [{}];
     const video = sender.track.kind === 'video';
-    params.encodings[0].maxBitrate = video ? CALL.VIDEO_BPS : CALL.AUDIO_BPS + 4000;
-    if (video) params.encodings[0].maxFramerate = CALL.FPS;
+    params.encodings[0].maxBitrate = video ? DIRECT_VIDEO_BPS(c.peers.size + 1) : CALL.AUDIO_BPS + 16000;
+    params.encodings[0].priority = params.encodings[0].networkPriority = video ? 'low' : 'high';
+    if (video) { params.encodings[0].maxFramerate = CALL.FPS; params.degradationPreference = 'balanced'; }
     sender.setParameters(params).catch(() => {});
   }
 }
@@ -346,7 +361,7 @@ function sendRelayInfo(c, p) {
   const r = c.relay;
   if (!r || call !== c) return;
   p.sentRelay = true;
-  sendSignal(c, p, 'relay', { key: b64(r.sendKeyRaw), tag: b64(r.sendTag), opus: r.opusOk, video: r.decodable }).catch(() => {});
+  sendSignal(c, p, 'relay', { key: b64(r.sendKeyRaw), tag: b64(r.sendTag), opus: r.opusOk, adpcm: true, video: r.decodable }).catch(() => {});
 }
 
 async function onRelaySignal(c, p, msg) {
@@ -357,7 +372,7 @@ async function onRelaySignal(c, p, msg) {
   if (!p.sentRelay) sendRelayInfo(c, p);
   if (p.relay && p.relay.tag) c.byTag.delete(p.relay.tag);
   const key = await crypto.subtle.importKey('raw', unb64(msg.key), 'AES-GCM', false, ['decrypt']);
-  p.relay = { ...(p.relay || {}), key, tag: msg.tag, lastCtr: -1, opus: !!msg.opus, video: msg.video || [], lastKfAsk: 0, chain: Promise.resolve() };
+  p.relay = { ...(p.relay || {}), key, tag: msg.tag, lastCtr: -1, opus: !!msg.opus, adpcm: !!msg.adpcm, video: msg.video || [], lastKfAsk: 0, chain: Promise.resolve() };
   c.byTag.set(msg.tag, p);
   chooseCodecs(c);
   connected(c);
@@ -399,8 +414,9 @@ async function rotateSenderKey(c) {
   for (const p of c.peers.values()) if (p.key) sendRelayInfo(c, p);
 }
 
+/** The relay runs over TCP, which never loses packets, so loss-recovery (FEC) bits go to the voice itself. */
 function opusConfig(rate) {
-  return { codec: 'opus', sampleRate: rate, numberOfChannels: 1, bitrate: CALL.AUDIO_BPS, opus: { frameDuration: 20000, usedtx: true, useinbandfec: true } };
+  return { codec: 'opus', sampleRate: rate, numberOfChannels: 1, bitrate: CALL.AUDIO_BPS, opus: { frameDuration: 20000, usedtx: true } };
 }
 
 /** One encoding for everyone: codecs every listener can decode (re-chosen when people change). */
@@ -408,7 +424,9 @@ function chooseCodecs(c) {
   const r = c.relay;
   const listeners = [...c.peers.values()].filter((p) => p.relay && p.relay.key);
   if (!listeners.length) return;
-  const audio = r.opusOk && listeners.every((p) => p.relay.opus) ? AC.OPUS : AC.MULAW;
+  // Opus when everyone has it; else wideband ADPCM (the desktop app); else narrowband G.711.
+  const audio = r.opusOk && listeners.every((p) => p.relay.opus) ? AC.OPUS
+    : listeners.every((p) => p.relay.adpcm) ? AC.ADPCM : AC.MULAW;
   if (audio !== r.audioCodec) {
     if (r.aenc) { try { r.aenc.close(); } catch { /* closed */ } r.aenc = null; }
     r.audioCodec = audio; r.ats = 0;
@@ -426,10 +444,13 @@ function chooseCodecs(c) {
 
 function sendAudio(c, pcm) {
   const r = c.relay;
-  if (call !== c || !r || !r.audioCodec || !c.micOn || !S.ws || S.ws.bufferedAmount > 256000) return; // muted or backed up
+  if (call !== c || !r || !r.audioCodec || !c.micOn || !S.ws || S.ws.bufferedAmount > 512000) return; // muted or badly backed up
   if (r.audioCodec === AC.OPUS && r.aenc) {
     r.aenc.encode(new AudioData({ format: 'f32-planar', sampleRate: r.rate, numberOfFrames: pcm.length, numberOfChannels: 1, timestamp: r.ats, data: pcm }));
     r.ats += Math.round((pcm.length / r.rate) * 1e6);
+  } else if (r.audioCodec === AC.ADPCM) {
+    const wide = resample(pcm, r.rate, 16000);
+    sendPacket(c, PKT.AUDIO, AC.ADPCM, adpcmEncode(wide, r.adpcm || (r.adpcm = { index: 0 })));
   } else if (r.audioCodec === AC.MULAW) {
     const low = resample(pcm, r.rate, 8000), bytes = new Uint8Array(low.length);
     for (let i = 0; i < low.length; i++) bytes[i] = mulawEncode(low[i]);
@@ -440,27 +461,69 @@ function sendAudio(c, pcm) {
 async function startVideoEncoder(c, codec) {
   const r = c.relay;
   if (r.venc) { try { r.venc.close(); } catch { /* closed */ } r.venc = null; }
-  clearInterval(r.videoTimer);
+  clearInterval(r.videoTimer); clearInterval(r.adaptTimer);
+  r.vcodecId = codec;
   if (!codec) return;
-  const config = { codec: VCODEC[codec], width: CALL.W, height: CALL.H, bitrate: CALL.VIDEO_BPS, framerate: CALL.FPS, latencyMode: 'realtime' };
-  if (codec === VC.AVC) config.avc = { format: 'annexb' };
-  if (!(await VideoEncoder.isConfigSupported(config).then((x) => x.supported, () => false))) { toast('video cannot be relayed on this browser; voice only'); return; }
-  const venc = r.venc = new VideoEncoder({ output: (chunk) => sendPacket(c, PKT.VIDEO, codec | (chunk.type === 'key' ? 0x80 : 0), chunk), error: () => {} });
-  venc.configure(config);
-  r.forceKey = true;
-  const canvas = h('canvas', { width: CALL.W, height: CALL.H }), g = canvas.getContext('2d');
-  const local = $('callLocal');
-  r.videoTimer = setInterval(() => {
-    if (call !== c || r.venc !== venc || !c.camOn || local.readyState < 2) return;
-    if (venc.encodeQueueSize > 1 || !S.ws || S.ws.bufferedAmount > 48000) { r.forceKey = true; return; } // congested: skip a frame
-    g.drawImage(local, 0, 0, CALL.W, CALL.H);
-    const vf = new VideoFrame(canvas, { timestamp: performance.now() * 1000 });
-    const keyFrame = r.forceKey || r.frames++ % CALL.KEY_EVERY === 0;
-    r.forceKey = false;
-    venc.encode(vf, { keyFrame });
-    vf.close();
-  }, Math.round(1000 / CALL.FPS));
-  c.timers.push(r.videoTimer);
+  r.rung = Math.min(2, maxRung(c)); // start at 360p, then climb
+  if (!(await configureVideo(c))) { toast('video cannot be relayed on this browser; voice only'); return; }
+  r.adaptTimer = setInterval(() => adaptVideo(c), 2000);
+  c.timers.push(r.adaptTimer);
+}
+
+/** The best rung this call can use: fewer people and a sharper camera allow more. */
+function maxRung(c) {
+  const people = c.peers.size + 1, camera = $('callLocal').videoHeight || CALL.H;
+  let top = people <= 2 ? 4 : people === 3 ? 3 : people <= 5 ? 2 : 1;
+  while (top > 0 && LADDER[top].h > camera) top--;
+  return top;
+}
+
+/** (Re)configures the encoder for the current rung; returns false when no rung is supported. */
+async function configureVideo(c) {
+  const r = c.relay;
+  for (; r.rung >= 0; r.rung--) {
+    const q = LADDER[r.rung];
+    const config = { codec: VCODEC[r.vcodecId], width: q.w, height: q.h, bitrate: q.bps, framerate: q.fps, latencyMode: 'realtime' };
+    if (r.vcodecId === VC.AVC) config.avc = { format: 'annexb' };
+    if (!(await VideoEncoder.isConfigSupported(config).then((x) => x.supported, () => false))) continue;
+    if (call !== c || !c.relay) return false;
+    if (!r.venc || r.venc.state === 'closed') {
+      const codec = r.vcodecId;
+      r.venc = new VideoEncoder({ output: (chunk) => sendPacket(c, PKT.VIDEO, codec | (chunk.type === 'key' ? 0x80 : 0), chunk), error: () => {} });
+    }
+    r.venc.configure(config);
+    r.forceKey = true; r.skipped = 0; r.calm = 0; r.frames = 0;
+    r.canvas = h('canvas', { width: q.w, height: q.h });
+    r.g = r.canvas.getContext('2d', { alpha: false });
+    clearInterval(r.videoTimer);
+    const local = $('callLocal'), venc = r.venc;
+    r.videoTimer = setInterval(() => {
+      if (call !== c || r.venc !== venc || venc.state !== 'configured' || !c.camOn || local.readyState < 2) return;
+      // Congested: skip this frame before encoding (the stream stays decodable, voice goes first).
+      if (venc.encodeQueueSize > 1 || !S.ws || S.ws.bufferedAmount > q.bps / 32) { r.skipped++; return; }
+      r.g.drawImage(local, 0, 0, q.w, q.h);
+      const vf = new VideoFrame(r.canvas, { timestamp: performance.now() * 1000 });
+      const keyFrame = r.forceKey || r.frames++ % (q.fps * CALL.KEY_SECONDS) === 0;
+      r.forceKey = false;
+      venc.encode(vf, { keyFrame });
+      vf.close();
+    }, Math.round(1000 / q.fps));
+    c.timers.push(r.videoTimer);
+    return true;
+  }
+  r.rung = 0;
+  return false;
+}
+
+/** Every 2 s: step down at once when frames had to be skipped, step up after 6 s without trouble. */
+function adaptVideo(c) {
+  const r = c.relay;
+  if (call !== c || !r || !r.venc) return;
+  const top = maxRung(c), was = r.rung;
+  if ((r.skipped > 1 && r.rung > 0) || r.rung > top) r.rung--;
+  else if (r.skipped === 0 && ++r.calm >= 3 && r.rung < top) r.rung++;
+  r.skipped = 0;
+  if (r.rung !== was) configureVideo(c);
 }
 
 /**
@@ -520,6 +583,9 @@ function onPacket(c, p, data) {
         pr.adec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
       }
       pr.adec.decode(new EncodedAudioChunk({ type: 'key', timestamp: time * 1000, data: body }));
+    } else if (flags === AC.ADPCM) {
+      const out = resample(adpcmDecode(body), 16000, r.rate);
+      pr.play.port.postMessage(out, [out.buffer]);
     } else if (flags === AC.MULAW) {
       const pcm = new Float32Array(body.length);
       for (let i = 0; i < body.length; i++) pcm[i] = mulawDecode(body[i]);
@@ -595,14 +661,63 @@ function mulawDecode(b) {
   return (b & 0x80 ? -s : s) / 32768;
 }
 
+/**
+ * IMA ADPCM at 16 kHz: wideband voice (twice G.711's audio range) at the same 64 kbit/s, for calls
+ * with the desktop app, which has no Opus. Each 20 ms frame stands alone: [first sample, 2 bytes]
+ * [step index] then one 4-bit code per further sample. Byte for byte the same as CallSession.java.
+ */
+const IMA_STEP = [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767];
+const IMA_INDEX = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+
+function adpcmEncode(samples, state) {
+  const n = samples.length, out = new Uint8Array(3 + Math.ceil((n - 1) / 2));
+  const s16 = (x) => Math.max(-32768, Math.min(32767, Math.round(x * 32767)));
+  let pred = s16(samples[0]), index = state.index;
+  out[0] = pred & 0xff; out[1] = (pred >> 8) & 0xff; out[2] = index;
+  for (let i = 1; i < n; i++) {
+    let diff = s16(samples[i]) - pred, code = 0, step = IMA_STEP[index], delta = step >> 3;
+    if (diff < 0) { code = 8; diff = -diff; }
+    if (diff >= step) { code |= 4; diff -= step; delta += step; }
+    step >>= 1;
+    if (diff >= step) { code |= 2; diff -= step; delta += step; }
+    step >>= 1;
+    if (diff >= step) { code |= 1; delta += step; }
+    pred = Math.max(-32768, Math.min(32767, code & 8 ? pred - delta : pred + delta));
+    index = Math.max(0, Math.min(88, index + IMA_INDEX[code]));
+    out[3 + ((i - 1) >> 1)] |= (i - 1) & 1 ? code << 4 : code;
+  }
+  state.index = index;
+  return out;
+}
+
+function adpcmDecode(bytes) {
+  if (bytes.length < 4) return new Float32Array(0);
+  const n = (bytes.length - 3) * 2, out = new Float32Array(n); // frames hold an even number of samples; the last half-byte is padding
+  let pred = (bytes[0] | (bytes[1] << 8)) << 16 >> 16, index = Math.min(88, bytes[2]);
+  out[0] = pred / 32768;
+  for (let i = 1; i < n; i++) {
+    const code = ((i - 1) & 1 ? bytes[3 + ((i - 1) >> 1)] >> 4 : bytes[3 + ((i - 1) >> 1)]) & 15;
+    const step = IMA_STEP[index];
+    let delta = step >> 3;
+    if (code & 4) delta += step;
+    if (code & 2) delta += step >> 1;
+    if (code & 1) delta += step >> 2;
+    pred = Math.max(-32768, Math.min(32767, code & 8 ? pred - delta : pred + delta));
+    index = Math.max(0, Math.min(88, index + IMA_INDEX[code]));
+    out[i] = pred / 32768;
+  }
+  return out;
+}
+
 // ---- screen ----
 async function getMedia(video) {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('calls need HTTPS and a modern browser');
   try {
     call.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 48000 },
       video: video ? { width: { ideal: CALL.W }, height: { ideal: CALL.H }, frameRate: { ideal: CALL.FPS, max: CALL.FPS }, facingMode: 'user' } : false,
     });
+    call.stream.getAudioTracks().forEach((t) => { t.contentHint = 'speech'; });
   } catch (e) {
     throw new Error(e.name === 'NotAllowedError' ? 'allow the microphone' + (video ? ' and camera' : '') + ' to call' : 'no microphone found');
   }
