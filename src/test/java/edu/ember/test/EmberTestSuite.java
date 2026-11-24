@@ -111,6 +111,7 @@ public final class EmberTestSuite {
         runTest("calls v2: jitter buffer order, concealment, steady delay, stall recovery", this::testJitterBuffer);
         runTest("calls v2: settings persist, microphone unplug falls back, devices released", this::testCallSettingsAndDevices);
         runTest("calls v2: feature flag reported in AUTH_OK, off by default", this::testCallsV2Flag);
+        runTest("calls v2: hand-off is single-use, short-lived, same person only, first commit wins", this::testCallHandoff);
         runTest("end-to-end chats: tamper, impostor and outsider refused; server sees only ciphertext", this::testEndToEndChat);
         runTest("theme palettes, wrapped message bodies, and EDT notifications",
                 this::testUiBasics);
@@ -1638,6 +1639,16 @@ public final class EmberTestSuite {
         return KvPayloadCodec.decode(wsRead(client.in(), opcode).payload());
     }
 
+    /** Reads call events until one of this kind (other devices of the same person also hear rings and ends). */
+    private static Map<String, String> wsCallKind(WsClient client, String kind) throws Exception {
+        while (true) {
+            Map<String, String> fields = wsFields(client, WireOpcodes.EVT_CALL);
+            if (kind.equals(fields.get("kind"))) {
+                return fields;
+            }
+        }
+    }
+
     /** What the server relays: [sender length][sender][the packet unchanged]. */
     private static byte[] stamp(String sender, byte[] packet) {
         byte[] name = sender.getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -2226,6 +2237,100 @@ public final class EmberTestSuite {
                             KvPayloadCodec.decode(wsRead(in, WireOpcodes.EVT_AUTH_OK).payload()).get("callsV2"),
                             "AUTH_OK did not report the calls v2 flag");
                 }
+            }
+        } finally {
+            server.close();
+        }
+    }
+
+    /** Calls v2 hand-off: only the same person, only once, only before expiry; the first commit wins. */
+    private void testCallHandoff() throws Exception {
+        Path config = Path.of("config");
+        char[] password = readStorePassword(config.resolve("secrets.properties"));
+        Path trust = config.resolve("ember-client-trust.p12");
+        EmberServer server = new EmberServer(config.resolve("ember-server.p12"), password, 0);
+        try {
+            server.start();
+            server.setCallsV2(true);
+            int port = server.port();
+            try (WsClient alice = wsOpen(trust, password, port, null);
+                    WsClient desk = wsOpen(trust, password, port, null);
+                    WsClient tabA = wsOpen(trust, password, port, null);
+                    WsClient tabB = wsOpen(trust, password, port, null);
+                    WsClient carol = wsOpen(trust, password, port, null)) {
+                wsSend(alice.out(), FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                        Map.of("user", "alice", "pass", "alice-pass-42", "displayName", "Alice", "calls", "1")));
+                wsRead(alice.in(), WireOpcodes.EVT_AUTH_OK);
+                wsSend(desk.out(), FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                        Map.of("user", "bob", "pass", "bob-pass-42", "displayName", "Bob", "calls", "1")));
+                wsRead(desk.in(), WireOpcodes.EVT_AUTH_OK);
+                for (WsClient tab : List.of(tabA, tabB)) {
+                    wsSend(tab.out(), FrameFactory.command(WireOpcodes.CMD_AUTH_LOGIN, 1,
+                            Map.of("user", "bob", "pass", "bob-pass-42")));
+                    wsRead(tab.in(), WireOpcodes.EVT_AUTH_OK);
+                }
+                wsSend(carol.out(), FrameFactory.command(WireOpcodes.CMD_AUTH_REGISTER, 1,
+                        Map.of("user", "carol", "pass", "carol-pass-42", "displayName", "Carol", "calls", "1")));
+                wsRead(carol.in(), WireOpcodes.EVT_AUTH_OK);
+
+                callCommand(alice, 2, Map.of("kind", "ring", "convId", "dm:alice:bob"));
+                String callId = wsFields(alice, WireOpcodes.EVT_CALL).get("callId");
+                callCommand(tabA, 3, Map.of("kind", "handoff-prepare", "callId", callId));
+                assertEquals("404", wsFields(tabA, WireOpcodes.EVT_ERROR).get("code"),
+                        "A hand-off before the call was answered must be refused");
+                callCommand(desk, 2, Map.of("kind", "accept", "callId", callId));
+                wsFields(desk, WireOpcodes.EVT_CALL); // roster
+                assertEquals("joined", wsFields(alice, WireOpcodes.EVT_CALL).get("kind"), "Desktop did not join");
+
+                callCommand(carol, 2, Map.of("kind", "handoff-prepare", "callId", callId));
+                assertEquals("404", wsFields(carol, WireOpcodes.EVT_ERROR).get("code"), "Someone else could take over Bob's call");
+                callCommand(desk, 3, Map.of("kind", "handoff-prepare", "callId", callId));
+                assertEquals("404", wsFields(desk, WireOpcodes.EVT_ERROR).get("code"), "A device cannot hand off to itself");
+
+                callCommand(tabA, 4, Map.of("kind", "handoff-prepare", "callId", callId));
+                Map<String, String> readyA = wsCallKind(tabA, "handoff-ready");
+                assertEquals("handoff-ready", readyA.get("kind"), "Bob's web tab could not prepare the hand-off");
+                assertEquals("dm:alice:bob", readyA.get("convId"), "Hand-off did not say which chat");
+                callCommand(tabB, 4, Map.of("kind", "handoff-prepare", "callId", callId));
+                String tokenB = wsCallKind(tabB, "handoff-ready").get("token");
+                callCommand(tabB, 5, Map.of("kind", "handoff-commit", "callId", callId, "token", readyA.get("token")));
+                assertEquals("404", wsFields(tabB, WireOpcodes.EVT_ERROR).get("code"), "A ticket worked on another device");
+
+                callCommand(tabA, 5, Map.of("kind", "handoff-commit", "callId", callId, "token", readyA.get("token")));
+                Map<String, String> roster = wsCallKind(tabA, "roster");
+                assertEquals("roster", roster.get("kind"), "The new device did not get the roster");
+                assertEquals("alice", roster.get("user.0"), "The roster did not name Alice");
+                Map<String, String> released = wsCallKind(desk, "end");
+                assertEquals("elsewhere", released.get("reason"), "The desktop was not told to let go of the call");
+                Map<String, String> moved = wsFields(alice, WireOpcodes.EVT_CALL);
+                assertEquals("moved", moved.get("kind"), "Alice was not told to re-key with the new device");
+                assertEquals("bob", moved.get("userId"), "Alice was told the wrong person moved");
+
+                callCommand(tabB, 6, Map.of("kind", "handoff-commit", "callId", callId, "token", tokenB));
+                assertEquals("404", wsFields(tabB, WireOpcodes.EVT_ERROR).get("code"), "The second tab won a race already lost");
+                callCommand(tabA, 6, Map.of("kind", "handoff-commit", "callId", callId, "token", readyA.get("token")));
+                assertEquals("404", wsFields(tabA, WireOpcodes.EVT_ERROR).get("code"), "A ticket was used twice");
+
+                byte[] packet = new byte[64];
+                wsSend(tabA.out(), new WireFrame.Builder(WireOpcodes.CMD_CALL_MEDIA).payload(packet).build());
+                assertTrue(java.util.Arrays.equals(stamp("bob", packet), wsRead(alice.in(), WireOpcodes.EVT_CALL_MEDIA).payload()),
+                        "Media did not flow from the new device");
+
+                callCommand(desk, 4, Map.of("kind", "end", "callId", callId));
+                wsSend(tabA.out(), new WireFrame.Builder(WireOpcodes.CMD_CALL_MEDIA).payload(packet).build());
+                assertTrue(java.util.Arrays.equals(stamp("bob", packet), wsRead(alice.in(), WireOpcodes.EVT_CALL_MEDIA).payload()),
+                        "The old device could still hang up the moved call");
+
+                server.setCallsV2(false);
+                callCommand(tabB, 7, Map.of("kind", "handoff-prepare", "callId", callId));
+                assertEquals("400", wsFields(tabB, WireOpcodes.EVT_ERROR).get("code"), "Hand-off worked with calls v2 off");
+                server.setCallsV2(true);
+                server.setHandoffTtlMs(1);
+                callCommand(tabB, 8, Map.of("kind", "handoff-prepare", "callId", callId));
+                String stale = wsCallKind(tabB, "handoff-ready").get("token");
+                Thread.sleep(20);
+                callCommand(tabB, 9, Map.of("kind", "handoff-commit", "callId", callId, "token", stale));
+                assertEquals("404", wsFields(tabB, WireOpcodes.EVT_ERROR).get("code"), "An expired ticket was accepted");
             }
         } finally {
             server.close();

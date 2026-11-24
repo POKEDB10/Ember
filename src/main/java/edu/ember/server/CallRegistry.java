@@ -187,6 +187,65 @@ public final class CallRegistry<D> {
                 ignored -> new TokenBucket(SIGNAL_BURST, SIGNALS_PER_SEC)).tryConsume();
     }
 
+    /** A single-use, short-lived permission for one device to take over a person's place in a call. */
+    private record Ticket<D>(String callId, String userId, D from, D to, long expiresMs) { }
+
+    private final Map<String, Ticket<D>> tickets = new ConcurrentHashMap<>();
+
+    /** What a successful hand-off did: the call and the device that lost its place. */
+    public record Handoff<D>(Call<D> call, D oldDevice) { }
+
+    /**
+     * Phase 1 of a hand-off (calls v2): the person is in this answered call on another device;
+     * returns a ticket for {@code newDevice}, or null when that is not the case.
+     */
+    public synchronized String prepareHandoff(String callId, String userId, D newDevice, long nowMs, long ttlMs) {
+        tickets.values().removeIf(ticket -> ticket.expiresMs() < nowMs);
+        Call<D> call = calls.get(callId);
+        if (call == null || call.state != State.ACTIVE || call.group) {
+            return null;
+        }
+        D current = call.deviceOf(userId);
+        if (current == null || current.equals(newDevice)) {
+            return null;
+        }
+        byte[] bytes = new byte[18];
+        random.nextBytes(bytes);
+        String token = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        tickets.put(token, new Ticket<>(callId, userId, current, newDevice, nowMs + ttlMs));
+        return token;
+    }
+
+    /**
+     * Phase 2: swaps the device in one step. The ticket is used up by its own device either way; it fails when it
+     * expired, belongs to another device, or the person's place already moved (the first commit wins).
+     */
+    public synchronized Handoff<D> commitHandoff(String token, String callId, D newDevice, long nowMs) {
+        Ticket<D> ticket = tickets.get(token);
+        if (ticket == null || !ticket.to().equals(newDevice) || !ticket.callId().equals(callId)) {
+            return null; // another device can neither use nor cancel someone's ticket
+        }
+        tickets.remove(token);
+        if (ticket.expiresMs() < nowMs) {
+            return null;
+        }
+        Call<D> call = calls.get(ticket.callId());
+        if (call == null || call.state != State.ACTIVE) {
+            return null;
+        }
+        synchronized (call) {
+            if (!ticket.from().equals(call.participants.get(ticket.userId()))) {
+                return null;
+            }
+            call.participants.put(ticket.userId(), newDevice);
+        }
+        callOfDevice.remove(ticket.from(), call);
+        callOfDevice.put(newDevice, call);
+        call.media.remove(ticket.from());
+        call.signals.remove(ticket.from());
+        return new Handoff<>(call, ticket.from());
+    }
+
     /** The call a person is in or being rung for, or null. */
     public Call<D> callOfUser(String userId) {
         String id = callOfUser.get(userId);

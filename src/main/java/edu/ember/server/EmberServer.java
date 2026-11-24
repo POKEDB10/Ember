@@ -26,6 +26,10 @@ public final class EmberServer implements AutoCloseable {
     private volatile int maxFrameBytes = 25 * 1024 * 1024;
     /** Off by default: only a server that sits behind a known proxy may believe X-Forwarded-For. */
     private volatile boolean trustForwardedFor;
+    /** Hand-off tickets live this long (tests shorten it). */
+    private volatile long handoffTtlMs = 30_000;
+    private final java.util.concurrent.ConcurrentMap<String, TokenBucket> handoffBuckets =
+            new java.util.concurrent.ConcurrentHashMap<>();
     /** Calls v2 feature flag (server half): --calls-v2 or EMBER_CALLS_V2=1. Off = legacy calls only. */
     private volatile boolean callsV2 = "1".equals(System.getenv("EMBER_CALLS_V2"));
     /** Chosen status per user: away, dnd or invisible (online when absent). Kept while the
@@ -278,6 +282,11 @@ public final class EmberServer implements AutoCloseable {
     /** Call only when the plain-HTTP listener is reachable solely through your own proxy. */
     public void setCallsV2(boolean enabled) {
         callsV2 = enabled;
+    }
+
+    /** For tests: how long a hand-off ticket stays valid. */
+    public void setHandoffTtlMs(long ttlMs) {
+        handoffTtlMs = ttlMs;
     }
 
     public void setTrustForwardedFor(boolean trust) {
@@ -804,6 +813,8 @@ public final class EmberServer implements AutoCloseable {
                         leaveCall(call, call.caller, "declined");
                     }
                 }
+                case "handoff-prepare" -> prepareHandoff(frame.correlationId(), call);
+                case "handoff-commit" -> commitHandoff(frame.correlationId(), call, fields.required("token"));
                 case "sdp", "ice", "key", "relay" -> {
                     // Signals go to one named participant; they are end-to-end encrypted except "key".
                     var peer = call.deviceOf(fields.required("to"));
@@ -815,6 +826,58 @@ public final class EmberServer implements AutoCloseable {
                     sendToDevice(peer, callEvent(call, kind, java.util.Map.of("data", data, "from", userId)));
                 }
                 default -> throw new edu.ember.common.exceptions.ValidationException("Unknown call action");
+            }
+        }
+
+        /**
+         * Hand-off phase 1 (calls v2): this device belongs to someone already in the answered call
+         * on another device. Returns a single-use ticket; nothing changes for the call yet.
+         */
+        private void prepareHandoff(long correlationId, CallRegistry.Call<ConnectionHandler> call) throws IOException,
+                edu.ember.common.exceptions.EmberException {
+            if (!callsV2) {
+                throw new edu.ember.common.exceptions.ValidationException("Hand-off is not enabled");
+            }
+            if (!handoffBuckets.computeIfAbsent(userId, ignored -> new TokenBucket(5, 1 / 10.0)).tryConsume()) {
+                auditLogger.log("rate_limited", userId, "handoff");
+                throw new edu.ember.common.exceptions.RateLimitedException("Too many hand-offs, wait a moment");
+            }
+            String token = callRegistry.prepareHandoff(call.id, userId, this, System.currentTimeMillis(), handoffTtlMs);
+            if (token == null) {
+                throw new edu.ember.common.exceptions.ResourceNotFoundException("The call is not connected on another device");
+            }
+            auditLogger.log("call_handoff_prepared", userId, "call");
+            send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_CALL, correlationId,
+                    java.util.Map.of("kind", "handoff-ready", "callId", call.id, "token", token,
+                            "convId", call.conversationId, "video", Boolean.toString(call.video))));
+        }
+
+        /** Hand-off phase 2: swaps this device in; the old device stops, the others re-key with this one. */
+        private void commitHandoff(long correlationId, CallRegistry.Call<ConnectionHandler> call, String token)
+                throws IOException, edu.ember.common.exceptions.EmberException {
+            var handoff = callRegistry.commitHandoff(token, call.id, this, System.currentTimeMillis());
+            if (handoff == null) {
+                throw new edu.ember.common.exceptions.ResourceNotFoundException("The hand-off expired or happened elsewhere");
+            }
+            auditLogger.log("call_handoff_committed", userId, "call");
+            java.util.Map<String, String> roster = new java.util.HashMap<>();
+            int index = 0;
+            for (String person : call.participants().keySet()) {
+                if (!person.equals(userId)) {
+                    roster.put("user." + index++, person);
+                }
+            }
+            roster.put("n", Integer.toString(index));
+            roster.put("kind", "roster");
+            roster.put("callId", call.id);
+            send(edu.ember.common.protocol.FrameFactory.event(edu.ember.common.protocol.WireOpcodes.EVT_CALL,
+                    correlationId, roster));
+            sendToDevice(handoff.oldDevice(), callEvent(call, "end", java.util.Map.of("reason", "elsewhere")));
+            var moved = callEvent(call, "moved", java.util.Map.of("userId", userId));
+            for (var entry : call.participants().entrySet()) {
+                if (!entry.getKey().equals(userId)) {
+                    sendToDevice(entry.getValue(), moved);
+                }
             }
         }
 
