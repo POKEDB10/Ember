@@ -9,3 +9,10 @@ dir /s /b src\test\java\*.java > build\test-sources.txt
 javac --release 17 -encoding UTF-8 -Xlint:all,-serial -Werror -cp build\classes -d build\test-classes @build\test-sources.txt
 if errorlevel 1 exit /b %errorlevel%
 java -cp build\classes;build\test-classes edu.ember.test.EmberTestSuite
+if errorlevel 1 exit /b %errorlevel%
+where node >nul 2>nul
+if errorlevel 1 (
+  echo Web tests skipped: node is not installed.
+  exit /b 0
+)
+node --test src\test\web\quality.test.js

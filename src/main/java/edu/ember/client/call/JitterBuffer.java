@@ -22,6 +22,8 @@ public final class JitterBuffer {
     /** Concealment fades over three frames: 70%, 49%, 34%, then silence. */
     private static final double FADE = 0.7;
     private static final int MAX_CONCEALED = 3;
+    /** Hard cap (500 ms): a flood of frames can never grow memory; the oldest goes first. */
+    static final int MAX_FRAMES = 25;
 
     private final Clock clock;
     private final int frameSamples;
@@ -61,6 +63,10 @@ public final class JitterBuffer {
             lastArrivalSequence = sequence;
         }
         frames.put(sequence, new AudioFrame(sequence, samples, now));
+        while (frames.size() > MAX_FRAMES) {
+            frames.pollFirstEntry();
+            trimDropped++;
+        }
     }
 
     /** The delay the buffer aims for, from measured jitter. */

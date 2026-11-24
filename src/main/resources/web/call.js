@@ -21,21 +21,13 @@
 const CALL = { AUDIO_BPS: 32000, W: 1280, H: 720, FPS: 30, DIRECT_WAIT_MS: 6000, KEY_SECONDS: 4, MAX_DIRECT: 4 };
 /** Direct video bitrate cap per link, by how many people are in the call (each link uploads separately). */
 const DIRECT_VIDEO_BPS = (people) => (people <= 2 ? 2500000 : people === 3 ? 1200000 : 800000);
-/** Relay video quality ladder. */
-const LADDER = [
-  { w: 320, h: 180, fps: 15, bps: 150000 },
-  { w: 480, h: 270, fps: 20, bps: 300000 },
-  { w: 640, h: 360, fps: 25, bps: 600000 },
-  { w: 960, h: 540, fps: 30, bps: 1100000 },
-  { w: 1280, h: 720, fps: 30, bps: 1800000 },
-];
 const PKT = { AUDIO: 1, VIDEO: 2, PING: 3, PONG: 4 };
-const AC = { OPUS: 1, MULAW: 2, ADPCM: 3 };
 const VC = { VP8: 1, AVC: 2 };
 const VCODEC = { [VC.VP8]: 'vp8', [VC.AVC]: 'avc1.42001f' };
 let call = null;
 
-const callPrefs = { hideIp: store.get('ember.hideIp') === '1' };
+/** Per-device call settings: Hide my IP, quality mode (Auto / Max / Data saver), and the calls v2 switch. */
+const callPrefs = { hideIp: store.get('ember.hideIp') === '1', mode: store.get('ember.quality') || 'auto', v2: store.get('ember.callsV2') !== '0' };
 const u32 = (n) => n >>> 0;
 const nowMs = () => u32(Math.round(performance.now()));
 const b64 = (bytes) => b64url(bytes);
@@ -59,8 +51,10 @@ async function startCall(video) {
 }
 
 function newCall(fields) {
-  return { id: '', state: 'ringing', mode: '', stream: null, peers: new Map(), byTag: new Map(), timers: [],
+  const c = { id: '', state: 'ringing', mode: '', stream: null, peers: new Map(), byTag: new Map(), timers: [],
     micOn: true, camOn: fields.video, relay: null, startedAt: 0, ...fields };
+  c.v2 = !!(S.callsV2 && callPrefs.v2 && !c.group); // calls v2: server and this device both on; 1:1 only
+  return c;
 }
 
 async function onRing(f) {
@@ -276,7 +270,7 @@ function pairReady(c, p) {
 async function startDirect(c, p) {
   const pc = newPeerConnection(c, p);
   const offer = await pc.createOffer();
-  await pc.setLocalDescription({ type: offer.type, sdp: thinOpus(offer.sdp) });
+  await pc.setLocalDescription({ type: offer.type, sdp: thinOpus(offer.sdp, opusBps(c)) });
   await sendSignal(c, p, 'sdp', { type: offer.type, sdp: pc.localDescription.sdp });
 }
 
@@ -310,7 +304,7 @@ async function onSdp(c, p, desc) {
     const pc = p.pc || newPeerConnection(c, p);
     await pc.setRemoteDescription(desc);
     const answer = await pc.createAnswer();
-    await pc.setLocalDescription({ type: answer.type, sdp: thinOpus(answer.sdp) });
+    await pc.setLocalDescription({ type: answer.type, sdp: thinOpus(answer.sdp, opusBps(c)) });
     await sendSignal(c, p, 'sdp', { type: answer.type, sdp: pc.localDescription.sdp });
   } else if (p.pc) {
     await p.pc.setRemoteDescription(desc);
@@ -319,10 +313,10 @@ async function onSdp(c, p, desc) {
 }
 
 /** Opus for voice: fullband mono, silence suppression (DTX), loss recovery (FEC) for UDP, 40 kbit/s ceiling. */
-function thinOpus(sdp) {
+function thinOpus(sdp, bps) {
   const m = sdp.match(/a=rtpmap:(\d+) opus\/48000/i);
   if (!m) return sdp;
-  const extra = 'usedtx=1;useinbandfec=1;stereo=0;sprop-stereo=0;maxplaybackrate=48000;maxaveragebitrate=' + (CALL.AUDIO_BPS + 8000);
+  const extra = 'usedtx=1;useinbandfec=1;stereo=0;sprop-stereo=0;maxplaybackrate=48000;maxaveragebitrate=' + bps;
   const re = new RegExp('a=fmtp:' + m[1] + ' ([^\\r\\n]*)');
   return re.test(sdp) ? sdp.replace(re, (_, x) => 'a=fmtp:' + m[1] + ' ' + x.split(';').filter((y) => !/^(usedtx|useinbandfec|stereo|sprop-stereo|maxaveragebitrate)=/.test(y)).concat(extra).join(';'))
     : sdp.replace(m[0], m[0] + '\r\na=fmtp:' + m[1] + ' ' + extra);
@@ -335,7 +329,7 @@ function capBitrates(c, pc) {
     const params = sender.getParameters();
     if (!params.encodings || !params.encodings.length) params.encodings = [{}];
     const video = sender.track.kind === 'video';
-    params.encodings[0].maxBitrate = video ? DIRECT_VIDEO_BPS(c.peers.size + 1) : CALL.AUDIO_BPS + 16000;
+    params.encodings[0].maxBitrate = video ? DIRECT_VIDEO_BPS(c.peers.size + 1) : opusBps(c) + (c.v2 ? 0 : 8000);
     params.encodings[0].priority = params.encodings[0].networkPriority = video ? 'low' : 'high';
     if (video) { params.encodings[0].maxFramerate = CALL.FPS; params.degradationPreference = 'balanced'; }
     sender.setParameters(params).catch(() => {});
@@ -361,7 +355,9 @@ function sendRelayInfo(c, p) {
   const r = c.relay;
   if (!r || call !== c) return;
   p.sentRelay = true;
-  sendSignal(c, p, 'relay', { key: b64(r.sendKeyRaw), tag: b64(r.sendTag), opus: r.opusOk, adpcm: true, video: r.decodable }).catch(() => {});
+  const info = { key: b64(r.sendKeyRaw), tag: b64(r.sendTag), opus: r.opusOk, adpcm: true, video: r.decodable };
+  if (c.v2) { info.v = 2; info.codecs = (r.opusOk ? [AC.OPUS] : []).concat([AC.ADPCM32, AC.ADPCM, AC.MULAW]); }
+  sendSignal(c, p, 'relay', info).catch(() => {});
 }
 
 async function onRelaySignal(c, p, msg) {
@@ -372,7 +368,7 @@ async function onRelaySignal(c, p, msg) {
   if (!p.sentRelay) sendRelayInfo(c, p);
   if (p.relay && p.relay.tag) c.byTag.delete(p.relay.tag);
   const key = await crypto.subtle.importKey('raw', unb64(msg.key), 'AES-GCM', false, ['decrypt']);
-  p.relay = { ...(p.relay || {}), key, tag: msg.tag, lastCtr: -1, opus: !!msg.opus, adpcm: !!msg.adpcm, video: msg.video || [], lastKfAsk: 0, chain: Promise.resolve() };
+  p.relay = { ...(p.relay || {}), key, tag: msg.tag, lastCtr: -1, opus: !!msg.opus, adpcm: !!msg.adpcm, decodes: peerDecodes(msg), video: msg.video || [], lastKfAsk: 0, chain: Promise.resolve() };
   c.byTag.set(msg.tag, p);
   chooseCodecs(c);
   connected(c);
@@ -415,8 +411,21 @@ async function rotateSenderKey(c) {
 }
 
 /** The relay runs over TCP, which never loses packets, so loss-recovery (FEC) bits go to the voice itself. */
-function opusConfig(rate) {
-  return { codec: 'opus', sampleRate: rate, numberOfChannels: 1, bitrate: CALL.AUDIO_BPS, opus: { frameDuration: 20000, usedtx: true } };
+function opusConfig(rate, bps = CALL.AUDIO_BPS) {
+  return { codec: 'opus', sampleRate: rate, numberOfChannels: 1, bitrate: bps, opus: { frameDuration: 20000, usedtx: true } };
+}
+
+/** Opus bitrate for this call: the quality mode's (calls v2) or the classic 32 kbit/s. */
+function opusBps(c) {
+  return c && c.v2 ? qualityFor(callPrefs.mode).opus : CALL.AUDIO_BPS + 8000;
+}
+
+/** Calls v2: a mode change mid-call re-applies the voice bitrate at once (video limits follow in P2 code). */
+function applyMode(c) {
+  if (!c || !c.v2) return;
+  const r = c.relay;
+  if (r && r.aenc && r.audioCodec === AC.OPUS) r.aenc.configure(opusConfig(r.rate, qualityFor(callPrefs.mode).opus));
+  for (const p of c.peers.values()) if (p.pc && p.pc.connectionState === 'connected') capBitrates(c, p.pc);
 }
 
 /** One encoding for everyone: codecs every listener can decode (re-chosen when people change). */
@@ -424,15 +433,18 @@ function chooseCodecs(c) {
   const r = c.relay;
   const listeners = [...c.peers.values()].filter((p) => p.relay && p.relay.key);
   if (!listeners.length) return;
-  // Opus when everyone has it; else wideband ADPCM (the desktop app); else narrowband G.711.
-  const audio = r.opusOk && listeners.every((p) => p.relay.opus) ? AC.OPUS
-    : listeners.every((p) => p.relay.adpcm) ? AC.ADPCM : AC.MULAW;
-  if (audio !== r.audioCodec) {
+  // Calls v2: chosen once at connect from what the other side announced. Classic: Opus when
+  // everyone has it; else wideband ADPCM (the desktop app); else narrowband G.711 (re-chosen as people change).
+  const audio = c.v2 ? (r.audioCodec || pickVoiceCodec(callPrefs.mode, r.opusOk, listeners[0].relay.decodes))
+    : r.opusOk && listeners.every((p) => p.relay.opus) ? AC.OPUS
+      : listeners.every((p) => p.relay.adpcm) ? AC.ADPCM : AC.MULAW;
+  if (!audio) toast('⚠ no shared voice codec with this device');
+  if (audio && audio !== r.audioCodec) {
     if (r.aenc) { try { r.aenc.close(); } catch { /* closed */ } r.aenc = null; }
     r.audioCodec = audio; r.ats = 0;
     if (audio === AC.OPUS) {
       r.aenc = new AudioEncoder({ output: (chunk) => sendPacket(c, PKT.AUDIO, AC.OPUS, chunk), error: () => {} });
-      r.aenc.configure(opusConfig(r.rate));
+      r.aenc.configure(opusConfig(r.rate, c.v2 ? qualityFor(callPrefs.mode).opus : CALL.AUDIO_BPS));
     }
   }
   const video = c.video && window.VideoEncoder ? [VC.VP8, VC.AVC].find((id) => listeners.every((p) => p.relay.video.includes(id))) : 0;
@@ -448,7 +460,20 @@ function sendAudio(c, pcm) {
   if (r.audioCodec === AC.OPUS && r.aenc) {
     r.aenc.encode(new AudioData({ format: 'f32-planar', sampleRate: r.rate, numberOfFrames: pcm.length, numberOfChannels: 1, timestamp: r.ats, data: pcm }));
     r.ats += Math.round((pcm.length / r.rate) * 1e6);
-  } else if (r.audioCodec === AC.ADPCM) {
+  } else if (r.audioCodec === AC.ADPCM || r.audioCodec === AC.ADPCM32) {
+    const rate = r.audioCodec === AC.ADPCM32 ? 32000 : 16000;
+    // Calls v2 resamples with a real anti-aliasing filter; classic calls keep the simple averaging.
+    if (c.v2 && (!r.down || r.downRate !== rate)) { r.down = makeResampler(r.rate, rate); r.downRate = rate; r.downPending = new Float32Array(0); }
+    if (c.v2) {
+      const fresh = r.down(pcm), joined = new Float32Array(r.downPending.length + fresh.length);
+      joined.set(r.downPending); joined.set(fresh, r.downPending.length);
+      let at = 0;
+      for (; joined.length - at >= rate / 50; at += rate / 50) {
+        sendPacket(c, PKT.AUDIO, r.audioCodec, adpcmEncode(joined.subarray(at, at + rate / 50), r.adpcm || (r.adpcm = { index: 0 })));
+      }
+      r.downPending = joined.slice(at);
+      return;
+    }
     const wide = resample(pcm, r.rate, 16000);
     sendPacket(c, PKT.AUDIO, AC.ADPCM, adpcmEncode(wide, r.adpcm || (r.adpcm = { index: 0 })));
   } else if (r.audioCodec === AC.MULAW) {
@@ -583,8 +608,11 @@ function onPacket(c, p, data) {
         pr.adec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
       }
       pr.adec.decode(new EncodedAudioChunk({ type: 'key', timestamp: time * 1000, data: body }));
-    } else if (flags === AC.ADPCM) {
-      const out = resample(adpcmDecode(body), 16000, r.rate);
+    } else if (flags === AC.ADPCM || flags === AC.ADPCM32) {
+      const rate = flags === AC.ADPCM32 ? 32000 : 16000, decoded = adpcmDecode(body);
+      if (decoded.length !== rate / 50) return; // wrong size for this codec: treated as lost
+      if (c.v2 && (!pr.up || pr.upRate !== rate)) { pr.up = makeResampler(rate, r.rate); pr.upRate = rate; }
+      const out = c.v2 ? pr.up(decoded) : resample(decoded, 16000, r.rate);
       pr.play.port.postMessage(out, [out.buffer]);
     } else if (flags === AC.MULAW) {
       const pcm = new Float32Array(body.length);
@@ -659,54 +687,6 @@ function mulawDecode(b) {
   b = ~b & 0xff;
   const exp = (b >> 4) & 7, s = ((((b & 0x0f) << 3) + 0x84) << exp) - 0x84;
   return (b & 0x80 ? -s : s) / 32768;
-}
-
-/**
- * IMA ADPCM at 16 kHz: wideband voice (twice G.711's audio range) at the same 64 kbit/s, for calls
- * with the desktop app, which has no Opus. Each 20 ms frame stands alone: [first sample, 2 bytes]
- * [step index] then one 4-bit code per further sample. Byte for byte the same as CallSession.java.
- */
-const IMA_STEP = [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767];
-const IMA_INDEX = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
-
-function adpcmEncode(samples, state) {
-  const n = samples.length, out = new Uint8Array(3 + Math.ceil((n - 1) / 2));
-  const s16 = (x) => Math.max(-32768, Math.min(32767, Math.round(x * 32767)));
-  let pred = s16(samples[0]), index = state.index;
-  out[0] = pred & 0xff; out[1] = (pred >> 8) & 0xff; out[2] = index;
-  for (let i = 1; i < n; i++) {
-    let diff = s16(samples[i]) - pred, code = 0, step = IMA_STEP[index], delta = step >> 3;
-    if (diff < 0) { code = 8; diff = -diff; }
-    if (diff >= step) { code |= 4; diff -= step; delta += step; }
-    step >>= 1;
-    if (diff >= step) { code |= 2; diff -= step; delta += step; }
-    step >>= 1;
-    if (diff >= step) { code |= 1; delta += step; }
-    pred = Math.max(-32768, Math.min(32767, code & 8 ? pred - delta : pred + delta));
-    index = Math.max(0, Math.min(88, index + IMA_INDEX[code]));
-    out[3 + ((i - 1) >> 1)] |= (i - 1) & 1 ? code << 4 : code;
-  }
-  state.index = index;
-  return out;
-}
-
-function adpcmDecode(bytes) {
-  if (bytes.length < 4) return new Float32Array(0);
-  const n = (bytes.length - 3) * 2, out = new Float32Array(n); // frames hold an even number of samples; the last half-byte is padding
-  let pred = (bytes[0] | (bytes[1] << 8)) << 16 >> 16, index = Math.min(88, bytes[2]);
-  out[0] = pred / 32768;
-  for (let i = 1; i < n; i++) {
-    const code = ((i - 1) & 1 ? bytes[3 + ((i - 1) >> 1)] >> 4 : bytes[3 + ((i - 1) >> 1)]) & 15;
-    const step = IMA_STEP[index];
-    let delta = step >> 3;
-    if (code & 4) delta += step;
-    if (code & 2) delta += step >> 1;
-    if (code & 1) delta += step >> 2;
-    pred = Math.max(-32768, Math.min(32767, code & 8 ? pred - delta : pred + delta));
-    index = Math.max(0, Math.min(88, index + IMA_INDEX[code]));
-    out[i] = pred / 32768;
-  }
-  return out;
 }
 
 // ---- screen ----
@@ -819,7 +799,11 @@ function toggleMic() {
   $('callMic').textContent = call.micOn ? 'MIC ON' : 'MUTED';
 }
 
-function renderHideIp() { $('hideIpBtn').textContent = '🛡 HIDE MY IP IN CALLS: ' + (callPrefs.hideIp ? 'ON' : 'OFF'); }
+function renderHideIp() {
+  $('hideIpBtn').textContent = '🛡 HIDE MY IP IN CALLS: ' + (callPrefs.hideIp ? 'ON' : 'OFF');
+  $('qualitySel').value = qualityFor(callPrefs.mode) === QUALITY[callPrefs.mode] ? callPrefs.mode : 'auto';
+  $('callsV2Btn').textContent = 'CALLS V2: ' + (callPrefs.v2 ? 'ON' : 'OFF') + (S.callsV2 ? '' : ' (server off)');
+}
 
 $('callBtn').onclick = () => startCall(false);
 $('videoBtn').onclick = () => startCall(true);
@@ -828,5 +812,12 @@ $('callEnd').onclick = hangUp;
 $('callMic').onclick = toggleMic;
 $('callCam').onclick = toggleCam;
 $('hideIpBtn').onclick = () => { callPrefs.hideIp = !callPrefs.hideIp; store.set('ember.hideIp', callPrefs.hideIp ? '1' : null); renderHideIp(); };
+$('qualitySel').onchange = (e) => {
+  callPrefs.mode = QUALITY[e.target.value] ? e.target.value : 'auto';
+  store.set('ember.quality', callPrefs.mode);
+  applyMode(call); // takes effect in the current call right away
+  toast('call quality: ' + qualityFor(callPrefs.mode).label);
+};
+$('callsV2Btn').onclick = () => { callPrefs.v2 = !callPrefs.v2; store.set('ember.callsV2', callPrefs.v2 ? null : '0'); renderHideIp(); };
 renderHideIp();
 addEventListener('pagehide', hangUp);

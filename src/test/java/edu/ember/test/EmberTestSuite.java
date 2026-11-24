@@ -2110,6 +2110,11 @@ public final class EmberTestSuite {
             }
         }
         assertTrue(jl.stats().targetMs() > 40, "Jitter of up to 60 ms must raise the target delay");
+        var flooded = new edu.ember.client.call.JitterBuffer(new FakeClock(), 2);
+        for (long sequence = 1; sequence <= 10_000; sequence++) {
+            flooded.put(sequence, new short[2]);
+        }
+        assertTrue(flooded.depthMs() <= 25 * 20, "A flood of frames grew the buffer past its cap: " + flooded.depthMs());
     }
 
     /** Settings persist; a damaged file falls back to defaults; a microphone that unplugs is replaced. */

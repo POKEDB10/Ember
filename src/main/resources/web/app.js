@@ -247,6 +247,8 @@ function onAuth(f) {
   if (f.syncReset === 'true') { S.convs.clear(); S.rev = 0; } // server data was reset: drop the cache
   S.me = f.userId; S.token = f.token; S.vapidKey = f.vapidKey || null;
   try { S.ice = JSON.parse(f.ice || '[]'); } catch { S.ice = []; }
+  S.callsV2 = f.callsV2 === 'true'; // server half of the calls v2 flag
+  if (typeof renderHideIp === 'function') renderHideIp();
   e2eStart();
   store.set('ember.token', f.token); store.set('ember.user', f.userId);
   showApp(); setStatus('syncing…');

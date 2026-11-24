@@ -10,6 +10,7 @@
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
 <script src="/app.js" defer></script>
+<script src="/quality.js" defer></script>
 <script src="/e2e.js" defer></script>
 <script src="/call.js" defer></script>
 </head>
@@ -58,6 +59,8 @@
       <div id="requests"></div>
       <button id="notifyBtn">🔔 NOTIFICATIONS: OFF</button>
       <button id="hideIpBtn">🛡 HIDE MY IP IN CALLS: OFF</button>
+      <label class="small">CALL QUALITY <select id="qualitySel" aria-label="Call quality"><option value="auto">Auto</option><option value="max">Max</option><option value="datasaver">Data saver</option></select></label>
+      <button id="callsV2Btn">CALLS V2: ON</button>
       <p class="dim small">Calls are end-to-end encrypted. They try a direct link first (lowest delay); with this on, every call goes through the encrypted relay so the other person never sees your IP address.</p>
       <p class="dim small">Notifications reach this device even when Ember is closed. Do&nbsp;not&nbsp;disturb silences them.</p>
     </section>

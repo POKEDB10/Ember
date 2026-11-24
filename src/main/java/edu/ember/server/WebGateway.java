@@ -33,11 +33,11 @@ public final class WebGateway {
     /** Messages smaller than this are not worth compressing. */
     private static final int COMPRESS_MIN_BYTES = 96;
     /** Allowlist of served files; anything else is 404, so no path traversal is possible. */
-    private static final Map<String, String> FILES = Map.of(
-            "/", "index.html", "/index.html", "index.html", "/app.js", "app.js",
-            "/app.css", "app.css", "/manifest.json", "manifest.json", "/sw.js", "sw.js",
-            "/icon.svg", "icon.svg", "/call-worklet.js", "call-worklet.js",
-            "/call.js", "call.js", "/e2e.js", "e2e.js");
+    private static final Map<String, String> FILES = Map.ofEntries(
+            Map.entry("/", "index.html"), Map.entry("/index.html", "index.html"), Map.entry("/app.js", "app.js"),
+            Map.entry("/app.css", "app.css"), Map.entry("/manifest.json", "manifest.json"), Map.entry("/sw.js", "sw.js"),
+            Map.entry("/icon.svg", "icon.svg"), Map.entry("/call-worklet.js", "call-worklet.js"),
+            Map.entry("/call.js", "call.js"), Map.entry("/e2e.js", "e2e.js"), Map.entry("/quality.js", "quality.js"));
     private static final Map<String, String> TYPES = Map.of(
             "html", "text/html; charset=utf-8", "js", "text/javascript; charset=utf-8",
             "css", "text/css; charset=utf-8", "json", "application/manifest+json",
