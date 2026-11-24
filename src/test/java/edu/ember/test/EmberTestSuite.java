@@ -2181,6 +2181,9 @@ public final class EmberTestSuite {
                         Map.of("user", "bob", "pass", "bob-pass-42", "displayName", "Bob"))).get("userId"),
                         "Sign-up without an email (desktop app) stopped working");
                 wsAsk(b, WireOpcodes.CMD_EMAIL_CODE, 6, Map.of("purpose", "link", "email", "alice@example.com"));
+                // Linking needs the current password, so a stolen session cannot move account recovery.
+                assertEquals("401", fieldsOf(wsAsk(b, WireOpcodes.CMD_EMAIL_LINK, 61, Map.of("email", "alice@example.com",
+                        "code", "000000", "pass", "not-bobs-pass-1"))).get("code"), "An email was linked without the password");
                 String[] notice = mails.poll(5, TimeUnit.SECONDS);
                 assertTrue(notice != null && !notice[1].contains("code") && !notice[2].matches("(?s).*\\b\\d{6}\\b.*"),
                         "An email in use received a code for someone else");

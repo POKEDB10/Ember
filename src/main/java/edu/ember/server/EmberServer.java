@@ -434,8 +434,8 @@ public final class EmberServer implements AutoCloseable {
         private String token;
         /** Only browsers that said they can take calls are rung (the Swing app cannot). */
         private volatile boolean supportsCalls;
-        /** Signed in with the password on this connection (not a resumed token): may set the key backup. */
-        private boolean passwordAuthed;
+        /** The account that signed in with its password on this connection (not a resumed token), or null. */
+        private String passwordUser;
         /** Who the login rate limiter sees: the socket peer, or the proxy-reported client. */
         private java.net.InetAddress clientAddress;
 
@@ -623,7 +623,7 @@ public final class EmberServer implements AutoCloseable {
             if (emailHash != null) {
                 linkEmail(user.userId(), emailHash);
             }
-            passwordAuthed = true;
+            passwordUser = user.userId();
             signIn(frame, user.userId(), fields);
         }
 
@@ -664,6 +664,7 @@ public final class EmberServer implements AutoCloseable {
             }
             goOnline(resumedUser);
             token = suppliedToken;
+            passwordUser = null; // a token is not a password: no key backup changes on this connection
             java.util.Map<String, String> response = new java.util.HashMap<>();
             response.put("token", token);
             response.put("userId", userId);
@@ -836,12 +837,12 @@ public final class EmberServer implements AutoCloseable {
             }
             authService.resetPassword(owner, password);
             sessions.removeUser(owner);
+            passwordUser = owner;
             for (ConnectionHandler device : online.getOrDefault(owner, java.util.Set.of())) {
                 if (device != this) {
                     device.closeQuietly(); // signed in with the old password: they must sign in again
                 }
             }
-            passwordAuthed = true;
             signIn(frame, owner, fields);
         }
 
@@ -850,6 +851,8 @@ public final class EmberServer implements AutoCloseable {
                 edu.ember.common.exceptions.EmberException {
             requireAuthenticated(frame.correlationId());
             MapFields fields = new MapFields(frame.payload());
+            // The current password is needed: a stolen session must not be able to move account recovery.
+            authService.login(userId, fields.required("pass").toCharArray());
             String email = EmailCodes.normalize(fields.required("email"));
             String emailHash = emailCodes.hash(email);
             String owner = emailOwner(emailHash);
@@ -921,7 +924,7 @@ public final class EmberServer implements AutoCloseable {
             if (!backup.matches("kb1\\.[A-Za-z0-9_-]{16,43}\\.[A-Za-z0-9_-]{87}\\.[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{100,400}")) {
                 throw new edu.ember.common.exceptions.ValidationException("Invalid key backup");
             }
-            if (!passwordAuthed) {
+            if (passwordUser == null || !passwordUser.equals(userId)) {
                 throw new edu.ember.common.exceptions.AuthorizationException("Sign in with your password to change the key backup");
             }
             synchronized (DeviceKeys.class) {

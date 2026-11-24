@@ -1230,12 +1230,13 @@ function renderMe() {
 async function linkEmail() {
   const a = await ask({ title: S.emailLinked ? 'CHANGE EMAIL' : 'ADD EMAIL', ok: 'SEND CODE',
     text: 'Sign in with it and get back into your account if you forget the password. The server keeps only a scrambled form of it.',
-    fields: [{ name: 'email', label: 'EMAIL', type: 'email', autocomplete: 'email', max: 254, required: true }] });
+    fields: [{ name: 'email', label: 'EMAIL', type: 'email', autocomplete: 'email', max: 254, required: true },
+      { name: 'pass', label: 'YOUR PASSWORD', type: 'password', autocomplete: 'current-password', max: 128, required: true }] });
   if (!a) return;
   try {
     const code = await emailCode('link', a.email, 'CHECK YOUR EMAIL', 'CONFIRM');
     if (!code) return;
-    await request(OP.EMAIL_LINK, { email: a.email, code });
+    await request(OP.EMAIL_LINK, { email: a.email, code, pass: a.pass });
     S.emailLinked = true; renderMe(); toast('✉ email linked');
   } catch (x) { toast('⚠ ' + x.message); }
 }
